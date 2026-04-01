@@ -1,0 +1,54 @@
+[package]
+name = "tg-ws-proxy-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Telegram MTProto WebSocket Bridge Proxy — Rust port of Flowseal/tg-ws-proxy"
+license = "MIT"
+
+[[bin]]
+name = "tg-ws-proxy"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# WebSocket protocol with TLS support
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tungstenite = { version = "0.24" }
+
+# AES-256-CTR encryption for MTProto obfuscation
+aes = "0.8"
+ctr = "0.9"
+cipher = "0.4"
+
+# SHA-256 for MTProto key derivation
+sha2 = "0.10"
+
+# Random bytes for handshake generation
+rand = "0.8"
+
+# Hex encoding / decoding utilities
+hex = "0.4"
+
+# CLI argument parsing (with env-variable fallback)
+clap = { version = "4", features = ["derive", "env"] }
+
+# Structured logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Async stream utilities (SinkExt, StreamExt)
+futures-util = "0.3"
+
+# Custom TLS configuration (skip-verify option)
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pki-types = "1"
+# Bundled Mozilla root cert store (used by the default TLS connector)
+webpki-roots = "0.26"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

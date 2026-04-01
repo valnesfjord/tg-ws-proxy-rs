@@ -1,0 +1,31 @@
+# Cargo configuration for cross-compilation targets.
+# Uncomment and adapt the relevant section for your target platform.
+
+# ─── Static binary for Linux x86_64 with musl libc ───────────────────────────
+# Use this for building a fully static binary on Linux (no glibc dependency).
+# Install the target with: rustup target add x86_64-unknown-linux-musl
+#
+# [target.x86_64-unknown-linux-musl]
+# rustflags = ["-C", "target-feature=+crt-static"]
+
+# ─── OpenWrt / MIPS little-endian (e.g. TP-Link, Xiaomi routers) ─────────────
+# Install the target with: rustup target add mipsel-unknown-linux-musl
+# You also need a MIPS musl cross-compiler; see README for details.
+#
+# [target.mipsel-unknown-linux-musl]
+# linker = "mipsel-linux-musl-gcc"
+# rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=-static"]
+
+# ─── OpenWrt / ARM (e.g. Raspberry Pi, some Xiaomi / GL.iNet routers) ────────
+# Install the target with: rustup target add armv7-unknown-linux-musleabihf
+#
+# [target.armv7-unknown-linux-musleabihf]
+# linker = "arm-linux-musleabihf-gcc"
+# rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=-static"]
+
+# ─── OpenWrt / ARM64 (e.g. newer GL.iNet routers) ────────────────────────────
+# Install the target with: rustup target add aarch64-unknown-linux-musl
+#
+# [target.aarch64-unknown-linux-musl]
+# linker = "aarch64-linux-musl-gcc"
+# rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=-static"]
