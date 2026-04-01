@@ -18,7 +18,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::TcpListener;
-use tracing::{error, info};
+use tokio::sync::Semaphore;
+use tracing::{error, info, warn};
 
 mod config;
 mod crypto;
@@ -79,6 +80,7 @@ async fn main() {
     if config.skip_tls_verify {
         info!("  ⚠  TLS certificate verification DISABLED");
     }
+    info!("  Max connections: {}", config.max_connections);
     info!("{}", "=".repeat(60));
     info!("  Telegram proxy link:");
     info!("    {}", tg_link);
@@ -95,19 +97,44 @@ async fn main() {
     }
 
     // ── Accept loop ───────────────────────────────────────────────────────
+    // Acquire a permit before each accept() to cap concurrent connections.
+    // This prevents EMFILE (too many open files) by keeping file-descriptor
+    // usage bounded: at most `max_connections` client sockets plus the pool
+    // connections can be open simultaneously.
+    const EMFILE: i32 = 24; // too many open files (per-process fd limit)
+    const ENFILE: i32 = 23; // file table overflow (system-wide fd limit)
+    let semaphore = Arc::new(Semaphore::new(config.max_connections));
     loop {
+        // Block here when we are already at the connection limit.  Pending
+        // TCP connections queue in the kernel backlog until capacity frees up.
+        let permit = Arc::clone(&semaphore)
+            .acquire_owned()
+            .await
+            .expect("semaphore closed unexpectedly");
+
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
                 let cfg = config.clone();
                 let pool = pool.clone();
                 tokio::spawn(async move {
+                    // Hold the permit for the lifetime of this connection so
+                    // it is released (and the slot freed) when the task ends.
+                    let _permit = permit;
                     proxy::handle_client(stream, peer_addr, cfg, pool).await;
                 });
             }
             Err(e) => {
-                error!("accept error: {}", e);
-                // Brief pause to avoid a tight error loop on transient issues.
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                // EMFILE / ENFILE: the process has run out of file descriptors
+                // (e.g. from pool connections).  Back off longer to let
+                // existing connections close, and log at warn-level to avoid
+                // flooding the log with repeated identical messages.
+                if matches!(e.raw_os_error(), Some(EMFILE) | Some(ENFILE)) {
+                    warn!("accept error: {} — backing off to allow FDs to free", e);
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                } else {
+                    error!("accept error: {}", e);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
             }
         }
     }

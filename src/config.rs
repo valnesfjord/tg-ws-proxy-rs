@@ -84,6 +84,11 @@ pub struct Config {
     #[arg(long = "pool-size", default_value = "4", env = "TG_POOL_SIZE")]
     pub pool_size: usize,
 
+    /// Maximum number of concurrent client connections.
+    /// Limits file-descriptor consumption and prevents EMFILE errors under load.
+    #[arg(long = "max-connections", default_value = "200", env = "TG_MAX_CONNECTIONS")]
+    pub max_connections: usize,
+
     /// Enable verbose (DEBUG) logging.
     #[arg(short, long, env = "TG_VERBOSE")]
     pub verbose: bool,
