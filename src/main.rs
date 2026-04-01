@@ -32,6 +32,10 @@ use pool::WsPool;
 
 #[tokio::main]
 async fn main() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install rustls ring CryptoProvider");
+
     let config = Config::from_args();
 
     // ── Logging ──────────────────────────────────────────────────────────
