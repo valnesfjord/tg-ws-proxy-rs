@@ -7,8 +7,9 @@
 //! The pool is keyed by `(dc_id, is_media)`.  Background refill tasks run
 //! after each pool hit to keep the bucket at `pool_size` connections.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
@@ -34,6 +35,28 @@ type PoolMap = HashMap<(u32, bool), Bucket>;
 pub struct WsPool {
     pool_size: usize,
     idle: Mutex<PoolMap>,
+    /// Tracks which (dc, is_media) buckets currently have a refill in flight.
+    /// Prevents a stampede of concurrent refill tasks when many clients arrive
+    /// simultaneously — each `pool.get()` call spawns a refill, and without
+    /// this guard they all open `pool_size` connections at once, exhausting FDs.
+    ///
+    /// Uses a standard (non-async) mutex because the critical section is tiny
+    /// (a single HashSet insert/remove) and never holds the lock across an
+    /// await point, which enables a simple Drop-based cleanup guard.
+    refilling: StdMutex<HashSet<(u32, bool)>>,
+}
+
+/// RAII guard that removes a `(dc, is_media)` key from the `refilling` set
+/// when dropped, guaranteeing cleanup even on early returns or panics.
+struct RefillGuard<'a> {
+    set: &'a StdMutex<HashSet<(u32, bool)>>,
+    key: (u32, bool),
+}
+
+impl Drop for RefillGuard<'_> {
+    fn drop(&mut self) {
+        self.set.lock().unwrap().remove(&self.key);
+    }
 }
 
 impl WsPool {
@@ -41,6 +64,7 @@ impl WsPool {
         Self {
             pool_size,
             idle: Mutex::new(HashMap::new()),
+            refilling: StdMutex::new(HashSet::new()),
         }
     }
 
@@ -133,6 +157,18 @@ impl WsPool {
     // ── Internal ─────────────────────────────────────────────────────────
 
     async fn refill(&self, dc: u32, is_media: bool, target_ip: String, skip_tls: bool) {
+        // Ensure only one refill runs at a time per (dc, is_media) key.
+        // Without this, a burst of simultaneous pool.get() calls spawns N
+        // refill tasks that each open pool_size connections concurrently,
+        // exhausting file descriptors well beyond the intended pool budget.
+        let registered = self.refilling.lock().unwrap().insert((dc, is_media));
+        if !registered {
+            return; // another refill is already in progress for this key
+        }
+        // The guard removes the key from `refilling` when it goes out of scope,
+        // covering all exit paths (normal return, early return, or panic).
+        let _guard = RefillGuard { set: &self.refilling, key: (dc, is_media) };
+
         let needed = {
             let lock = self.idle.lock().await;
             let current = lock.get(&(dc, is_media)).map_or(0, |b| b.len());
@@ -146,7 +182,11 @@ impl WsPool {
         if !new_conns.is_empty() {
             let mut lock = self.idle.lock().await;
             let bucket = lock.entry((dc, is_media)).or_default();
-            for ws in new_conns {
+            // Re-check available space; another path (e.g. warmup) may have
+            // filled the bucket while we were connecting.  Drop any surplus
+            // connections so their FDs are closed immediately.
+            let can_add = self.pool_size.saturating_sub(bucket.len());
+            for ws in new_conns.into_iter().take(can_add) {
                 bucket.push(PoolEntry {
                     ws,
                     created: Instant::now(),
