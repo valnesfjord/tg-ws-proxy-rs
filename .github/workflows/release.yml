@@ -43,7 +43,7 @@ jobs:
         with:
           # (required) Binary names (non-extension portion of filename) to build and upload (whitespace or comma separated list).
           # Note that glob pattern is not supported yet.
-          bin: tg-ws-proxy-rs
+          bin: tg-ws-proxy
           # (optional) Target triple, default is host triple.
           target: ${{ matrix.target }}
           # (required) GitHub token for uploading assets to GitHub Releases.
