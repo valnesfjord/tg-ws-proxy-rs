@@ -5,8 +5,6 @@
 
 Listens for Telegram Desktop's MTProto connections on a local port and
 tunnels them through WebSocket (TLS) connections to Telegram's DC servers.
-Useful on networks where direct TCP traffic to Telegram is blocked or
-throttled.
 
 ```
 Telegram Desktop → MTProto (TCP 1443) → tg-ws-proxy-rs → WS (TLS 443) → Telegram DC
