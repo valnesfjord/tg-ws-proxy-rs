@@ -15,12 +15,12 @@ jobs:
             - uses: actions/checkout@v6
             - uses: taiki-e/create-gh-release-action@v1
               with:
-                  # (required) GitHub token for creating GitHub Releases.
                   token: ${{ secrets.GITHUB_TOKEN }}
 
     upload-assets:
         needs: create-release
         strategy:
+            fail-fast: false
             matrix:
                 include:
                     - target: aarch64-unknown-linux-musl
@@ -37,18 +37,42 @@ jobs:
                       os: macos-latest
                     - target: x86_64-pc-windows-gnu
                       os: windows-latest
-                    # Universal macOS binary is supported as universal-apple-darwin.
                     - target: universal-apple-darwin
                       os: macos-latest
         runs-on: ${{ matrix.os }}
         steps:
             - uses: actions/checkout@v6
-            - uses: taiki-e/upload-rust-binary-action@v1
+
+            # --- default path (all targets except mipsel) ---
+            - name: Build & upload (default)
+              if: matrix.target != 'mipsel-unknown-linux-musl'
+              uses: taiki-e/upload-rust-binary-action@v1
               with:
-                  # (required) Binary names (non-extension portion of filename) to build and upload (whitespace or comma separated list).
-                  # Note that glob pattern is not supported yet.
                   bin: tg-ws-proxy
-                  # (optional) Target triple, default is host triple.
                   target: ${{ matrix.target }}
-                  # (required) GitHub token for uploading assets to GitHub Releases.
                   token: ${{ secrets.GITHUB_TOKEN }}
+
+            # --- special path for mipsel ---
+            - name: Install nightly + rust-src (mipsel)
+              if: matrix.target == 'mipsel-unknown-linux-musl'
+              uses: dtolnay/rust-toolchain@nightly
+              with:
+                  components: rust-src
+
+            - name: Install cross (mipsel)
+              if: matrix.target == 'mipsel-unknown-linux-musl'
+              run: cargo install cross --locked
+
+            - name: Build (mipsel, build-std)
+              if: matrix.target == 'mipsel-unknown-linux-musl'
+              run: cross +nightly build --release --bin tg-ws-proxy --target mipsel-unknown-linux-musl -Z build-std=std,panic_abort
+
+            # (важно) upload-gh-release-asset требует путь к файлу.
+            # имя ассета делаем с суффиксом таргета, чтобы не конфликтовало с другими.
+            - name: Upload asset (mipsel)
+              if: matrix.target == 'mipsel-unknown-linux-musl'
+              uses: taiki-e/upload-gh-release-asset@v1
+              with:
+                  token: ${{ secrets.GITHUB_TOKEN }}
+                  files: |
+                      target/mipsel-unknown-linux-musl/release/tg-ws-proxy:tg-ws-proxy-mipsel-unknown-linux-musl
