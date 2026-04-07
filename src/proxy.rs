@@ -615,6 +615,18 @@ async fn connect_mtproto_upstream(
         }
     };
 
+    // Telegram MTProto proxy secrets in link format start with a 1-byte mode
+    // indicator: 0xdd = padded intermediate, 0xee = FakeTLS.  This byte is a
+    // connection-mode flag and is NOT part of the 16-byte key material used for
+    // SHA-256 key derivation in the obfuscation handshake.  Standard proxy
+    // servers strip it before key derivation; we must do the same, or the
+    // SHA-256 keys on both sides won't match and the handshake is rejected.
+    let key_bytes: &[u8] = if secret.len() == 17 && matches!(secret[0], 0xdd | 0xee) {
+        &secret[1..]
+    } else {
+        &secret
+    };
+
     let stream = match tokio::time::timeout(
         UPSTREAM_CONNECT_TIMEOUT,
         TcpStream::connect(format!("{}:{}", host, port)),
@@ -633,7 +645,7 @@ async fn connect_mtproto_upstream(
     };
     let _ = stream.set_nodelay(true);
 
-    let (handshake, enc, dec) = generate_client_handshake(&secret, dc_idx, proto);
+    let (handshake, enc, dec) = generate_client_handshake(key_bytes, dc_idx, proto);
 
     let (reader, mut writer) = tokio::io::split(stream);
     if let Err(e) = writer.write_all(&handshake).await {
