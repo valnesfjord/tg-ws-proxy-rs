@@ -8,6 +8,8 @@ tunnels them through WebSocket (TLS) connections to Telegram's DC servers.
 
 ```
 Telegram Desktop → MTProto (TCP 1443) → tg-ws-proxy-rs → WS (TLS 443) → Telegram DC
+                                                         ↘ upstream MTProto proxy → Telegram DC  (WS fallback)
+                                                         ↘ direct TCP :443 → Telegram DC          (last resort)
 ```
 
 ## Why Rust?
@@ -95,13 +97,14 @@ tg-ws-proxy [OPTIONS]
 | `--dc-ip <DC:IP>` | DC2 + DC4 | Target IP per DC (repeatable) |
 | `--buf-kb <KB>` | `256` | Socket buffer size |
 | `--pool-size <N>` | `4` | Pre-warmed WS connections per DC |
+| `--mtproto-proxy <HOST:PORT:SECRET>` | — | Upstream MTProto proxy fallback (repeatable) |
 | `-q / --quiet` | off | Suppress all log output |
 | `-v / --verbose` | off | Debug logging |
 | `--danger-accept-invalid-certs` | off | Skip TLS verification |
 
 Every flag has a matching environment variable (`TG_PORT`, `TG_HOST`,
 `TG_SECRET`, `TG_BUF_KB`, `TG_POOL_SIZE`, `TG_QUIET`, `TG_VERBOSE`,
-`TG_SKIP_TLS_VERIFY`, `TG_LINK_IP`).
+`TG_SKIP_TLS_VERIFY`, `TG_LINK_IP`, `TG_MTPROTO_PROXY`).
 
 ### Examples
 
@@ -111,6 +114,14 @@ tg-ws-proxy
 
 # Custom port and extra DCs
 tg-ws-proxy --port 9050 --dc-ip 1:149.154.175.205 --dc-ip 2:149.154.167.220
+
+# With upstream MTProto proxy fallback
+tg-ws-proxy --mtproto-proxy proxy.example.com:443:abcdef1234567890abcdef1234567890
+
+# Multiple upstream proxies (tried in order until one succeeds)
+tg-ws-proxy \
+  --mtproto-proxy proxy.example.com:443:abcdef1234567890abcdef1234567890 \
+  --mtproto-proxy other.example.net:8888:deadbeef01234567deadbeef01234567
 
 # Router deployment: listen on all interfaces, let all LAN devices use the proxy
 tg-ws-proxy --host 0.0.0.0
@@ -124,6 +135,42 @@ TG_PORT=1443 TG_SECRET=deadbeef... tg-ws-proxy
 
 On startup the proxy prints a `tg://proxy?...` link you can paste into
 Telegram Desktop to configure it automatically.
+
+### Upstream MTProto proxy fallback
+
+When WebSocket connections to Telegram are blocked, the proxy can route
+traffic through an external MTProto proxy before falling back to direct TCP:
+
+```
+WS (preferred) → upstream MTProto proxy → direct TCP (last resort)
+```
+
+Pass one or more `--mtproto-proxy HOST:PORT:SECRET` flags (or a
+comma-separated list in `TG_MTPROTO_PROXY`).  Proxies are tried in the order
+given; if one fails it enters a 60-second cooldown so subsequent connections
+skip it without delay.
+
+```bash
+tg-ws-proxy \
+  --mtproto-proxy proxy.example.com:443:abcdef1234567890abcdef1234567890 \
+  --mtproto-proxy other.example.net:8888:deadbeef01234567deadbeef01234567
+
+# Or via environment variable (comma-separated)
+TG_MTPROTO_PROXY="proxy.example.com:443:abcdef1234...,other.example.net:8888:deadbeef..." tg-ws-proxy
+```
+
+> **⚠️ Secret format — no `dd` prefix!**
+>
+> Public MTProto proxies (e.g. from `@MTProxybot`) often display the secret
+> with a `dd` prefix, e.g. `ddabcdef1234567890abcdef1234567890`.  That `dd`
+> prefix is **not** part of the secret — it's a protocol marker indicating the
+> "padded intermediate" transport.  **Strip the leading `dd` before passing the
+> secret to `--mtproto-proxy`:**
+>
+> ```
+> Proxy shows:  ddabcdef1234567890abcdef1234567890
+> Use this:       abcdef1234567890abcdef1234567890   ← drop the "dd"
+> ```
 
 ### Router deployment
 
@@ -244,10 +291,13 @@ chmod +x /etc/init.d/tg-ws-proxy
    (using the DC-specific domain as TLS SNI but routing TCP to the configured
    IP).
 4. The relay init packet is sent to Telegram, and bidirectional bridging
-   begins with AES-256-CTR re-encryption (client keys <=> relay keys).
-5. If WebSocket is unavailable (redirect response), the proxy falls back to
+   begins with AES-256-CTR re-encryption (client keys ↔ relay keys).
+5. If WebSocket is unavailable, the proxy tries each configured upstream
+   MTProto proxy in order (generating a fresh client handshake with the
+   upstream's secret so it can route to the correct DC).
+6. If no upstream proxy is configured or all fail, the proxy falls back to
    direct TCP on port 443.
-6. A small pool of pre-connected WebSocket connections is maintained per DC to
+7. A small pool of pre-connected WebSocket connections is maintained per DC to
    reduce connection latency for subsequent clients.
 
 ## Project structure
@@ -276,6 +326,7 @@ TG_POOL_SIZE=4
 TG_BUF_KB=256
 TG_QUIET=true
 TG_VERBOSE=false
+TG_MTPROTO_PROXY=proxy.example.com:443:abcdef1234567890abcdef1234567890
 ```
 
 ## License
