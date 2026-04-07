@@ -44,8 +44,10 @@ pub struct MtProtoProxy {
 }
 
 /// Parse a `HOST:PORT:SECRET` triplet.
-/// Splitting from the right handles IPv4/domain hosts that may contain no colon
-/// in the host part; the two right-most colons delimit port and secret.
+/// Splitting from the right handles IPv4/domain hosts; the two right-most
+/// colons delimit port and secret.
+/// Note: IPv6 addresses in bracket notation (e.g. `[::1]:443:secret`) are
+/// not supported — use a hostname or IPv4 address instead.
 fn parse_mtproto_proxy(s: &str) -> Result<MtProtoProxy, String> {
     // rsplitn(3, ':') yields at most 3 parts, right-to-left: [secret, port, host]
     let parts: Vec<&str> = s.rsplitn(3, ':').collect();

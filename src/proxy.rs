@@ -604,8 +604,16 @@ async fn connect_mtproto_upstream(
     AesCtr256,
     AesCtr256,
 )> {
-    let secret =
-        hex::decode(secret_hex).expect("upstream proxy secret must be valid hex (validated at startup)");
+    let secret = match hex::decode(secret_hex) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(
+                "[upstream] {}:{} invalid hex secret: {}",
+                host, port, e
+            );
+            return None;
+        }
+    };
 
     let stream = match tokio::time::timeout(
         UPSTREAM_CONNECT_TIMEOUT,

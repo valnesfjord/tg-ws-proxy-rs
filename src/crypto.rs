@@ -253,7 +253,8 @@ pub fn generate_client_handshake(
         for i in 0..2 {
             handshake[DC_IDX_POS + i] = dc_bytes[i] ^ keystream[DC_IDX_POS + i];
         }
-        // handshake[62..64] stays as random raw bytes.
+        // handshake[62..64] stays as the original random raw bytes — these two
+        // padding bytes are not interpreted by the upstream proxy and can be arbitrary.
 
         // Build enc cipher (what we use to encrypt data sent to upstream).
         // This mirrors the upstream's clt_dec cipher: same key/IV, fast-forwarded 64 bytes.
