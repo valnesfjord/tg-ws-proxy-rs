@@ -12,14 +12,17 @@
 //!       │   [connect WebSocket]  →  wss://kwsN.web.telegram.org/apiws
 //!       │   [bridge_ws]          ←  bidirectional re-encrypted bridge
 //!       │
-//!       └─ TCP fallback (when WS is blocked / fails):
+//!       ├─ Upstream MTProto proxy fallback (when WS fails, if configured):
+//!       │   [connect_mtproto_upstream]  →  external MTProto proxy TCP
+//!       │   [bridge_mtproto_relay]      ←  bidirectional re-encrypted bridge
+//!       │
+//!       └─ Direct TCP fallback (last resort):
 //!           [bridge_tcp]  →  direct TCP to Telegram DC IP:443
 //! ```
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::crypto::ConnectionCiphers;
 use cipher::StreamCipher;
 use futures_util::SinkExt;
 use futures_util::StreamExt;
@@ -29,7 +32,10 @@ use tracing::{debug, info, warn};
 use tungstenite::Message;
 
 use crate::config::{default_dc_ips, default_dc_overrides, Config};
-use crate::crypto::{build_connection_ciphers, generate_relay_init, parse_handshake};
+use crate::crypto::{
+    build_connection_ciphers, generate_client_handshake, generate_relay_init, parse_handshake,
+    AesCtr256, ConnectionCiphers,
+};
 use crate::pool::WsPool;
 use crate::splitter::MsgSplitter;
 use crate::ws_client::{connect_ws_for_dc, ws_send, TgWsStream};
@@ -49,6 +55,44 @@ const WS_FAIL_COOLDOWN: Duration = Duration::from_secs(30);
 const WS_REDIRECT_COOLDOWN: Duration = Duration::from_secs(300); // 5 min for "all redirects"
 const WS_FAIL_TIMEOUT: Duration = Duration::from_secs(2);
 const WS_NORMAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+// ─── Upstream MTProto proxy failure tracking ─────────────────────────────────
+
+/// Per-upstream cooldown: keyed by "host:port".
+static UPSTREAM_FAIL_UNTIL: StdMutex<Option<HashMap<String, Instant>>> = StdMutex::new(None);
+
+const UPSTREAM_FAIL_COOLDOWN: Duration = Duration::from_secs(60);
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn upstream_key(host: &str, port: u16) -> String {
+    format!("{}:{}", host, port)
+}
+
+fn set_upstream_cooldown(host: &str, port: u16) {
+    let key = upstream_key(host, port);
+    let mut lock = UPSTREAM_FAIL_UNTIL.lock().unwrap();
+    lock.get_or_insert_with(HashMap::new)
+        .insert(key, Instant::now() + UPSTREAM_FAIL_COOLDOWN);
+}
+
+fn clear_upstream_cooldown(host: &str, port: u16) {
+    let key = upstream_key(host, port);
+    let mut lock = UPSTREAM_FAIL_UNTIL.lock().unwrap();
+    if let Some(map) = lock.as_mut() {
+        map.remove(&key);
+    }
+}
+
+fn upstream_in_cooldown(host: &str, port: u16) -> bool {
+    let key = upstream_key(host, port);
+    let lock = UPSTREAM_FAIL_UNTIL.lock().unwrap();
+    if let Some(map) = lock.as_ref() {
+        if let Some(&until) = map.get(&key) {
+            return Instant::now() < until;
+        }
+    }
+    false
+}
 
 fn blacklist_ws(dc: u32, is_media: bool) {
     // Instead of a permanent blacklist, apply a long cooldown so the proxy
@@ -172,7 +216,7 @@ pub async fn handle_client(
     let media_tag = if is_media { "m" } else { "" };
 
     if target_ip.is_none() {
-        // DC not in config — fall back to TCP using default IP.
+        // DC not in config — try upstream proxies, then fall back to direct TCP.
         let reason = format!("DC{} not in --dc-ip config", dc_id);
         let fallback = match dc_fallback_ips.get(&dc_id) {
             Some(ip) => ip.clone(),
@@ -181,6 +225,58 @@ pub async fn handle_client(
                 return;
             }
         };
+
+        // Try each configured upstream MTProto proxy.
+        for upstream in &config.mtproto_proxies {
+            if upstream_in_cooldown(&upstream.host, upstream.port) {
+                debug!(
+                    "[{}] upstream {}:{} in cooldown, skipping",
+                    label, upstream.host, upstream.port
+                );
+                continue;
+            }
+
+            match connect_mtproto_upstream(
+                &upstream.host,
+                upstream.port,
+                &upstream.secret,
+                dc_idx,
+                proto,
+            )
+            .await
+            {
+                Some((rem_reader, rem_writer, up_enc, up_dec)) => {
+                    clear_upstream_cooldown(&upstream.host, upstream.port);
+                    info!(
+                        "[{}] DC{}{} {} → upstream MTProto {}:{}",
+                        label, dc_id, media_tag, reason, upstream.host, upstream.port
+                    );
+                    let ConnectionCiphers { clt_dec, clt_enc, .. } = ciphers;
+                    let up_ciphers = ConnectionCiphers {
+                        clt_dec,
+                        clt_enc,
+                        tg_enc: up_enc,
+                        tg_dec: up_dec,
+                    };
+                    bridge_mtproto_relay(
+                        &label, reader, writer, rem_reader, rem_writer, up_ciphers, dc_id,
+                        is_media,
+                    )
+                    .await;
+                    return;
+                }
+                None => {
+                    set_upstream_cooldown(&upstream.host, upstream.port);
+                    warn!(
+                        "[{}] upstream {}:{} failed, cooldown {}s",
+                        label,
+                        upstream.host,
+                        upstream.port,
+                        UPSTREAM_FAIL_COOLDOWN.as_secs()
+                    );
+                }
+            }
+        }
 
         info!("[{}] {} → TCP fallback {}:443", label, reason, fallback);
 
@@ -229,7 +325,7 @@ pub async fn handle_client(
                 ws
             }
             None => {
-                // WS failed — apply cooldown and fall back to TCP.
+                // WS failed — apply cooldown and try upstream proxies or TCP fallback.
                 if all_redirects {
                     blacklist_ws(dc_id, is_media);
 
@@ -250,6 +346,58 @@ pub async fn handle_client(
                         media_tag,
                         WS_FAIL_COOLDOWN.as_secs()
                     );
+                }
+
+                // Try each configured upstream MTProto proxy before direct TCP.
+                for upstream in &config.mtproto_proxies {
+                    if upstream_in_cooldown(&upstream.host, upstream.port) {
+                        debug!(
+                            "[{}] upstream {}:{} in cooldown, skipping",
+                            label, upstream.host, upstream.port
+                        );
+                        continue;
+                    }
+
+                    match connect_mtproto_upstream(
+                        &upstream.host,
+                        upstream.port,
+                        &upstream.secret,
+                        dc_idx,
+                        proto,
+                    )
+                    .await
+                    {
+                        Some((rem_reader, rem_writer, up_enc, up_dec)) => {
+                            clear_upstream_cooldown(&upstream.host, upstream.port);
+                            info!(
+                                "[{}] DC{}{} → upstream MTProto {}:{}",
+                                label, dc_id, media_tag, upstream.host, upstream.port
+                            );
+                            let ConnectionCiphers { clt_dec, clt_enc, .. } = ciphers;
+                            let up_ciphers = ConnectionCiphers {
+                                clt_dec,
+                                clt_enc,
+                                tg_enc: up_enc,
+                                tg_dec: up_dec,
+                            };
+                            bridge_mtproto_relay(
+                                &label, reader, writer, rem_reader, rem_writer, up_ciphers,
+                                dc_id, is_media,
+                            )
+                            .await;
+                            return;
+                        }
+                        None => {
+                            set_upstream_cooldown(&upstream.host, upstream.port);
+                            warn!(
+                                "[{}] upstream {}:{} failed, cooldown {}s",
+                                label,
+                                upstream.host,
+                                upstream.port,
+                                UPSTREAM_FAIL_COOLDOWN.as_secs()
+                            );
+                        }
+                    }
                 }
 
                 let fallback = dc_fallback_ips
@@ -428,6 +576,166 @@ async fn bridge_ws(
 
     info!(
         "[{}] DC{}{} WS session closed: ↑{}  ↓{}  {:.1}s",
+        label,
+        dc,
+        if is_media { "m" } else { "" },
+        human_bytes(bytes_up),
+        human_bytes(bytes_down),
+        elapsed
+    );
+}
+
+// ─── Upstream MTProto proxy connection ───────────────────────────────────────
+
+/// Connect to an upstream MTProto proxy and perform the client handshake.
+///
+/// Returns the split TCP stream and the two ciphers for the session:
+/// - `enc`: encrypts data we send to the upstream proxy.
+/// - `dec`: decrypts data we receive from the upstream proxy.
+async fn connect_mtproto_upstream(
+    host: &str,
+    port: u16,
+    secret_hex: &str,
+    dc_idx: i16,
+    proto: crate::crypto::ProtoTag,
+) -> Option<(
+    tokio::io::ReadHalf<TcpStream>,
+    tokio::io::WriteHalf<TcpStream>,
+    AesCtr256,
+    AesCtr256,
+)> {
+    let secret = match hex::decode(secret_hex) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(
+                "[upstream] {}:{} invalid hex secret: {}",
+                host, port, e
+            );
+            return None;
+        }
+    };
+
+    let stream = match tokio::time::timeout(
+        UPSTREAM_CONNECT_TIMEOUT,
+        TcpStream::connect(format!("{}:{}", host, port)),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            warn!("[upstream] {}:{} connect error: {}", host, port, e);
+            return None;
+        }
+        Err(_) => {
+            warn!("[upstream] {}:{} connect timed out", host, port);
+            return None;
+        }
+    };
+    let _ = stream.set_nodelay(true);
+
+    let (handshake, enc, dec) = generate_client_handshake(&secret, dc_idx, proto);
+
+    let (reader, mut writer) = tokio::io::split(stream);
+    if let Err(e) = writer.write_all(&handshake).await {
+        warn!("[upstream] {}:{} send handshake error: {}", host, port, e);
+        return None;
+    }
+
+    Some((reader, writer, enc, dec))
+}
+
+// ─── Upstream MTProto relay bridge ───────────────────────────────────────────
+
+/// Bidirectional bridge between the client (TCP) and an upstream MTProto proxy
+/// (TCP).  The upstream proxy handles the onward Telegram connection.
+///
+/// `ciphers.tg_enc` / `ciphers.tg_dec` must already be set to the upstream
+/// session ciphers returned by [`connect_mtproto_upstream`].
+async fn bridge_mtproto_relay(
+    label: &str,
+    reader: tokio::io::ReadHalf<TcpStream>,
+    writer: tokio::io::WriteHalf<TcpStream>,
+    rem_reader: tokio::io::ReadHalf<TcpStream>,
+    mut rem_writer: tokio::io::WriteHalf<TcpStream>,
+    ciphers: ConnectionCiphers,
+    dc: u32,
+    is_media: bool,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let ConnectionCiphers {
+        mut clt_dec,
+        mut clt_enc,
+        mut tg_enc,
+        mut tg_dec,
+    } = ciphers;
+
+    // The upstream proxy is already expecting encrypted data (the client
+    // handshake was the only "setup" packet; no additional relay_init is sent).
+
+    let start = std::time::Instant::now();
+
+    let mut upload = tokio::spawn(async move {
+        let mut reader = reader;
+        let mut buf = vec![0u8; 65536];
+        let mut total = 0u64;
+
+        loop {
+            let n = match reader.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let chunk = &mut buf[..n];
+            clt_dec.apply_keystream(chunk);
+            tg_enc.apply_keystream(chunk);
+            if rem_writer.write_all(chunk).await.is_err() {
+                break;
+            }
+            total += n as u64;
+        }
+        total
+    });
+
+    let mut download = tokio::spawn(async move {
+        let mut rem_reader = rem_reader;
+        let mut writer = writer;
+        let mut buf = vec![0u8; 65536];
+        let mut total = 0u64;
+
+        loop {
+            let n = match rem_reader.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let chunk = &mut buf[..n];
+            tg_dec.apply_keystream(chunk);
+            clt_enc.apply_keystream(chunk);
+            if writer.write_all(chunk).await.is_err() {
+                break;
+            }
+            total += n as u64;
+        }
+        total
+    });
+
+    let (bytes_up, bytes_down) = tokio::select! {
+        result = &mut upload => {
+            let up = result.unwrap_or(0);
+            download.abort();
+            let down = download.await.unwrap_or(0);
+            (up, down)
+        }
+        result = &mut download => {
+            let down = result.unwrap_or(0);
+            upload.abort();
+            let up = upload.await.unwrap_or(0);
+            (up, down)
+        }
+    };
+
+    let elapsed = start.elapsed().as_secs_f32();
+    info!(
+        "[{}] DC{}{} upstream session closed: ↑{}  ↓{}  {:.1}s",
         label,
         dc,
         if is_media { "m" } else { "" },

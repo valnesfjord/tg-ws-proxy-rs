@@ -162,6 +162,13 @@ async fn main() {
         info!("  ⚠  TLS certificate verification DISABLED");
     }
 
+    if !config.mtproto_proxies.is_empty() {
+        info!("  Upstream MTProto proxies (WS fallback):");
+        for p in &config.mtproto_proxies {
+            info!("    {}:{}", p.host, p.port);
+        }
+    }
+
     info!(
         "  Max connections: {} (fd-limit: {})",
         max_connections, fd_limit

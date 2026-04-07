@@ -195,6 +195,100 @@ pub fn make_cipher(key: &[u8], iv: &[u8]) -> AesCtr256 {
     AesCtr256::new_from_slices(key, iv).expect("key must be 32 bytes and iv must be 16 bytes")
 }
 
+// ─── Client handshake generation (our proxy acting as a client to upstream) ──
+
+/// Generate a 64-byte MTProto obfuscation handshake that our proxy sends to
+/// an upstream MTProto proxy, plus the two AES-256-CTR ciphers for the session.
+///
+/// Returns `(handshake, enc, dec)` where:
+/// - `handshake` is the 64 bytes to send to the upstream proxy.
+/// - `enc` encrypts data we send upstream (fast-forwarded 64 bytes).
+/// - `dec` decrypts data we receive from upstream.
+///
+/// The upstream proxy parses our handshake with `SHA-256(prekey ∥ upstream_secret)`
+/// and then routes the connection to the requested `dc_idx`.
+pub fn generate_client_handshake(
+    secret: &[u8],
+    dc_idx: i16,
+    proto: ProtoTag,
+) -> ([u8; HANDSHAKE_LEN], AesCtr256, AesCtr256) {
+    let proto_bytes = proto.as_bytes();
+    let dc_bytes = dc_idx.to_le_bytes();
+
+    loop {
+        let mut raw = [0u8; HANDSHAKE_LEN];
+        rand::thread_rng().fill_bytes(&mut raw);
+
+        // Reject reserved prefixes (same rules as generate_relay_init).
+        if RESERVED_FIRST_BYTES.contains(&raw[0]) {
+            continue;
+        }
+        if RESERVED_STARTS.iter().any(|s| &raw[..4] == s) {
+            continue;
+        }
+        if raw[4..8] == RESERVED_CONTINUE {
+            continue;
+        }
+
+        // Derive key and IV from the raw (pre-modification) bytes so the
+        // upstream proxy can reproduce them from the handshake it receives.
+        let key = {
+            let mut h = Sha256::new();
+            h.update(&raw[SKIP_LEN..SKIP_LEN + PREKEY_LEN]);
+            h.update(secret);
+            h.finalize()
+        };
+        let iv = &raw[SKIP_LEN + PREKEY_LEN..SKIP_LEN + PREKEY_LEN + IV_LEN];
+
+        // Obtain the full keystream by encrypting a zero buffer.
+        let mut keystream = [0u8; HANDSHAKE_LEN];
+        make_cipher(&key, iv).apply_keystream(&mut keystream);
+
+        // Embed proto_tag and dc_idx at positions [56..64] by XOR-ing with the
+        // keystream so the upstream proxy sees the correct values after decryption.
+        let mut handshake = raw;
+        for i in 0..4 {
+            handshake[PROTO_TAG_POS + i] = proto_bytes[i] ^ keystream[PROTO_TAG_POS + i];
+        }
+        for i in 0..2 {
+            handshake[DC_IDX_POS + i] = dc_bytes[i] ^ keystream[DC_IDX_POS + i];
+        }
+        // handshake[62..64] stays as the original random raw bytes — these two
+        // padding bytes are not interpreted by the upstream proxy and can be arbitrary.
+
+        // Build enc cipher (what we use to encrypt data sent to upstream).
+        // This mirrors the upstream's clt_dec cipher: same key/IV, fast-forwarded 64 bytes.
+        let enc_key = {
+            let mut h = Sha256::new();
+            h.update(&handshake[SKIP_LEN..SKIP_LEN + PREKEY_LEN]);
+            h.update(secret);
+            h.finalize()
+        };
+        let enc_iv = &handshake[SKIP_LEN + PREKEY_LEN..SKIP_LEN + PREKEY_LEN + IV_LEN];
+        let mut enc = make_cipher(&enc_key, enc_iv);
+        let mut dummy = [0u8; HANDSHAKE_LEN];
+        enc.apply_keystream(&mut dummy); // fast-forward past the handshake bytes
+
+        // Build dec cipher (what we use to decrypt data from upstream).
+        // This mirrors the upstream's clt_enc cipher: reversed prekey+IV, not fast-forwarded.
+        let reversed: Vec<u8> = handshake[SKIP_LEN..SKIP_LEN + PREKEY_LEN + IV_LEN]
+            .iter()
+            .rev()
+            .copied()
+            .collect();
+        let dec_key = {
+            let mut h = Sha256::new();
+            h.update(&reversed[..PREKEY_LEN]);
+            h.update(secret);
+            h.finalize()
+        };
+        let dec_iv = &reversed[PREKEY_LEN..];
+        let dec = make_cipher(&dec_key, dec_iv);
+
+        return (handshake, enc, dec);
+    }
+}
+
 // ─── Client ↔ proxy ciphers ──────────────────────────────────────────────────
 
 /// All four AES-256-CTR ciphers needed for one proxied connection.

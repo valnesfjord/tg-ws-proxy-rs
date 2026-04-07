@@ -32,6 +32,39 @@ pub fn default_dc_overrides() -> HashMap<u32, u32> {
     [(203, 2)].iter().copied().collect()
 }
 
+// ─── Upstream MTProto proxy config ───────────────────────────────────────────
+
+/// An upstream MTProto proxy to fall back to when the WebSocket path fails.
+#[derive(Clone, Debug)]
+pub struct MtProtoProxy {
+    pub host: String,
+    pub port: u16,
+    /// Hex-encoded proxy secret (32 hex chars = 16 bytes).
+    pub secret: String,
+}
+
+/// Parse a `HOST:PORT:SECRET` triplet.
+/// Splitting from the right handles IPv4/domain hosts; the two right-most
+/// colons delimit port and secret.
+/// Note: IPv6 addresses in bracket notation (e.g. `[::1]:443:secret`) are
+/// not supported — use a hostname or IPv4 address instead.
+fn parse_mtproto_proxy(s: &str) -> Result<MtProtoProxy, String> {
+    // rsplitn(3, ':') yields at most 3 parts, right-to-left: [secret, port, host]
+    let parts: Vec<&str> = s.rsplitn(3, ':').collect();
+    if parts.len() != 3 {
+        return Err(format!("expected HOST:PORT:SECRET, got {:?}", s));
+    }
+    let secret = parts[0].to_string();
+    let port: u16 = parts[1]
+        .parse()
+        .map_err(|_| format!("invalid port {:?}", parts[1]))?;
+    let host = parts[2].to_string();
+
+    hex::decode(&secret).map_err(|_| format!("invalid hex secret {:?}", secret))?;
+
+    Ok(MtProtoProxy { host, port, secret })
+}
+
 // ─── CLI / env-var configuration ─────────────────────────────────────────────
 
 /// Parse a `DC:IP` pair such as `2:149.154.167.220`.
@@ -112,6 +145,19 @@ pub struct Config {
     /// Overrides `--verbose` when both are set.
     #[arg(short = 'q', long, env = "TG_QUIET")]
     pub quiet: bool,
+
+    /// Upstream MTProto proxy to try when the WebSocket path fails.
+    /// Format: `HOST:PORT:SECRET` (32 hex chars).  Can be specified multiple times.
+    /// Multiple proxies are tried in order until one succeeds.
+    /// Via env: comma-separated list, e.g. `host1:443:sec1,host2:8888:sec2`.
+    #[arg(
+        long = "mtproto-proxy",
+        value_name = "HOST:PORT:SECRET",
+        value_parser = parse_mtproto_proxy,
+        value_delimiter = ',',
+        env = "TG_MTPROTO_PROXY"
+    )]
+    pub mtproto_proxies: Vec<MtProtoProxy>,
 
     /// IP address to advertise in the generated `tg://proxy` link.
     /// Useful when the proxy listens on `0.0.0.0` or `127.0.0.1` but clients
