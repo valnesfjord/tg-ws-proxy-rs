@@ -39,7 +39,11 @@ pub fn default_dc_overrides() -> HashMap<u32, u32> {
 pub struct MtProtoProxy {
     pub host: String,
     pub port: u16,
-    /// Hex-encoded proxy secret (32 hex chars = 16 bytes).
+    /// Hex-encoded proxy secret as it appears in the `tg://proxy` link.
+    /// May be 32 hex chars (16 bytes, plain secret), or 34 hex chars (17 bytes)
+    /// with a 1-byte mode-indicator prefix: `dd` = padded intermediate,
+    /// `ee` = FakeTLS.  The prefix byte is stripped before key derivation —
+    /// only the trailing 16 bytes are used as the actual cryptographic key.
     pub secret: String,
 }
 
