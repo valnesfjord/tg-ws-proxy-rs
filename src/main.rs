@@ -13,6 +13,7 @@
 //! See [`proxy`] for the connection handling logic and [`crypto`] for the
 //! MTProto obfuscation details.
 
+use std::io::IsTerminal as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -117,7 +118,6 @@ async fn main() {
         // Windows consoles that lack Virtual Terminal Processing support, so
         // disable them there.  Also disable when stderr is not a terminal
         // (e.g. output is piped or redirected).
-        use std::io::IsTerminal as _;
         let use_ansi = std::io::stderr().is_terminal() && !cfg!(windows);
         tracing_subscriber::fmt()
             .with_env_filter(env_filter)
