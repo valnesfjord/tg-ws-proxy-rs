@@ -150,6 +150,11 @@ pub struct Config {
     #[arg(short = 'q', long, env = "TG_QUIET")]
     pub quiet: bool,
 
+    /// Write log output to this file instead of stderr.
+    /// Log lines written to a file never contain ANSI color codes.
+    #[arg(long = "log-file", value_name = "PATH", env = "TG_LOG_FILE")]
+    pub log_file: Option<String>,
+
     /// Upstream MTProto proxy to try when the WebSocket path fails.
     /// Format: `HOST:PORT:SECRET` (32 hex chars).  Can be specified multiple times.
     /// Multiple proxies are tried in order until one succeeds.
