@@ -308,24 +308,48 @@ pub async fn handle_client(
             )
             .await
             {
-                Some((rem_reader, rem_writer, up_enc, up_dec)) => {
+                Some(conn) => {
                     clear_upstream_cooldown(&upstream.host, upstream.port);
+                    let is_ft = matches!(conn, UpstreamConnection::FakeTls(..));
                     info!(
-                        "[{}] DC{}{} {} → upstream MTProto {}:{}",
-                        label, dc_id, media_tag, reason, upstream.host, upstream.port
+                        "[{}] DC{}{} {} → upstream MTProto {}:{} ({})",
+                        label,
+                        dc_id,
+                        media_tag,
+                        reason,
+                        upstream.host,
+                        upstream.port,
+                        if is_ft { "FakeTLS" } else { "plain" }
                     );
                     let ConnectionCiphers { clt_dec, clt_enc, .. } = ciphers;
-                    let up_ciphers = ConnectionCiphers {
-                        clt_dec,
-                        clt_enc,
-                        tg_enc: up_enc,
-                        tg_dec: up_dec,
-                    };
-                    bridge_mtproto_relay(
-                        &label, reader, writer, rem_reader, rem_writer, up_ciphers, dc_id,
-                        is_media,
-                    )
-                    .await;
+                    match conn {
+                        UpstreamConnection::Plain(rem_reader, rem_writer, up_enc, up_dec) => {
+                            let up_ciphers = ConnectionCiphers {
+                                clt_dec,
+                                clt_enc,
+                                tg_enc: up_enc,
+                                tg_dec: up_dec,
+                            };
+                            bridge_mtproto_relay(
+                                &label, reader, writer, rem_reader, rem_writer, up_ciphers,
+                                dc_id, is_media,
+                            )
+                            .await;
+                        }
+                        UpstreamConnection::FakeTls(rem_reader, rem_writer, up_enc, up_dec) => {
+                            let up_ciphers = ConnectionCiphers {
+                                clt_dec,
+                                clt_enc,
+                                tg_enc: up_enc,
+                                tg_dec: up_dec,
+                            };
+                            bridge_faketls_relay(
+                                &label, reader, writer, rem_reader, rem_writer, up_ciphers,
+                                dc_id, is_media,
+                            )
+                            .await;
+                        }
+                    }
                     return;
                 }
                 None => {
@@ -430,24 +454,57 @@ pub async fn handle_client(
                     )
                     .await
                     {
-                        Some((rem_reader, rem_writer, up_enc, up_dec)) => {
+                        Some(conn) => {
                             clear_upstream_cooldown(&upstream.host, upstream.port);
+                            let is_ft = matches!(conn, UpstreamConnection::FakeTls(..));
                             info!(
-                                "[{}] DC{}{} → upstream MTProto {}:{}",
-                                label, dc_id, media_tag, upstream.host, upstream.port
+                                "[{}] DC{}{} → upstream MTProto {}:{} ({})",
+                                label,
+                                dc_id,
+                                media_tag,
+                                upstream.host,
+                                upstream.port,
+                                if is_ft { "FakeTLS" } else { "plain" }
                             );
                             let ConnectionCiphers { clt_dec, clt_enc, .. } = ciphers;
-                            let up_ciphers = ConnectionCiphers {
-                                clt_dec,
-                                clt_enc,
-                                tg_enc: up_enc,
-                                tg_dec: up_dec,
-                            };
-                            bridge_mtproto_relay(
-                                &label, reader, writer, rem_reader, rem_writer, up_ciphers,
-                                dc_id, is_media,
-                            )
-                            .await;
+                            match conn {
+                                UpstreamConnection::Plain(
+                                    rem_reader,
+                                    rem_writer,
+                                    up_enc,
+                                    up_dec,
+                                ) => {
+                                    let up_ciphers = ConnectionCiphers {
+                                        clt_dec,
+                                        clt_enc,
+                                        tg_enc: up_enc,
+                                        tg_dec: up_dec,
+                                    };
+                                    bridge_mtproto_relay(
+                                        &label, reader, writer, rem_reader, rem_writer,
+                                        up_ciphers, dc_id, is_media,
+                                    )
+                                    .await;
+                                }
+                                UpstreamConnection::FakeTls(
+                                    rem_reader,
+                                    rem_writer,
+                                    up_enc,
+                                    up_dec,
+                                ) => {
+                                    let up_ciphers = ConnectionCiphers {
+                                        clt_dec,
+                                        clt_enc,
+                                        tg_enc: up_enc,
+                                        tg_dec: up_dec,
+                                    };
+                                    bridge_faketls_relay(
+                                        &label, reader, writer, rem_reader, rem_writer,
+                                        up_ciphers, dc_id, is_media,
+                                    )
+                                    .await;
+                                }
+                            }
                             return;
                         }
                         None => {
@@ -650,23 +707,40 @@ async fn bridge_ws(
 
 // ─── Upstream MTProto proxy connection ───────────────────────────────────────
 
+/// Result of a successful upstream MTProto proxy connection.
+///
+/// - `Plain`: standard MTProto obfuscated stream (raw AES-CTR, no extra framing).
+/// - `FakeTls`: MTProto stream wrapped in TLS Application Data records (0xee secrets).
+enum UpstreamConnection {
+    Plain(
+        tokio::io::ReadHalf<TcpStream>,
+        tokio::io::WriteHalf<TcpStream>,
+        AesCtr256,
+        AesCtr256,
+    ),
+    FakeTls(
+        tokio::io::ReadHalf<TcpStream>,
+        tokio::io::WriteHalf<TcpStream>,
+        AesCtr256,
+        AesCtr256,
+    ),
+}
+
 /// Connect to an upstream MTProto proxy and perform the client handshake.
 ///
-/// Returns the split TCP stream and the two ciphers for the session:
-/// - `enc`: encrypts data we send to the upstream proxy.
-/// - `dec`: decrypts data we receive from the upstream proxy.
+/// Detects the secret prefix to choose the right transport:
+/// - No prefix / unknown: plain MTProto obfuscated stream.
+/// - `0xdd` prefix: plain stream, key stripped from bytes [1..17].
+/// - `0xee` prefix: FakeTLS — sends a TLS ClientHello, drains the server's
+///   fake handshake response, then returns a `FakeTls` connection whose data
+///   must be wrapped / unwrapped in TLS Application Data records by the caller.
 async fn connect_mtproto_upstream(
     host: &str,
     port: u16,
     secret_hex: &str,
     dc_idx: i16,
     proto: crate::crypto::ProtoTag,
-) -> Option<(
-    tokio::io::ReadHalf<TcpStream>,
-    tokio::io::WriteHalf<TcpStream>,
-    AesCtr256,
-    AesCtr256,
-)> {
+) -> Option<UpstreamConnection> {
     let secret = match hex::decode(secret_hex) {
         Ok(b) => b,
         Err(e) => {
@@ -678,21 +752,23 @@ async fn connect_mtproto_upstream(
         }
     };
 
-    // Telegram MTProto proxy secrets in link format start with a 1-byte mode
-    // indicator: 0xdd = padded intermediate, 0xee = FakeTLS.  This byte is a
-    // connection-mode flag and is NOT part of the 16-byte key material used for
-    // SHA-256 key derivation.  Strip it before key derivation.
+    // ── Secret parsing ────────────────────────────────────────────────────
     //
-    // Note: the protocol we declare in the handshake must match what we actually
-    // send — i.e. the client's protocol — because we forward client data without
-    // any re-framing.  The upstream prefix only tells us about key stripping,
-    // not about what framing we should use on our side.
+    // Telegram MTProto proxy secrets start with an optional 1-byte mode flag:
+    //   0xdd → padded-intermediate, key = secret[1..17]
+    //   0xee → FakeTLS, key = secret[1..17], hostname = secret[17..]
+    //
+    // For FakeTLS we send a real-looking TLS ClientHello embedding the
+    // 64-byte MTProto init in the `random` + `session_id` fields, then drain
+    // the server's fake TLS handshake before switching to the data phase.
+    let is_faketls = secret.len() > 17 && secret[0] == 0xee;
     let key_bytes: &[u8] = if secret.len() >= 17 && matches!(secret[0], 0xdd | 0xee) {
         &secret[1..17]
     } else {
         &secret
     };
 
+    // ── TCP connect ───────────────────────────────────────────────────────
     let stream = match tokio::time::timeout(
         UPSTREAM_CONNECT_TIMEOUT,
         TcpStream::connect(format!("{}:{}", host, port)),
@@ -712,14 +788,200 @@ async fn connect_mtproto_upstream(
     let _ = stream.set_nodelay(true);
 
     let (handshake, enc, dec) = generate_client_handshake(key_bytes, dc_idx, proto);
+    let (mut reader, mut writer) = tokio::io::split(stream);
 
-    let (reader, mut writer) = tokio::io::split(stream);
-    if let Err(e) = writer.write_all(&handshake).await {
-        warn!("[upstream] {}:{} send handshake error: {}", host, port, e);
-        return None;
+    if is_faketls {
+        // ── FakeTLS path ──────────────────────────────────────────────────
+        let hostname =
+            match std::str::from_utf8(&secret[17..]) {
+                Ok(h) => h,
+                Err(_) => {
+                    warn!(
+                        "[upstream] {}:{} FakeTLS secret has non-UTF-8 hostname",
+                        host, port
+                    );
+                    return None;
+                }
+            };
+
+        let client_hello = build_faketls_client_hello(&handshake, hostname);
+        if let Err(e) = writer.write_all(&client_hello).await {
+            warn!(
+                "[upstream] {}:{} FakeTLS send ClientHello error: {}",
+                host, port, e
+            );
+            return None;
+        }
+
+        if !drain_faketls_server_hello(&mut reader).await {
+            warn!(
+                "[upstream] {}:{} FakeTLS server handshake failed",
+                host, port
+            );
+            return None;
+        }
+
+        Some(UpstreamConnection::FakeTls(reader, writer, enc, dec))
+    } else {
+        // ── Plain MTProto path ────────────────────────────────────────────
+        if let Err(e) = writer.write_all(&handshake).await {
+            warn!("[upstream] {}:{} send handshake error: {}", host, port, e);
+            return None;
+        }
+
+        Some(UpstreamConnection::Plain(reader, writer, enc, dec))
+    }
+}
+
+// ── FakeTLS helpers ───────────────────────────────────────────────────────────
+
+/// Build a TLS 1.2-style ClientHello packet that embeds a 64-byte MTProto
+/// obfuscation init in the `random` (bytes 0..32) and `session_id` (bytes
+/// 32..64) fields.
+///
+/// The resulting packet looks like a real browser ClientHello and is accepted
+/// by all standard FakeTLS MTProto proxy implementations (official Telegram
+/// MTProxy, 9seconds/mtg, etc.).
+fn build_faketls_client_hello(init_bytes: &[u8; 64], hostname: &str) -> Vec<u8> {
+    // ── Extensions ────────────────────────────────────────────────────────
+    let mut exts: Vec<u8> = Vec::new();
+
+    // server_name (SNI)
+    let host_b = hostname.as_bytes();
+    let host_len = host_b.len() as u16;
+    let sni_entry_len = 1u16 + 2 + host_len; // type(1) + len(2) + name
+    let sni_list_len = sni_entry_len;
+    let sni_data_len = 2u16 + sni_list_len; // list_length field + entry
+    exts.extend_from_slice(&0x0000u16.to_be_bytes()); // ext type
+    exts.extend_from_slice(&sni_data_len.to_be_bytes());
+    exts.extend_from_slice(&sni_list_len.to_be_bytes());
+    exts.push(0x00); // name_type: host_name
+    exts.extend_from_slice(&host_len.to_be_bytes());
+    exts.extend_from_slice(host_b);
+
+    // extended_master_secret (empty)
+    exts.extend_from_slice(&[0x00, 0x17, 0x00, 0x00]);
+
+    // supported_groups: x25519, secp256r1, secp384r1, secp521r1
+    #[rustfmt::skip]
+    exts.extend_from_slice(&[
+        0x00, 0x0a, 0x00, 0x0a, 0x00, 0x08,
+        0x00, 0x1d, 0x00, 0x17, 0x00, 0x18, 0x00, 0x19,
+    ]);
+
+    // ec_point_formats: uncompressed only
+    exts.extend_from_slice(&[0x00, 0x0b, 0x00, 0x02, 0x01, 0x00]);
+
+    // session_ticket (empty = requesting a ticket)
+    exts.extend_from_slice(&[0x00, 0x23, 0x00, 0x00]);
+
+    // signature_algorithms
+    #[rustfmt::skip]
+    exts.extend_from_slice(&[
+        0x00, 0x0d, 0x00, 0x14, 0x00, 0x12,
+        0x04, 0x03, 0x08, 0x04, 0x04, 0x01,
+        0x05, 0x03, 0x08, 0x05, 0x05, 0x01,
+        0x08, 0x06, 0x06, 0x01, 0x02, 0x01,
+    ]);
+
+    // ── Cipher suites ─────────────────────────────────────────────────────
+    #[rustfmt::skip]
+    let cipher_suites: &[u8] = &[
+        0x13, 0x01,  // TLS_AES_128_GCM_SHA256
+        0x13, 0x02,  // TLS_AES_256_GCM_SHA384
+        0x13, 0x03,  // TLS_CHACHA20_POLY1305_SHA256
+        0xc0, 0x2b,  // ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+        0xc0, 0x2f,  // ECDHE_RSA_WITH_AES_128_GCM_SHA256
+        0xc0, 0x2c,  // ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+        0xc0, 0x30,  // ECDHE_RSA_WITH_AES_256_GCM_SHA384
+        0xcc, 0xa9,  // ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+        0xcc, 0xa8,  // ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+        0xc0, 0x13,  // ECDHE_RSA_WITH_AES_128_CBC_SHA
+        0xc0, 0x14,  // ECDHE_RSA_WITH_AES_256_CBC_SHA
+        0x00, 0x9c,  // RSA_WITH_AES_128_GCM_SHA256
+        0x00, 0x9d,  // RSA_WITH_AES_256_GCM_SHA384
+        0x00, 0x2f,  // RSA_WITH_AES_128_CBC_SHA
+        0x00, 0x35,  // RSA_WITH_AES_256_CBC_SHA
+        0x00, 0x0a,  // RSA_WITH_3DES_EDE_CBC_SHA
+        0x00, 0xff,  // TLS_EMPTY_RENEGOTIATION_INFO_SCSV
+    ];
+
+    // ── ClientHello body ──────────────────────────────────────────────────
+    let mut hello: Vec<u8> = Vec::new();
+    hello.extend_from_slice(&[0x03, 0x03]); // version: TLS 1.2
+    hello.extend_from_slice(&init_bytes[0..32]); // random (32 bytes of MTProto init)
+    hello.push(0x20); // session_id length = 32
+    hello.extend_from_slice(&init_bytes[32..64]); // session_id (32 bytes of MTProto init)
+    hello.extend_from_slice(&(cipher_suites.len() as u16).to_be_bytes());
+    hello.extend_from_slice(cipher_suites);
+    hello.push(0x01); // compression_methods length: 1
+    hello.push(0x00); // null compression
+    hello.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+    hello.extend_from_slice(&exts);
+
+    // ── Handshake message ─────────────────────────────────────────────────
+    let hello_len = hello.len() as u32;
+    let mut handshake: Vec<u8> = Vec::with_capacity(4 + hello.len());
+    handshake.push(0x01); // HandshakeType: ClientHello
+    handshake.push((hello_len >> 16) as u8);
+    handshake.push((hello_len >> 8) as u8);
+    handshake.push(hello_len as u8);
+    handshake.extend_from_slice(&hello);
+
+    // ── TLS record ────────────────────────────────────────────────────────
+    let mut record: Vec<u8> = Vec::with_capacity(5 + handshake.len());
+    record.push(0x16); // Content-Type: Handshake
+    record.push(0x03); // Legacy version: TLS 1.0
+    record.push(0x01);
+    record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+    record.extend_from_slice(&handshake);
+
+    record
+}
+
+/// Read and discard TLS records until the fake TLS handshake is complete.
+///
+/// FakeTLS proxies send:
+///   Handshake (0x16) → ChangeCipherSpec (0x14) → Application Data (0x17)
+///
+/// We discard Handshake and ChangeCipherSpec records unconditionally and stop
+/// (returning `true`) as soon as we see the first Application Data record,
+/// which is the server's synthetic "finished" message.  All subsequent
+/// Application Data records are actual MTProto data.
+async fn drain_faketls_server_hello(
+    reader: &mut tokio::io::ReadHalf<TcpStream>,
+) -> bool {
+    let mut header = [0u8; 5];
+
+    // At most 20 records before we give up — a real TLS handshake never
+    // produces that many distinct records.
+    for _ in 0..20 {
+        if reader.read_exact(&mut header).await.is_err() {
+            return false;
+        }
+
+        let record_type = header[0];
+        let payload_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+
+        // TLS records must not exceed 16 KiB.
+        if payload_len > 16384 {
+            return false;
+        }
+
+        let mut payload = vec![0u8; payload_len];
+        if reader.read_exact(&mut payload).await.is_err() {
+            return false;
+        }
+
+        match record_type {
+            0x16 | 0x14 => {} // Handshake or ChangeCipherSpec: discard and loop
+            0x17 => return true, // Application Data: fake handshake complete
+            0x15 => return false, // Alert: something went wrong
+            _ => return false, // Unexpected record type
+        }
     }
 
-    Some((reader, writer, enc, dec))
+    false // Too many records without reaching Application Data
 }
 
 // ─── Upstream MTProto relay bridge ───────────────────────────────────────────
@@ -814,6 +1076,143 @@ async fn bridge_mtproto_relay(
     let elapsed = start.elapsed().as_secs_f32();
     info!(
         "[{}] DC{}{} upstream session closed: ↑{}  ↓{}  {:.1}s",
+        label,
+        dc,
+        if is_media { "m" } else { "" },
+        human_bytes(bytes_up),
+        human_bytes(bytes_down),
+        elapsed
+    );
+}
+
+// ─── FakeTLS upstream relay bridge ───────────────────────────────────────────
+
+/// Bidirectional bridge between the client (TCP) and an upstream FakeTLS proxy.
+///
+/// Identical to [`bridge_mtproto_relay`] except that:
+/// - **Writes to upstream** are wrapped in TLS Application Data records
+///   (`\x17\x03\x03` + 2-byte big-endian length + payload).
+/// - **Reads from upstream** parse TLS record headers and extract payloads.
+///
+/// The AES-CTR re-encryption (`clt_dec` / `tg_enc` and `tg_dec` / `clt_enc`)
+/// operates on the payload inside TLS records, exactly as in the plain bridge.
+async fn bridge_faketls_relay(
+    label: &str,
+    reader: tokio::io::ReadHalf<TcpStream>,
+    writer: tokio::io::WriteHalf<TcpStream>,
+    rem_reader: tokio::io::ReadHalf<TcpStream>,
+    rem_writer: tokio::io::WriteHalf<TcpStream>,
+    ciphers: ConnectionCiphers,
+    dc: u32,
+    is_media: bool,
+) {
+    let ConnectionCiphers {
+        mut clt_dec,
+        mut clt_enc,
+        mut tg_enc,
+        mut tg_dec,
+    } = ciphers;
+
+    // TLS Application Data records may contain up to 16 KiB of payload.
+    const MAX_TLS_PAYLOAD: usize = 16384;
+
+    let start = std::time::Instant::now();
+
+    // ── Upload: client → upstream (wrapped in TLS Application Data records) ─
+    let mut upload = tokio::spawn(async move {
+        let mut reader = reader;
+        let mut rem_writer = rem_writer;
+        let mut buf = vec![0u8; MAX_TLS_PAYLOAD];
+        let mut total = 0u64;
+
+        loop {
+            let n = match reader.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let chunk = &mut buf[..n];
+            clt_dec.apply_keystream(chunk); // remove client's AES-CTR
+            tg_enc.apply_keystream(chunk); // add upstream's AES-CTR
+
+            // Wrap in TLS Application Data record: type + TLS 1.2 version + length
+            let header = [0x17u8, 0x03, 0x03, (n >> 8) as u8, n as u8];
+            if rem_writer.write_all(&header).await.is_err() {
+                break;
+            }
+            if rem_writer.write_all(&buf[..n]).await.is_err() {
+                break;
+            }
+            total += n as u64;
+        }
+
+        total
+    });
+
+    // ── Download: upstream → client (unwrap TLS Application Data records) ──
+    let mut download = tokio::spawn(async move {
+        let mut rem_reader = rem_reader;
+        let mut writer = writer;
+        let mut header = [0u8; 5];
+        let mut buf = vec![0u8; MAX_TLS_PAYLOAD];
+        let mut total = 0u64;
+
+        loop {
+            if rem_reader.read_exact(&mut header).await.is_err() {
+                break;
+            }
+
+            let record_type = header[0];
+            let payload_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+
+            if payload_len > MAX_TLS_PAYLOAD {
+                break; // malformed record
+            }
+
+            if record_type != 0x17 {
+                // Discard non-Application-Data records (shouldn't appear in
+                // the data phase but handle gracefully just in case).
+                let mut discard = vec![0u8; payload_len];
+                if rem_reader.read_exact(&mut discard).await.is_err() {
+                    break;
+                }
+                continue;
+            }
+
+            if rem_reader.read_exact(&mut buf[..payload_len]).await.is_err() {
+                break;
+            }
+
+            let chunk = &mut buf[..payload_len];
+            tg_dec.apply_keystream(chunk); // remove upstream's AES-CTR
+            clt_enc.apply_keystream(chunk); // add client's AES-CTR
+
+            if writer.write_all(chunk).await.is_err() {
+                break;
+            }
+            total += payload_len as u64;
+        }
+
+        total
+    });
+
+    let (bytes_up, bytes_down) = tokio::select! {
+        result = &mut upload => {
+            let up = result.unwrap_or(0);
+            download.abort();
+            let down = download.await.unwrap_or(0);
+            (up, down)
+        }
+        result = &mut download => {
+            let down = result.unwrap_or(0);
+            upload.abort();
+            let up = upload.await.unwrap_or(0);
+            (up, down)
+        }
+    };
+
+    let elapsed = start.elapsed().as_secs_f32();
+    info!(
+        "[{}] DC{}{} upstream FakeTLS session closed: ↑{}  ↓{}  {:.1}s",
         label,
         dc,
         if is_media { "m" } else { "" },
