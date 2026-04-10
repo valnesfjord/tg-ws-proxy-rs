@@ -20,10 +20,6 @@ use futures_util::{FutureExt, StreamExt};
 use crate::config::Config;
 use crate::ws_client::{connect_ws_for_dc, TgWsStream};
 
-// Age limit for pooled connections.  Telegram closes idle WebSocket connections
-// after roughly 60 seconds, so anything older than that is likely dead.
-const MAX_AGE: Duration = Duration::from_secs(55);
-
 struct PoolEntry {
     ws: TgWsStream,
     created: Instant,
@@ -34,6 +30,9 @@ type PoolMap = HashMap<(u32, bool), Bucket>;
 
 pub struct WsPool {
     pool_size: usize,
+    /// Maximum age for a pooled connection.  Connections older than this are
+    /// discarded on next use rather than handed to a client.
+    max_age: Duration,
     idle: Mutex<PoolMap>,
     /// Tracks which (dc, is_media) buckets currently have a refill in flight.
     /// Prevents a stampede of concurrent refill tasks when many clients arrive
@@ -60,9 +59,10 @@ impl Drop for RefillGuard<'_> {
 }
 
 impl WsPool {
-    pub fn new(pool_size: usize) -> Self {
+    pub fn new(pool_size: usize, max_age: Duration) -> Self {
         Self {
             pool_size,
+            max_age,
             idle: Mutex::new(HashMap::new()),
             refilling: StdMutex::new(HashSet::new()),
         }
@@ -85,7 +85,7 @@ impl WsPool {
 
         // Drain from the back (LIFO) so the freshest connections are used first.
         while let Some(mut entry) = bucket.pop() {
-            if now.saturating_duration_since(entry.created) > MAX_AGE {
+            if now.saturating_duration_since(entry.created) > self.max_age {
                 // Entry is stale; drop it (close happens on drop via tungstenite).
                 continue;
             }

@@ -51,28 +51,24 @@ use std::time::Instant;
 /// Also used for the "all redirects" case (longer cooldown of 5 min).
 static DC_FAIL_UNTIL: StdMutex<Option<HashMap<(u32, bool), Instant>>> = StdMutex::new(None);
 
-const WS_FAIL_COOLDOWN: Duration = Duration::from_secs(30);
-const WS_REDIRECT_COOLDOWN: Duration = Duration::from_secs(300); // 5 min for "all redirects"
+/// Fast-probe timeout used when a DC is still in cooldown: we try quickly so
+/// that a network change can restore WS without waiting the full normal timeout.
 const WS_FAIL_TIMEOUT: Duration = Duration::from_secs(2);
-const WS_NORMAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ─── Upstream MTProto proxy failure tracking ─────────────────────────────────
 
 /// Per-upstream cooldown: keyed by "host:port".
 static UPSTREAM_FAIL_UNTIL: StdMutex<Option<HashMap<String, Instant>>> = StdMutex::new(None);
 
-const UPSTREAM_FAIL_COOLDOWN: Duration = Duration::from_secs(60);
-const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
 fn upstream_key(host: &str, port: u16) -> String {
     format!("{}:{}", host, port)
 }
 
-fn set_upstream_cooldown(host: &str, port: u16) {
+fn set_upstream_cooldown(host: &str, port: u16, cooldown: Duration) {
     let key = upstream_key(host, port);
     let mut lock = UPSTREAM_FAIL_UNTIL.lock().unwrap();
     lock.get_or_insert_with(HashMap::new)
-        .insert(key, Instant::now() + UPSTREAM_FAIL_COOLDOWN);
+        .insert(key, Instant::now() + cooldown);
 }
 
 fn clear_upstream_cooldown(host: &str, port: u16) {
@@ -99,13 +95,10 @@ fn upstream_in_cooldown(host: &str, port: u16) -> bool {
 /// Per-DC cooldown for the CF proxy path.
 static CF_FAIL_UNTIL: StdMutex<Option<HashMap<(u32, bool), Instant>>> = StdMutex::new(None);
 
-const CF_FAIL_COOLDOWN: Duration = Duration::from_secs(60);
-const CF_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
-fn set_cf_cooldown(dc: u32, is_media: bool) {
+fn set_cf_cooldown(dc: u32, is_media: bool, cooldown: Duration) {
     let mut lock = CF_FAIL_UNTIL.lock().unwrap();
     lock.get_or_insert_with(HashMap::new)
-        .insert((dc, is_media), Instant::now() + CF_FAIL_COOLDOWN);
+        .insert((dc, is_media), Instant::now() + cooldown);
 }
 
 fn clear_cf_cooldown(dc: u32, is_media: bool) {
@@ -125,19 +118,19 @@ fn cf_in_cooldown(dc: u32, is_media: bool) -> bool {
     false
 }
 
-fn blacklist_ws(dc: u32, is_media: bool) {
+fn blacklist_ws(dc: u32, is_media: bool, cooldown: Duration) {
     // Instead of a permanent blacklist, apply a long cooldown so the proxy
     // can recover automatically if WS becomes available again (e.g. after a
     // network change or Telegram-side redirect policy change).
     let mut lock = DC_FAIL_UNTIL.lock().unwrap();
     lock.get_or_insert_with(HashMap::new)
-        .insert((dc, is_media), Instant::now() + WS_REDIRECT_COOLDOWN);
+        .insert((dc, is_media), Instant::now() + cooldown);
 }
 
-fn set_dc_cooldown(dc: u32, is_media: bool) {
+fn set_dc_cooldown(dc: u32, is_media: bool, cooldown: Duration) {
     let mut lock = DC_FAIL_UNTIL.lock().unwrap();
     lock.get_or_insert_with(HashMap::new)
-        .insert((dc, is_media), Instant::now() + WS_FAIL_COOLDOWN);
+        .insert((dc, is_media), Instant::now() + cooldown);
 }
 
 fn clear_dc_cooldown(dc: u32, is_media: bool) {
@@ -147,7 +140,7 @@ fn clear_dc_cooldown(dc: u32, is_media: bool) {
     }
 }
 
-fn ws_timeout_for(dc: u32, is_media: bool) -> Duration {
+fn ws_timeout_for(dc: u32, is_media: bool, normal_timeout: Duration) -> Duration {
     let lock = DC_FAIL_UNTIL.lock().unwrap();
     if let Some(map) = lock.as_ref() {
         if let Some(&until) = map.get(&(dc, is_media)) {
@@ -157,7 +150,7 @@ fn ws_timeout_for(dc: u32, is_media: bool) -> Duration {
         }
     }
 
-    WS_NORMAL_TIMEOUT
+    normal_timeout
 }
 
 // ─── Client handler ──────────────────────────────────────────────────────────
@@ -178,13 +171,24 @@ pub async fn handle_client(
     let dc_fallback_ips = default_dc_ips();
     let skip_tls = config.skip_tls_verify;
 
+    // ── Timeouts / cooldowns from config ─────────────────────────────────
+    let ws_connect_timeout = Duration::from_secs(config.ws_connect_timeout);
+    let ws_fail_cooldown = Duration::from_secs(config.ws_fail_cooldown);
+    let ws_redirect_cooldown = Duration::from_secs(config.ws_redirect_cooldown);
+    let handshake_timeout = Duration::from_secs(config.handshake_timeout);
+    let tcp_fallback_timeout = Duration::from_secs(config.tcp_fallback_timeout);
+    let upstream_connect_timeout = Duration::from_secs(config.upstream_connect_timeout);
+    let upstream_fail_cooldown = Duration::from_secs(config.upstream_fail_cooldown);
+    let cf_connect_timeout = Duration::from_secs(config.cf_connect_timeout);
+    let cf_fail_cooldown = Duration::from_secs(config.cf_fail_cooldown);
+
     // Split into independent read / write halves.
     let (mut reader, writer) = tokio::io::split(stream);
 
     // ── Step 1: read the 64-byte MTProto obfuscation init ────────────────
     let mut handshake_buf = [0u8; 64];
     match tokio::time::timeout(
-        Duration::from_secs(10),
+        handshake_timeout,
         reader.read_exact(&mut handshake_buf),
     )
     .await
@@ -266,7 +270,7 @@ pub async fn handle_client(
                 );
 
                 let (cf_ws_opt, _all_redirects) =
-                    connect_cf_ws_for_dc(dc_id, cf_domain, is_media, skip_tls, CF_CONNECT_TIMEOUT)
+                    connect_cf_ws_for_dc(dc_id, cf_domain, is_media, skip_tls, cf_connect_timeout)
                         .await;
 
                 if let Some(ws) = cf_ws_opt {
@@ -281,10 +285,10 @@ pub async fn handle_client(
                     .await;
                     return;
                 } else {
-                    set_cf_cooldown(dc_id, is_media);
+                    set_cf_cooldown(dc_id, is_media, cf_fail_cooldown);
                     warn!(
                         "[{}] DC{}{} CF proxy failed, cooldown {}s",
-                        label, dc_id, media_tag, CF_FAIL_COOLDOWN.as_secs()
+                        label, dc_id, media_tag, cf_fail_cooldown.as_secs()
                     );
                 }
             } else {
@@ -311,6 +315,7 @@ pub async fn handle_client(
                 &upstream.secret,
                 dc_idx,
                 proto,
+                upstream_connect_timeout,
             )
             .await
             {
@@ -335,13 +340,13 @@ pub async fn handle_client(
                     return;
                 }
                 None => {
-                    set_upstream_cooldown(&upstream.host, upstream.port);
+                    set_upstream_cooldown(&upstream.host, upstream.port, upstream_fail_cooldown);
                     warn!(
                         "[{}] upstream {}:{} failed, cooldown {}s",
                         label,
                         upstream.host,
                         upstream.port,
-                        UPSTREAM_FAIL_COOLDOWN.as_secs()
+                        upstream_fail_cooldown.as_secs()
                     );
                 }
             }
@@ -358,6 +363,7 @@ pub async fn handle_client(
             ciphers,
             dc_id,
             is_media,
+            tcp_fallback_timeout,
         )
         .await;
 
@@ -365,7 +371,7 @@ pub async fn handle_client(
     }
 
     let target_ip = target_ip.unwrap();
-    let ws_timeout = ws_timeout_for(dc_id, is_media);
+    let ws_timeout = ws_timeout_for(dc_id, is_media, ws_connect_timeout);
 
     // ── Step 6a: try pool first ───────────────────────────────────────────
     let ws_opt = pool.get(dc_id, is_media, target_ip.clone(), skip_tls).await;
@@ -396,24 +402,24 @@ pub async fn handle_client(
             None => {
                 // WS failed — apply cooldown and try CF proxy, upstream proxies, or TCP fallback.
                 if all_redirects {
-                    blacklist_ws(dc_id, is_media);
+                    blacklist_ws(dc_id, is_media, ws_redirect_cooldown);
 
                     warn!(
                         "[{}] DC{}{} WS cooldown {}s (all domains returned redirect)",
                         label,
                         dc_id,
                         media_tag,
-                        WS_REDIRECT_COOLDOWN.as_secs()
+                        ws_redirect_cooldown.as_secs()
                     );
                 } else {
-                    set_dc_cooldown(dc_id, is_media);
+                    set_dc_cooldown(dc_id, is_media, ws_fail_cooldown);
 
                     info!(
                         "[{}] DC{}{} WS cooldown {}s",
                         label,
                         dc_id,
                         media_tag,
-                        WS_FAIL_COOLDOWN.as_secs()
+                        ws_fail_cooldown.as_secs()
                     );
                 }
 
@@ -430,7 +436,7 @@ pub async fn handle_client(
                             cf_domain,
                             is_media,
                             skip_tls,
-                            CF_CONNECT_TIMEOUT,
+                            cf_connect_timeout,
                         )
                         .await;
 
@@ -447,10 +453,10 @@ pub async fn handle_client(
                             .await;
                             return;
                         } else {
-                            set_cf_cooldown(dc_id, is_media);
+                            set_cf_cooldown(dc_id, is_media, cf_fail_cooldown);
                             warn!(
                                 "[{}] DC{}{} CF proxy failed, cooldown {}s",
-                                label, dc_id, media_tag, CF_FAIL_COOLDOWN.as_secs()
+                                label, dc_id, media_tag, cf_fail_cooldown.as_secs()
                             );
                         }
                     } else {
@@ -477,6 +483,7 @@ pub async fn handle_client(
                         &upstream.secret,
                         dc_idx,
                         proto,
+                        upstream_connect_timeout,
                     )
                     .await
                     {
@@ -501,13 +508,13 @@ pub async fn handle_client(
                             return;
                         }
                         None => {
-                            set_upstream_cooldown(&upstream.host, upstream.port);
+                            set_upstream_cooldown(&upstream.host, upstream.port, upstream_fail_cooldown);
                             warn!(
                                 "[{}] upstream {}:{} failed, cooldown {}s",
                                 label,
                                 upstream.host,
                                 upstream.port,
-                                UPSTREAM_FAIL_COOLDOWN.as_secs()
+                                upstream_fail_cooldown.as_secs()
                             );
                         }
                     }
@@ -532,6 +539,7 @@ pub async fn handle_client(
                     ciphers,
                     dc_id,
                     is_media,
+                    tcp_fallback_timeout,
                 )
                 .await;
 
@@ -711,6 +719,7 @@ async fn connect_mtproto_upstream(
     secret_hex: &str,
     dc_idx: i16,
     proto: crate::crypto::ProtoTag,
+    timeout: Duration,
 ) -> Option<(
     tokio::io::ReadHalf<TcpStream>,
     tokio::io::WriteHalf<TcpStream>,
@@ -741,7 +750,7 @@ async fn connect_mtproto_upstream(
     };
 
     let stream = match tokio::time::timeout(
-        UPSTREAM_CONNECT_TIMEOUT,
+        timeout,
         TcpStream::connect(format!("{}:{}", host, port)),
     )
     .await
@@ -884,9 +893,10 @@ async fn bridge_tcp(
     ciphers: crate::crypto::ConnectionCiphers,
     dc: u32,
     is_media: bool,
+    connect_timeout: Duration,
 ) {
     let remote = match tokio::time::timeout(
-        Duration::from_secs(10),
+        connect_timeout,
         TcpStream::connect(format!("{}:443", dst)),
     )
     .await

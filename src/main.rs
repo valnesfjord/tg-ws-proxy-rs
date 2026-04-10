@@ -220,7 +220,10 @@ async fn main() {
     info!("{}", "=".repeat(60));
 
     // ── Connection pool warm-up ───────────────────────────────────────────
-    let pool = Arc::new(WsPool::new(config.pool_size));
+    let pool = Arc::new(WsPool::new(
+        config.pool_size,
+        Duration::from_secs(config.pool_max_age),
+    ));
     {
         let pool_clone = pool.clone();
         let config_clone = config.clone();
