@@ -216,7 +216,8 @@ pub async fn handle_client(
     let media_tag = if is_media { "m" } else { "" };
 
     if target_ip.is_none() {
-        // DC not in config — try upstream proxies, then fall back to direct TCP.
+        // DC not in config — try WS via fallback IP first, then upstream proxies,
+        // then fall back to direct TCP.
         let reason = format!("DC{} not in --dc-ip config", dc_id);
         let fallback = match dc_fallback_ips.get(&dc_id) {
             Some(ip) => ip.clone(),
@@ -226,7 +227,55 @@ pub async fn handle_client(
             }
         };
 
-        // Try each configured upstream MTProto proxy.
+        // ── Try WebSocket via fallback IP ────────────────────────────────
+        // Use the same pool + cooldown logic as the configured-DC path so that
+        // repeated failures are rate-limited and file descriptors don't pile up.
+        let ws_timeout = ws_timeout_for(dc_id, is_media);
+        let pool_hit = pool.get(dc_id, is_media, fallback.clone(), skip_tls).await;
+        let ws_opt = if let Some(ws) = pool_hit {
+            info!(
+                "[{}] DC{}{} {} → pool hit via {}",
+                label, dc_id, media_tag, reason, fallback
+            );
+            Some(ws)
+        } else {
+            let (ws, all_redirects) =
+                connect_ws_for_dc(&fallback, ws_dc, is_media, skip_tls, ws_timeout).await;
+            if ws.is_some() {
+                clear_dc_cooldown(dc_id, is_media);
+                info!(
+                    "[{}] DC{}{} {} → WS via {}",
+                    label, dc_id, media_tag, reason, fallback
+                );
+            } else if all_redirects {
+                blacklist_ws(dc_id, is_media);
+                warn!(
+                    "[{}] DC{}{} WS cooldown {}s (all domains returned redirect)",
+                    label,
+                    dc_id,
+                    media_tag,
+                    WS_REDIRECT_COOLDOWN.as_secs()
+                );
+            } else {
+                set_dc_cooldown(dc_id, is_media);
+                info!(
+                    "[{}] DC{}{} WS cooldown {}s",
+                    label,
+                    dc_id,
+                    media_tag,
+                    WS_FAIL_COOLDOWN.as_secs()
+                );
+            }
+            ws
+        };
+
+        if let Some(ws) = ws_opt {
+            bridge_ws(&label, reader, writer, ws, relay_init, ciphers, proto, dc_id, is_media)
+                .await;
+            return;
+        }
+
+        // ── WS failed — try each configured upstream MTProto proxy ───────
         for upstream in &config.mtproto_proxies {
             if upstream_in_cooldown(&upstream.host, upstream.port) {
                 debug!(
@@ -616,16 +665,28 @@ async fn connect_mtproto_upstream(
     };
 
     // Telegram MTProto proxy secrets in link format start with a 1-byte mode
-    // indicator: 0xdd = padded intermediate, 0xee = FakeTLS.  This byte is a
-    // connection-mode flag and is NOT part of the 16-byte key material used for
-    // SHA-256 key derivation in the obfuscation handshake.  Standard proxy
-    // servers strip it before key derivation; we must do the same, or the
-    // SHA-256 keys on both sides won't match and the handshake is rejected.
-    let key_bytes: &[u8] = if secret.len() == 17 && matches!(secret[0], 0xdd | 0xee) {
-        &secret[1..]
+    // indicator: 0xdd = padded intermediate, 0xee = FakeTLS.  Two things must
+    // be derived from this byte:
+    //
+    // 1. The key material: the prefix byte is NOT part of the 16-byte
+    //    cryptographic key used for SHA-256 derivation, so it must be stripped
+    //    before calling generate_client_handshake.
+    //
+    // 2. The transport protocol: 0xdd proxies expect PaddedIntermediate;
+    //    0xee proxies use FakeTLS which speaks Intermediate as the inner
+    //    protocol.  Always pass the protocol the upstream advertises rather
+    //    than the protocol the original Telegram client used, so the handshake
+    //    is accepted.
+    let (key_start, upstream_proto) = if secret.len() == 17 {
+        match secret[0] {
+            0xdd => (1, crate::crypto::ProtoTag::PaddedIntermediate),
+            0xee => (1, crate::crypto::ProtoTag::Intermediate), // FakeTLS uses Intermediate as its inner protocol
+            _ => (0, proto),
+        }
     } else {
-        &secret
+        (0, proto)
     };
+    let key_bytes = &secret[key_start..];
 
     let stream = match tokio::time::timeout(
         UPSTREAM_CONNECT_TIMEOUT,
@@ -645,7 +706,7 @@ async fn connect_mtproto_upstream(
     };
     let _ = stream.set_nodelay(true);
 
-    let (handshake, enc, dec) = generate_client_handshake(key_bytes, dc_idx, proto);
+    let (handshake, enc, dec) = generate_client_handshake(key_bytes, dc_idx, upstream_proto);
 
     let (reader, mut writer) = tokio::io::split(stream);
     if let Err(e) = writer.write_all(&handshake).await {
