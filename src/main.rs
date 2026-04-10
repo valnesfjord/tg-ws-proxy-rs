@@ -13,6 +13,7 @@
 //! See [`proxy`] for the connection handling logic and [`crypto`] for the
 //! MTProto obfuscation details.
 
+#[cfg(not(windows))]
 use std::io::IsTerminal as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,6 +22,51 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
+
+// ── ANSI / VT detection ───────────────────────────────────────────────────────
+
+/// Returns `true` when stderr is able to render ANSI/VT escape sequences.
+///
+/// On **Windows** we probe this at run-time by requesting the OS to enable
+/// Virtual Terminal Processing on the stderr console handle.  Modern
+/// terminals (Windows Terminal, VS Code integrated terminal, PowerShell 7+)
+/// accept the request; legacy `cmd.exe` rejects it.  Using the OS result
+/// rather than a compile-time `cfg!(windows)` guard means users with capable
+/// terminals get colored output, while users on `cmd.exe` (or any other
+/// console that doesn't support VTP) see plain text instead of the garbled
+/// `ESC[…` escape codes reported in issue #18.
+///
+/// On **non-Windows** we fall back to the standard `is_terminal()` check.
+fn stderr_ansi_supported() -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Console::{
+            GetConsoleMode, GetStdHandle, SetConsoleMode,
+            ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_ERROR_HANDLE,
+        };
+        // SAFETY: all three Win32 functions have well-defined behaviour for
+        // the handle values we pass.  We never dereference raw pointers
+        // ourselves; the OS validates the handle internally.
+        unsafe {
+            let handle = GetStdHandle(STD_ERROR_HANDLE);
+            if handle == 0 || handle == INVALID_HANDLE_VALUE {
+                return false;
+            }
+            let mut mode: u32 = 0;
+            if GetConsoleMode(handle, &mut mode) == 0 {
+                // Not a console (e.g. redirected to a file or pipe).
+                return false;
+            }
+            // Try to enable VTP; success ↔ the console supports ANSI.
+            SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::io::stderr().is_terminal()
+    }
+}
 
 // ── File-descriptor budget helpers ───────────────────────────────────────────
 
@@ -114,11 +160,19 @@ async fn main() {
             .with_writer(file)
             .init();
     } else {
-        // Console output: ANSI color codes are not rendered correctly on
-        // Windows consoles that lack Virtual Terminal Processing support, so
-        // disable them there.  Also disable when stderr is not a terminal
-        // (e.g. output is piped or redirected).
-        let use_ansi = std::io::stderr().is_terminal() && !cfg!(windows);
+        // Console output: only enable ANSI color codes when the terminal
+        // actually supports VT escape sequences.
+        //
+        // On Windows the console may or may not support Virtual Terminal
+        // Processing (VTP).  We probe this at run-time by asking the OS to
+        // enable VTP on stderr.  Modern terminals (Windows Terminal, VS Code,
+        // PowerShell 7+) accept the request; legacy cmd.exe rejects it.
+        // This avoids the garbled "крякозябры" escape codes that users see
+        // when running under cmd.exe (issue #18), while still giving colored
+        // output in terminals that can render it.
+        //
+        // On non-Windows we fall back to the standard is_terminal() check.
+        let use_ansi = stderr_ansi_supported();
         tracing_subscriber::fmt()
             .with_env_filter(env_filter)
             .with_ansi(use_ansi)

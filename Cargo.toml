@@ -47,6 +47,10 @@ rustls-pki-types = "1"
 # Bundled Mozilla root cert store (used by the default TLS connector)
 webpki-roots = "0.26"
 
+# Windows-only: try to enable Virtual Terminal Processing for ANSI colours
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_System_Console", "Win32_Foundation"] }
+
 [profile.release]
 opt-level = 3
 lto = true
