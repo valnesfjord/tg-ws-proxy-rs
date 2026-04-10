@@ -52,10 +52,9 @@ default domain can stop working at any time.
 
    Make sure the **orange cloud** (Proxy status) is **enabled** for each record.
 
-4. If Cloudflare's own IP ranges are also blocked in your country (e.g. in
-   Russia), add your domain to
-   [zapret](https://github.com/Flowseal/zapret-discord-youtube/) or another
-   bypass tool.
+4. If Cloudflare's own IP ranges are also blocked by your ISP, add your
+   domain to [zapret](https://github.com/Flowseal/zapret-discord-youtube/)
+   or another bypass tool.
 
 5. Pass your domain to `tg-ws-proxy` via `--cf-domain`:
 
@@ -84,8 +83,3 @@ When `--cf-domain` is configured the proxy:
 
 When no `--dc-ip` is configured for a DC, the CF proxy is tried as the
 **primary** path (before upstreams / TCP fallback).
-
-## Credits
-
-Idea — <https://github.com/Nekogram/WSProxy>  
-Original Go implementation — <https://github.com/Flowseal/tg-ws-proxy>
