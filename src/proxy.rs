@@ -227,55 +227,69 @@ pub async fn handle_client(
             }
         };
 
-        // ── Try WebSocket via fallback IP ────────────────────────────────
-        // Use the same pool + cooldown logic as the configured-DC path so that
-        // repeated failures are rate-limited and file descriptors don't pile up.
-        let ws_timeout = ws_timeout_for(dc_id, is_media);
-        let pool_hit = pool.get(dc_id, is_media, fallback.clone(), skip_tls).await;
-        let ws_opt = if let Some(ws) = pool_hit {
-            info!(
-                "[{}] DC{}{} {} → pool hit via {}",
-                label, dc_id, media_tag, reason, fallback
-            );
-            Some(ws)
+        // ── Try WebSocket via the mapped DC's configured IP ─────────────
+        // For DCs with a WS domain override (e.g. DC203 → DC2), we can reuse
+        // DC2's configured IP for WebSocket.  DCs without an override (DC1,
+        // DC3, DC5) are skipped because default_dc_ips() are plain Telegram
+        // MTProto-only addresses that do not support WebSocket connections.
+        // Using the fallback IPs for WS would just cause slow TCP timeouts
+        // before falling through to upstream/TCP.
+        let ws_ip = if ws_dc != dc_id {
+            dc_redirects.get(&ws_dc).cloned()
         } else {
-            let (ws, all_redirects) =
-                connect_ws_for_dc(&fallback, ws_dc, is_media, skip_tls, ws_timeout).await;
-            if ws.is_some() {
-                clear_dc_cooldown(dc_id, is_media);
-                info!(
-                    "[{}] DC{}{} {} → WS via {}",
-                    label, dc_id, media_tag, reason, fallback
-                );
-            } else if all_redirects {
-                blacklist_ws(dc_id, is_media);
-                warn!(
-                    "[{}] DC{}{} WS cooldown {}s (all domains returned redirect)",
-                    label,
-                    dc_id,
-                    media_tag,
-                    WS_REDIRECT_COOLDOWN.as_secs()
-                );
-            } else {
-                set_dc_cooldown(dc_id, is_media);
-                info!(
-                    "[{}] DC{}{} WS cooldown {}s",
-                    label,
-                    dc_id,
-                    media_tag,
-                    WS_FAIL_COOLDOWN.as_secs()
-                );
-            }
-            ws
+            None
         };
 
-        if let Some(ws) = ws_opt {
-            bridge_ws(&label, reader, writer, ws, relay_init, ciphers, proto, dc_id, is_media)
+        if let Some(ws_ip) = ws_ip {
+            let ws_timeout = ws_timeout_for(dc_id, is_media);
+            let pool_hit = pool.get(dc_id, is_media, ws_ip.clone(), skip_tls).await;
+            let ws_opt = if let Some(ws) = pool_hit {
+                info!(
+                    "[{}] DC{}{} {} → pool hit via {}",
+                    label, dc_id, media_tag, reason, ws_ip
+                );
+                Some(ws)
+            } else {
+                let (ws, all_redirects) =
+                    connect_ws_for_dc(&ws_ip, ws_dc, is_media, skip_tls, ws_timeout).await;
+                if ws.is_some() {
+                    clear_dc_cooldown(dc_id, is_media);
+                    info!(
+                        "[{}] DC{}{} {} → WS via {}",
+                        label, dc_id, media_tag, reason, ws_ip
+                    );
+                } else if all_redirects {
+                    blacklist_ws(dc_id, is_media);
+                    warn!(
+                        "[{}] DC{}{} WS cooldown {}s (all domains returned redirect)",
+                        label,
+                        dc_id,
+                        media_tag,
+                        WS_REDIRECT_COOLDOWN.as_secs()
+                    );
+                } else {
+                    set_dc_cooldown(dc_id, is_media);
+                    info!(
+                        "[{}] DC{}{} WS cooldown {}s",
+                        label,
+                        dc_id,
+                        media_tag,
+                        WS_FAIL_COOLDOWN.as_secs()
+                    );
+                }
+                ws
+            };
+
+            if let Some(ws) = ws_opt {
+                bridge_ws(
+                    &label, reader, writer, ws, relay_init, ciphers, proto, dc_id, is_media,
+                )
                 .await;
-            return;
+                return;
+            }
         }
 
-        // ── WS failed — try each configured upstream MTProto proxy ───────
+        // ── WS failed or not available — try upstream MTProto proxies ────
         for upstream in &config.mtproto_proxies {
             if upstream_in_cooldown(&upstream.host, upstream.port) {
                 debug!(
@@ -665,28 +679,19 @@ async fn connect_mtproto_upstream(
     };
 
     // Telegram MTProto proxy secrets in link format start with a 1-byte mode
-    // indicator: 0xdd = padded intermediate, 0xee = FakeTLS.  Two things must
-    // be derived from this byte:
+    // indicator: 0xdd = padded intermediate, 0xee = FakeTLS.  This byte is a
+    // connection-mode flag and is NOT part of the 16-byte key material used for
+    // SHA-256 key derivation.  Strip it before key derivation.
     //
-    // 1. The key material: the prefix byte is NOT part of the 16-byte
-    //    cryptographic key used for SHA-256 derivation, so it must be stripped
-    //    before calling generate_client_handshake.
-    //
-    // 2. The transport protocol: 0xdd proxies expect PaddedIntermediate;
-    //    0xee proxies use FakeTLS which speaks Intermediate as the inner
-    //    protocol.  Always pass the protocol the upstream advertises rather
-    //    than the protocol the original Telegram client used, so the handshake
-    //    is accepted.
-    let (key_start, upstream_proto) = if secret.len() == 17 {
-        match secret[0] {
-            0xdd => (1, crate::crypto::ProtoTag::PaddedIntermediate),
-            0xee => (1, crate::crypto::ProtoTag::Intermediate), // FakeTLS uses Intermediate as its inner protocol
-            _ => (0, proto),
-        }
+    // Note: the protocol we declare in the handshake must match what we actually
+    // send — i.e. the client's protocol — because we forward client data without
+    // any re-framing.  The upstream prefix only tells us about key stripping,
+    // not about what framing we should use on our side.
+    let key_bytes: &[u8] = if secret.len() >= 17 && matches!(secret[0], 0xdd | 0xee) {
+        &secret[1..17]
     } else {
-        (0, proto)
+        &secret
     };
-    let key_bytes = &secret[key_start..];
 
     let stream = match tokio::time::timeout(
         UPSTREAM_CONNECT_TIMEOUT,
@@ -706,7 +711,7 @@ async fn connect_mtproto_upstream(
     };
     let _ = stream.set_nodelay(true);
 
-    let (handshake, enc, dec) = generate_client_handshake(key_bytes, dc_idx, upstream_proto);
+    let (handshake, enc, dec) = generate_client_handshake(key_bytes, dc_idx, proto);
 
     let (reader, mut writer) = tokio::io::split(stream);
     if let Err(e) = writer.write_all(&handshake).await {
