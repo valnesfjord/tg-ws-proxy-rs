@@ -23,7 +23,17 @@ default domain can stop working at any time.
 
 2. In **SSL/TLS → Overview** set the mode to **Flexible**.
 
-3. In **DNS → Records** add the following `A` records via **+ Add Record**:
+3. In **DNS → Records** import all records at once using the provided
+   zone file:
+
+   - Click **"Import DNS Records"** (or **Advanced → Import zone file**).
+   - Upload [`cloudflare-dns-import.txt`](cloudflare-dns-import.txt).
+   - After importing, **enable the orange cloud** (Proxy status →
+     Proxied) for every imported record — zone file imports create
+     DNS-only records by default.
+
+   Alternatively, add the following `A` records manually via
+   **+ Add Record**:
 
    | Name      | IPv4 address      |
    |-----------|-------------------|
