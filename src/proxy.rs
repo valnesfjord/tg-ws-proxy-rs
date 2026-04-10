@@ -64,6 +64,29 @@ static UPSTREAM_FAIL_UNTIL: StdMutex<Option<HashMap<String, Instant>>> = StdMute
 const UPSTREAM_FAIL_COOLDOWN: Duration = Duration::from_secs(60);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+// ─── TLS protocol constants (used by FakeTLS upstream support) ───────────────
+
+/// Maximum TLS record payload size (RFC 8446 §5.1: 2^14 bytes).
+const TLS_MAX_RECORD_PAYLOAD: usize = 16384;
+
+/// TLS Content-Type for Handshake records.
+const TLS_RECORD_HANDSHAKE: u8 = 0x16;
+/// TLS Content-Type for ChangeCipherSpec records.
+const TLS_RECORD_CHANGE_CIPHER_SPEC: u8 = 0x14;
+/// TLS Content-Type for Application Data records.
+const TLS_RECORD_APPLICATION_DATA: u8 = 0x17;
+/// TLS Content-Type for Alert records.
+const TLS_RECORD_ALERT: u8 = 0x15;
+
+/// TLS legacy version field used in record headers and ClientHello (TLS 1.0/1.2).
+const TLS_LEGACY_VERSION: [u8; 2] = [0x03, 0x01];
+/// TLS ClientHello `client_version` field indicating TLS 1.2.
+const TLS_CLIENT_HELLO_VERSION: [u8; 2] = [0x03, 0x03];
+
+/// Maximum number of TLS records read during fake TLS server handshake drain.
+/// A real TLS handshake never produces more than a handful of distinct records.
+const TLS_MAX_HANDSHAKE_RECORDS: usize = 20;
+
 fn upstream_key(host: &str, port: u16) -> String {
     format!("{}:{}", host, port)
 }
@@ -908,7 +931,7 @@ fn build_faketls_client_hello(init_bytes: &[u8; 64], hostname: &str) -> Vec<u8> 
 
     // ── ClientHello body ──────────────────────────────────────────────────
     let mut hello: Vec<u8> = Vec::new();
-    hello.extend_from_slice(&[0x03, 0x03]); // version: TLS 1.2
+    hello.extend_from_slice(&TLS_CLIENT_HELLO_VERSION); // version: TLS 1.2
     hello.extend_from_slice(&init_bytes[0..32]); // random (32 bytes of MTProto init)
     hello.push(0x20); // session_id length = 32
     hello.extend_from_slice(&init_bytes[32..64]); // session_id (32 bytes of MTProto init)
@@ -930,9 +953,8 @@ fn build_faketls_client_hello(init_bytes: &[u8; 64], hostname: &str) -> Vec<u8> 
 
     // ── TLS record ────────────────────────────────────────────────────────
     let mut record: Vec<u8> = Vec::with_capacity(5 + handshake.len());
-    record.push(0x16); // Content-Type: Handshake
-    record.push(0x03); // Legacy version: TLS 1.0
-    record.push(0x01);
+    record.push(TLS_RECORD_HANDSHAKE);
+    record.extend_from_slice(&TLS_LEGACY_VERSION);
     record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
     record.extend_from_slice(&handshake);
 
@@ -955,7 +977,7 @@ async fn drain_faketls_server_hello(
 
     // At most 20 records before we give up — a real TLS handshake never
     // produces that many distinct records.
-    for _ in 0..20 {
+    for _ in 0..TLS_MAX_HANDSHAKE_RECORDS {
         if reader.read_exact(&mut header).await.is_err() {
             return false;
         }
@@ -963,8 +985,8 @@ async fn drain_faketls_server_hello(
         let record_type = header[0];
         let payload_len = u16::from_be_bytes([header[3], header[4]]) as usize;
 
-        // TLS records must not exceed 16 KiB.
-        if payload_len > 16384 {
+        // TLS records must not exceed TLS_MAX_RECORD_PAYLOAD bytes.
+        if payload_len > TLS_MAX_RECORD_PAYLOAD {
             return false;
         }
 
@@ -974,10 +996,10 @@ async fn drain_faketls_server_hello(
         }
 
         match record_type {
-            0x16 | 0x14 => {} // Handshake or ChangeCipherSpec: discard and loop
-            0x17 => return true, // Application Data: fake handshake complete
-            0x15 => return false, // Alert: something went wrong
-            _ => return false, // Unexpected record type
+            TLS_RECORD_HANDSHAKE | TLS_RECORD_CHANGE_CIPHER_SPEC => {} // discard and loop
+            TLS_RECORD_APPLICATION_DATA => return true, // fake handshake complete
+            TLS_RECORD_ALERT => return false,           // something went wrong
+            _ => return false,                          // unexpected record type
         }
     }
 
@@ -1113,16 +1135,13 @@ async fn bridge_faketls_relay(
         mut tg_dec,
     } = ciphers;
 
-    // TLS Application Data records may contain up to 16 KiB of payload.
-    const MAX_TLS_PAYLOAD: usize = 16384;
-
     let start = std::time::Instant::now();
 
     // ── Upload: client → upstream (wrapped in TLS Application Data records) ─
     let mut upload = tokio::spawn(async move {
         let mut reader = reader;
         let mut rem_writer = rem_writer;
-        let mut buf = vec![0u8; MAX_TLS_PAYLOAD];
+        let mut buf = vec![0u8; TLS_MAX_RECORD_PAYLOAD];
         let mut total = 0u64;
 
         loop {
@@ -1134,9 +1153,15 @@ async fn bridge_faketls_relay(
             clt_dec.apply_keystream(chunk); // remove client's AES-CTR
             tg_enc.apply_keystream(chunk); // add upstream's AES-CTR
 
-            // Wrap in TLS Application Data record: type + TLS 1.2 version + length
-            let header = [0x17u8, 0x03, 0x03, (n >> 8) as u8, n as u8];
-            if rem_writer.write_all(&header).await.is_err() {
+            // Wrap in TLS Application Data record: type + version + length
+            let hdr = [
+                TLS_RECORD_APPLICATION_DATA,
+                TLS_LEGACY_VERSION[0],
+                TLS_LEGACY_VERSION[1],
+                (n >> 8) as u8,
+                n as u8,
+            ];
+            if rem_writer.write_all(&hdr).await.is_err() {
                 break;
             }
             if rem_writer.write_all(&buf[..n]).await.is_err() {
@@ -1153,7 +1178,7 @@ async fn bridge_faketls_relay(
         let mut rem_reader = rem_reader;
         let mut writer = writer;
         let mut header = [0u8; 5];
-        let mut buf = vec![0u8; MAX_TLS_PAYLOAD];
+        let mut buf = vec![0u8; TLS_MAX_RECORD_PAYLOAD];
         let mut total = 0u64;
 
         loop {
@@ -1164,11 +1189,11 @@ async fn bridge_faketls_relay(
             let record_type = header[0];
             let payload_len = u16::from_be_bytes([header[3], header[4]]) as usize;
 
-            if payload_len > MAX_TLS_PAYLOAD {
+            if payload_len > TLS_MAX_RECORD_PAYLOAD {
                 break; // malformed record
             }
 
-            if record_type != 0x17 {
+            if record_type != TLS_RECORD_APPLICATION_DATA {
                 // Discard non-Application-Data records (shouldn't appear in
                 // the data phase but handle gracefully just in case).
                 let mut discard = vec![0u8; payload_len];
