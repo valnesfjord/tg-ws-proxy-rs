@@ -197,6 +197,11 @@ pub struct Config {
     #[arg(long = "ws-connect-timeout", default_value = "10", env = "TG_WS_CONNECT_TIMEOUT")]
     pub ws_connect_timeout: u64,
 
+    /// WebSocket connection timeout in seconds when the DC is in failure
+    /// cooldown (fast-probe path, allows quick recovery after a network change).
+    #[arg(long = "ws-fail-probe-timeout", default_value = "2", env = "TG_WS_FAIL_PROBE_TIMEOUT")]
+    pub ws_fail_probe_timeout: u64,
+
     /// Seconds to back off from a DC's WebSocket after a connection failure.
     #[arg(long = "ws-fail-cooldown", default_value = "30", env = "TG_WS_FAIL_COOLDOWN")]
     pub ws_fail_cooldown: u64,

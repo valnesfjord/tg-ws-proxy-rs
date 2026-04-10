@@ -51,10 +51,6 @@ use std::time::Instant;
 /// Also used for the "all redirects" case (longer cooldown of 5 min).
 static DC_FAIL_UNTIL: StdMutex<Option<HashMap<(u32, bool), Instant>>> = StdMutex::new(None);
 
-/// Fast-probe timeout used when a DC is still in cooldown: we try quickly so
-/// that a network change can restore WS without waiting the full normal timeout.
-const WS_FAIL_TIMEOUT: Duration = Duration::from_secs(2);
-
 // ─── Upstream MTProto proxy failure tracking ─────────────────────────────────
 
 /// Per-upstream cooldown: keyed by "host:port".
@@ -140,12 +136,12 @@ fn clear_dc_cooldown(dc: u32, is_media: bool) {
     }
 }
 
-fn ws_timeout_for(dc: u32, is_media: bool, normal_timeout: Duration) -> Duration {
+fn ws_timeout_for(dc: u32, is_media: bool, normal_timeout: Duration, fail_probe_timeout: Duration) -> Duration {
     let lock = DC_FAIL_UNTIL.lock().unwrap();
     if let Some(map) = lock.as_ref() {
         if let Some(&until) = map.get(&(dc, is_media)) {
             if Instant::now() < until {
-                return WS_FAIL_TIMEOUT; // still in cooldown → try fast
+                return fail_probe_timeout; // still in cooldown → try fast
             }
         }
     }
@@ -173,6 +169,7 @@ pub async fn handle_client(
 
     // ── Timeouts / cooldowns from config ─────────────────────────────────
     let ws_connect_timeout = Duration::from_secs(config.ws_connect_timeout);
+    let ws_fail_probe_timeout = Duration::from_secs(config.ws_fail_probe_timeout);
     let ws_fail_cooldown = Duration::from_secs(config.ws_fail_cooldown);
     let ws_redirect_cooldown = Duration::from_secs(config.ws_redirect_cooldown);
     let handshake_timeout = Duration::from_secs(config.handshake_timeout);
@@ -371,7 +368,7 @@ pub async fn handle_client(
     }
 
     let target_ip = target_ip.unwrap();
-    let ws_timeout = ws_timeout_for(dc_id, is_media, ws_connect_timeout);
+    let ws_timeout = ws_timeout_for(dc_id, is_media, ws_connect_timeout, ws_fail_probe_timeout);
 
     // ── Step 6a: try pool first ───────────────────────────────────────────
     let ws_opt = pool.get(dc_id, is_media, target_ip.clone(), skip_tls).await;
