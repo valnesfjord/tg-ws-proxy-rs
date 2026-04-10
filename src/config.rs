@@ -175,6 +175,21 @@ pub struct Config {
     /// if that fails it falls back to `--host`.
     #[arg(long = "link-ip", env = "TG_LINK_IP")]
     pub link_ip: Option<String>,
+
+    /// Cloudflare-proxied domain for alternative WebSocket routing.
+    ///
+    /// When set, the proxy will attempt to connect to Telegram DCs through
+    /// Cloudflare's CDN using `kws{N}.{cf-domain}` subdomains.  This can
+    /// bypass ISP-level blocks on Telegram's IP ranges (common in Russia).
+    ///
+    /// Setup: add `kws1`–`kws5` A records in your Cloudflare DNS pointing to
+    /// the respective Telegram DC IPs, enable the orange-cloud proxy, and set
+    /// SSL/TLS mode to **Flexible**.  See docs/CfProxy.md for full instructions.
+    ///
+    /// The CF proxy is tried as a fallback after direct WebSocket connections
+    /// fail, and as the primary path when no `--dc-ip` is configured for a DC.
+    #[arg(long = "cf-domain", value_name = "DOMAIN", env = "TG_CF_DOMAIN")]
+    pub cf_domain: Option<String>,
 }
 
 impl Config {

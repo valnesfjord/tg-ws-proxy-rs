@@ -218,6 +218,90 @@ pub async fn connect_ws_for_dc(
     (None, all_redirects)
 }
 
+/// WebSocket domains for a given DC when routing through a Cloudflare-proxied
+/// domain.
+///
+/// Each DNS record `kws{N}.{cf_domain}` should be an **orange-cloud** (proxied)
+/// A record in Cloudflare pointing at the corresponding Telegram DC IP, with
+/// the zone's SSL/TLS mode set to **Flexible**.  Cloudflare then terminates TLS
+/// from our side and forwards the WebSocket traffic as plain HTTP to Telegram.
+///
+/// The effective DC is remapped the same way as `ws_domains()` so that
+/// non-canonical DC numbers (e.g. DC 203) resolve to a valid subdomain.
+pub fn cf_ws_domains(dc: u32, cf_domain: &str, is_media: bool) -> Vec<String> {
+    let overrides = default_dc_overrides();
+    let effective_dc = *overrides.get(&dc).unwrap_or(&dc);
+    if is_media {
+        vec![
+            format!("kws{}-1.{}", effective_dc, cf_domain),
+            format!("kws{}.{}", effective_dc, cf_domain),
+        ]
+    } else {
+        vec![
+            format!("kws{}.{}", effective_dc, cf_domain),
+            format!("kws{}-1.{}", effective_dc, cf_domain),
+        ]
+    }
+}
+
+/// Try all Cloudflare-proxy domains for a DC in order.
+///
+/// The hostname serves as both the TCP destination (DNS resolves to Cloudflare's
+/// anycast IP, not directly to Telegram) and the TLS SNI, so no separate DC IP
+/// is required.
+///
+/// Returns `(Some(stream), all_redirects)` with the same semantics as
+/// [`connect_ws_for_dc`].
+pub async fn connect_cf_ws_for_dc(
+    dc: u32,
+    cf_domain: &str,
+    is_media: bool,
+    skip_tls_verify: bool,
+    timeout: Duration,
+) -> (Option<TgWsStream>, bool) {
+    let domains = cf_ws_domains(dc, cf_domain, is_media);
+    let mut all_redirects = true;
+
+    for domain in &domains {
+        debug!(
+            "CF WS trying DC{}{} → {}",
+            dc,
+            if is_media { "m" } else { "" },
+            domain
+        );
+
+        // Pass the CF domain as the TCP host so that Tokio's DNS resolution
+        // returns Cloudflare's anycast IP rather than Telegram's DC IP.
+        match connect_ws(domain, domain, skip_tls_verify, timeout).await {
+            WsConnectResult::Connected(ws) => {
+                return (Some(ws), false);
+            }
+            WsConnectResult::Redirect(code) => {
+                warn!(
+                    "CF WS DC{}{} got {} from {} (redirect)",
+                    dc,
+                    if is_media { "m" } else { "" },
+                    code,
+                    domain
+                );
+            }
+            WsConnectResult::Failed(reason) => {
+                warn!(
+                    "CF WS DC{}{} failed on {}: {}",
+                    dc,
+                    if is_media { "m" } else { "" },
+                    domain,
+                    reason
+                );
+
+                all_redirects = false;
+            }
+        }
+    }
+
+    (None, all_redirects)
+}
+
 /// Send a binary WebSocket message and flush.
 pub async fn ws_send(ws: &mut TgWsStream, data: Vec<u8>) -> Result<(), String> {
     ws.send(Message::Binary(data))

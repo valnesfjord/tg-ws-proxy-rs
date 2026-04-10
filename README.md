@@ -8,6 +8,7 @@ tunnels them through WebSocket (TLS) connections to Telegram's DC servers.
 
 ```
 Telegram Desktop → MTProto (TCP 1443) → tg-ws-proxy-rs → WS (TLS 443) → Telegram DC
+                                                         ↘ CF proxy (kws{N}.{cf-domain}) → Telegram DC  (WS via Cloudflare)
                                                          ↘ upstream MTProto proxy → Telegram DC  (WS fallback)
                                                          ↘ direct TCP :443 → Telegram DC          (last resort)
 ```
@@ -97,6 +98,7 @@ tg-ws-proxy [OPTIONS]
 | `--dc-ip <DC:IP>` | DC2 + DC4 | Target IP per DC (repeatable) |
 | `--buf-kb <KB>` | `256` | Socket buffer size |
 | `--pool-size <N>` | `4` | Pre-warmed WS connections per DC |
+| `--cf-domain <DOMAIN>` | — | Cloudflare-proxied domain for alternative WS routing (see [CF Proxy](#cloudflare-proxy)) |
 | `--max-connections <N>` | auto | Max concurrent client connections (auto-computed from `ulimit -n`) |
 | `--mtproto-proxy <HOST:PORT:SECRET>` | — | Upstream MTProto proxy fallback (repeatable) |
 | `--log-file <PATH>` | — | Write logs to a file instead of stderr (no ANSI color codes) |
@@ -107,7 +109,7 @@ tg-ws-proxy [OPTIONS]
 Every flag has a matching environment variable (`TG_PORT`, `TG_HOST`,
 `TG_SECRET`, `TG_BUF_KB`, `TG_POOL_SIZE`, `TG_MAX_CONNECTIONS`, `TG_QUIET`,
 `TG_VERBOSE`, `TG_SKIP_TLS_VERIFY`, `TG_LINK_IP`, `TG_MTPROTO_PROXY`,
-`TG_LOG_FILE`).
+`TG_LOG_FILE`, `TG_CF_DOMAIN`).
 
 ### Examples
 
@@ -120,6 +122,9 @@ tg-ws-proxy --port 9050 --dc-ip 1:149.154.175.205 --dc-ip 2:149.154.167.220
 
 # With upstream MTProto proxy fallback
 tg-ws-proxy --mtproto-proxy proxy.example.com:443:abcdef1234567890abcdef1234567890
+
+# With Cloudflare proxy domain (WS fallback via Cloudflare CDN)
+tg-ws-proxy --cf-domain yourdomain.com
 
 # Multiple upstream proxies (tried in order until one succeeds)
 tg-ws-proxy \
@@ -177,6 +182,45 @@ TG_MTPROTO_PROXY="proxy.example.com:443:abcdef1234...,other.example.net:8888:dea
 > Proxy shows:  ddabcdef1234567890abcdef1234567890
 > Use this:       abcdef1234567890abcdef1234567890   ← drop the "dd"
 > ```
+
+### Cloudflare Proxy
+
+When Telegram's IP ranges are blocked by your ISP, you can route WebSocket
+traffic through Cloudflare using `--cf-domain`.  This requires only a domain
+name — no server-side component.
+
+```bash
+# Use your own Cloudflare-proxied domain
+tg-ws-proxy --cf-domain yourdomain.com
+
+# Or via environment variable
+TG_CF_DOMAIN=yourdomain.com tg-ws-proxy
+```
+
+The proxy will try the CF path as a fallback after direct WebSocket fails, and
+as the primary path for DCs that have no `--dc-ip` configured.
+
+**One-time domain setup** (do this in the Cloudflare dashboard):
+
+1. In **SSL/TLS → Overview** set mode to **Flexible**.
+2. In **DNS → Records** add these proxied (`🔶`) A records:
+
+   | Name      | IPv4 address      |
+   |-----------|-------------------|
+   | `kws1`    | `149.154.175.50`  |
+   | `kws1-1`  | `149.154.175.50`  |
+   | `kws2`    | `149.154.167.51`  |
+   | `kws2-1`  | `149.154.167.51`  |
+   | `kws3`    | `149.154.175.100` |
+   | `kws3-1`  | `149.154.175.100` |
+   | `kws4`    | `149.154.167.91`  |
+   | `kws4-1`  | `149.154.167.91`  |
+   | `kws5`    | `149.154.171.5`   |
+   | `kws5-1`  | `149.154.171.5`   |
+   | `kws203`  | `91.105.192.100`  |
+   | `kws203-1`| `91.105.192.100`  |
+
+See [docs/CfProxy.md](docs/CfProxy.md) for full instructions.
 
 ### Router deployment
 
@@ -298,12 +342,15 @@ chmod +x /etc/init.d/tg-ws-proxy
    IP).
 4. The relay init packet is sent to Telegram, and bidirectional bridging
    begins with AES-256-CTR re-encryption (client keys ↔ relay keys).
-5. If WebSocket is unavailable, the proxy tries each configured upstream
-   MTProto proxy in order (generating a fresh client handshake with the
-   upstream's secret so it can route to the correct DC).
-6. If no upstream proxy is configured or all fail, the proxy falls back to
+5. If WebSocket is unavailable, the proxy tries the Cloudflare proxy path
+   (`wss://kwsN.{cf-domain}/apiws`) if `--cf-domain` is configured —
+   Cloudflare terminates TLS and forwards plain WebSocket traffic to Telegram.
+6. If CF proxy is unavailable or not configured, each upstream MTProto proxy
+   is tried in order (generating a fresh client handshake with the upstream's
+   secret so it can route to the correct DC).
+7. If no upstream proxy is configured or all fail, the proxy falls back to
    direct TCP on port 443.
-7. A small pool of pre-connected WebSocket connections is maintained per DC to
+8. A small pool of pre-connected WebSocket connections is maintained per DC to
    reduce connection latency for subsequent clients.
 
 ## Project structure
@@ -333,6 +380,7 @@ TG_BUF_KB=256
 TG_MAX_CONNECTIONS=64
 TG_QUIET=true
 TG_VERBOSE=false
+TG_CF_DOMAIN=yourdomain.com
 TG_LOG_FILE=/var/log/tg-ws-proxy.log
 TG_MTPROTO_PROXY=proxy.example.com:443:abcdef1234567890abcdef1234567890
 ```

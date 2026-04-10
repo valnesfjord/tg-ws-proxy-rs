@@ -1,0 +1,40 @@
+; Cloudflare DNS import file for tg-ws-proxy Cloudflare Proxy setup.
+;
+; HOW TO IMPORT
+; -------------
+; 1. Open your Cloudflare dashboard → select your domain.
+; 2. Go to DNS → Records.
+; 3. Click "Import DNS Records" (or "Advanced" → "Import zone file").
+; 4. Upload this file.
+;
+; IMPORTANT: After importing, open each record and enable the orange
+; cloud (Proxy status = Proxied) — zone file imports set records to
+; DNS-only by default.
+;
+; Telegram DC IP mapping:
+;   DC1  149.154.175.50
+;   DC2  149.154.167.51
+;   DC3  149.154.175.100
+;   DC4  149.154.167.91
+;   DC5  149.154.171.5
+;   DC203 91.105.192.100  (media)
+
+$TTL 300
+
+kws1     IN A 149.154.175.50
+kws1-1   IN A 149.154.175.50
+
+kws2     IN A 149.154.167.51
+kws2-1   IN A 149.154.167.51
+
+kws3     IN A 149.154.175.100
+kws3-1   IN A 149.154.175.100
+
+kws4     IN A 149.154.167.91
+kws4-1   IN A 149.154.167.91
+
+kws5     IN A 149.154.171.5
+kws5-1   IN A 149.154.171.5
+
+kws203   IN A 91.105.192.100
+kws203-1 IN A 91.105.192.100

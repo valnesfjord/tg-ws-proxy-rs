@@ -183,6 +183,11 @@ async fn main() {
         info!("  ⚠  TLS certificate verification DISABLED");
     }
 
+    if let Some(ref cf_domain) = config.cf_domain {
+        info!("  Cloudflare proxy domain: {}", cf_domain);
+        info!("    (used as WS fallback via kws{{N}}.{} subdomains)", cf_domain);
+    }
+
     if !config.mtproto_proxies.is_empty() {
         info!("  Upstream MTProto proxies (WS fallback):");
         for p in &config.mtproto_proxies {

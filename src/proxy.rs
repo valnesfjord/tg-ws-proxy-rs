@@ -38,7 +38,7 @@ use crate::crypto::{
 };
 use crate::pool::WsPool;
 use crate::splitter::MsgSplitter;
-use crate::ws_client::{connect_ws_for_dc, ws_send, TgWsStream};
+use crate::ws_client::{connect_cf_ws_for_dc, connect_ws_for_dc, ws_send, TgWsStream};
 
 // WS failure cooldown is global for the process lifetime.
 use std::collections::HashMap;
@@ -88,6 +88,37 @@ fn upstream_in_cooldown(host: &str, port: u16) -> bool {
     let lock = UPSTREAM_FAIL_UNTIL.lock().unwrap();
     if let Some(map) = lock.as_ref() {
         if let Some(&until) = map.get(&key) {
+            return Instant::now() < until;
+        }
+    }
+    false
+}
+
+// ─── Cloudflare proxy failure tracking ───────────────────────────────────────
+
+/// Per-DC cooldown for the CF proxy path.
+static CF_FAIL_UNTIL: StdMutex<Option<HashMap<(u32, bool), Instant>>> = StdMutex::new(None);
+
+const CF_FAIL_COOLDOWN: Duration = Duration::from_secs(60);
+const CF_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn set_cf_cooldown(dc: u32, is_media: bool) {
+    let mut lock = CF_FAIL_UNTIL.lock().unwrap();
+    lock.get_or_insert_with(HashMap::new)
+        .insert((dc, is_media), Instant::now() + CF_FAIL_COOLDOWN);
+}
+
+fn clear_cf_cooldown(dc: u32, is_media: bool) {
+    let mut lock = CF_FAIL_UNTIL.lock().unwrap();
+    if let Some(map) = lock.as_mut() {
+        map.remove(&(dc, is_media));
+    }
+}
+
+fn cf_in_cooldown(dc: u32, is_media: bool) -> bool {
+    let lock = CF_FAIL_UNTIL.lock().unwrap();
+    if let Some(map) = lock.as_ref() {
+        if let Some(&until) = map.get(&(dc, is_media)) {
             return Instant::now() < until;
         }
     }
@@ -216,7 +247,7 @@ pub async fn handle_client(
     let media_tag = if is_media { "m" } else { "" };
 
     if target_ip.is_none() {
-        // DC not in config — try upstream proxies, then fall back to direct TCP.
+        // DC not in config — try CF proxy, then upstream proxies, then TCP fallback.
         let reason = format!("DC{} not in --dc-ip config", dc_id);
         let fallback = match dc_fallback_ips.get(&dc_id) {
             Some(ip) => ip.clone(),
@@ -225,6 +256,44 @@ pub async fn handle_client(
                 return;
             }
         };
+
+        // ── Try Cloudflare proxy if configured ────────────────────────────
+        if let Some(ref cf_domain) = config.cf_domain {
+            if !cf_in_cooldown(dc_id, is_media) {
+                debug!(
+                    "[{}] DC{}{} {} → trying CF proxy via {}",
+                    label, dc_id, media_tag, reason, cf_domain
+                );
+
+                let (cf_ws_opt, _all_redirects) =
+                    connect_cf_ws_for_dc(dc_id, cf_domain, is_media, skip_tls, CF_CONNECT_TIMEOUT)
+                        .await;
+
+                if let Some(ws) = cf_ws_opt {
+                    clear_cf_cooldown(dc_id, is_media);
+                    info!(
+                        "[{}] DC{}{} {} → CF proxy connected via {}",
+                        label, dc_id, media_tag, reason, cf_domain
+                    );
+                    bridge_ws(
+                        &label, reader, writer, ws, relay_init, ciphers, proto, dc_id, is_media,
+                    )
+                    .await;
+                    return;
+                } else {
+                    set_cf_cooldown(dc_id, is_media);
+                    warn!(
+                        "[{}] DC{}{} CF proxy failed, cooldown {}s",
+                        label, dc_id, media_tag, CF_FAIL_COOLDOWN.as_secs()
+                    );
+                }
+            } else {
+                debug!(
+                    "[{}] DC{}{} CF proxy in cooldown, skipping",
+                    label, dc_id, media_tag
+                );
+            }
+        }
 
         // Try each configured upstream MTProto proxy.
         for upstream in &config.mtproto_proxies {
@@ -325,7 +394,7 @@ pub async fn handle_client(
                 ws
             }
             None => {
-                // WS failed — apply cooldown and try upstream proxies or TCP fallback.
+                // WS failed — apply cooldown and try CF proxy, upstream proxies, or TCP fallback.
                 if all_redirects {
                     blacklist_ws(dc_id, is_media);
 
@@ -346,6 +415,50 @@ pub async fn handle_client(
                         media_tag,
                         WS_FAIL_COOLDOWN.as_secs()
                     );
+                }
+
+                // ── Try Cloudflare proxy if configured ────────────────────
+                if let Some(ref cf_domain) = config.cf_domain {
+                    if !cf_in_cooldown(dc_id, is_media) {
+                        debug!(
+                            "[{}] DC{}{} WS failed → trying CF proxy via {}",
+                            label, dc_id, media_tag, cf_domain
+                        );
+
+                        let (cf_ws_opt, _all_redirects) = connect_cf_ws_for_dc(
+                            dc_id,
+                            cf_domain,
+                            is_media,
+                            skip_tls,
+                            CF_CONNECT_TIMEOUT,
+                        )
+                        .await;
+
+                        if let Some(ws) = cf_ws_opt {
+                            clear_cf_cooldown(dc_id, is_media);
+                            info!(
+                                "[{}] DC{}{} → CF proxy connected via {}",
+                                label, dc_id, media_tag, cf_domain
+                            );
+                            bridge_ws(
+                                &label, reader, writer, ws, relay_init, ciphers, proto, dc_id,
+                                is_media,
+                            )
+                            .await;
+                            return;
+                        } else {
+                            set_cf_cooldown(dc_id, is_media);
+                            warn!(
+                                "[{}] DC{}{} CF proxy failed, cooldown {}s",
+                                label, dc_id, media_tag, CF_FAIL_COOLDOWN.as_secs()
+                            );
+                        }
+                    } else {
+                        debug!(
+                            "[{}] DC{}{} CF proxy in cooldown, skipping",
+                            label, dc_id, media_tag
+                        );
+                    }
                 }
 
                 // Try each configured upstream MTProto proxy before direct TCP.
