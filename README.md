@@ -99,14 +99,17 @@ tg-ws-proxy [OPTIONS]
 | `--buf-kb <KB>` | `256` | Socket buffer size |
 | `--pool-size <N>` | `4` | Pre-warmed WS connections per DC |
 | `--cf-domain <DOMAIN>` | — | Cloudflare-proxied domain for alternative WS routing (see [CF Proxy](#cloudflare-proxy)) |
+| `--max-connections <N>` | auto | Max concurrent client connections (auto-computed from `ulimit -n`) |
 | `--mtproto-proxy <HOST:PORT:SECRET>` | — | Upstream MTProto proxy fallback (repeatable) |
+| `--log-file <PATH>` | — | Write logs to a file instead of stderr (no ANSI color codes) |
 | `-q / --quiet` | off | Suppress all log output |
 | `-v / --verbose` | off | Debug logging |
 | `--danger-accept-invalid-certs` | off | Skip TLS verification |
 
 Every flag has a matching environment variable (`TG_PORT`, `TG_HOST`,
-`TG_SECRET`, `TG_BUF_KB`, `TG_POOL_SIZE`, `TG_QUIET`, `TG_VERBOSE`,
-`TG_SKIP_TLS_VERIFY`, `TG_LINK_IP`, `TG_CF_DOMAIN`, `TG_MTPROTO_PROXY`).
+`TG_SECRET`, `TG_BUF_KB`, `TG_POOL_SIZE`, `TG_MAX_CONNECTIONS`, `TG_QUIET`,
+`TG_VERBOSE`, `TG_SKIP_TLS_VERIFY`, `TG_LINK_IP`, `TG_MTPROTO_PROXY`,
+`TG_LOG_FILE`, `TG_CF_DOMAIN`).
 
 ### Examples
 
@@ -133,6 +136,9 @@ tg-ws-proxy --host 0.0.0.0
 
 # Verbose logging
 tg-ws-proxy -v
+
+# Log to a file instead of stderr (no garbled ANSI codes — useful on Windows)
+tg-ws-proxy --log-file proxy.log
 
 # All options via environment variables (useful for Docker / systemd)
 TG_PORT=1443 TG_SECRET=deadbeef... tg-ws-proxy
@@ -371,10 +377,28 @@ TG_PORT=1443
 TG_SECRET=0123456789abcdef0123456789abcdef
 TG_POOL_SIZE=4
 TG_BUF_KB=256
+TG_MAX_CONNECTIONS=64
 TG_QUIET=true
 TG_VERBOSE=false
 TG_CF_DOMAIN=yourdomain.com
+TG_LOG_FILE=/var/log/tg-ws-proxy.log
 TG_MTPROTO_PROXY=proxy.example.com:443:abcdef1234567890abcdef1234567890
+```
+
+## Windows console — no garbled characters
+
+On Windows the console does not enable ANSI/VT colour codes by default, which
+caused log lines to show symbols like `←[32m` around the log level.  This is
+fixed: ANSI escape codes are automatically disabled when running on Windows or
+when stderr is not a terminal (e.g. output is piped or redirected).
+
+If you prefer completely clean logs or want to capture them to a file, use
+`--log-file`:
+
+```bash
+tg-ws-proxy --log-file proxy.log
+# or
+set TG_LOG_FILE=proxy.log && tg-ws-proxy
 ```
 
 ## License

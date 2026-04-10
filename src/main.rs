@@ -13,6 +13,7 @@
 //! See [`proxy`] for the connection handling logic and [`crypto`] for the
 //! MTProto obfuscation details.
 
+use std::io::IsTerminal as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -97,12 +98,32 @@ async fn main() {
         "info"
     };
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| log_level.into()),
-        )
-        .init();
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| log_level.into());
+
+    if let Some(ref path) = config.log_file {
+        // File output: always disable ANSI color codes in log files.
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap_or_else(|e| panic!("cannot open log file '{}': {}", path, e));
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_ansi(false)
+            .with_writer(file)
+            .init();
+    } else {
+        // Console output: ANSI color codes are not rendered correctly on
+        // Windows consoles that lack Virtual Terminal Processing support, so
+        // disable them there.  Also disable when stderr is not a terminal
+        // (e.g. output is piped or redirected).
+        let use_ansi = std::io::stderr().is_terminal() && !cfg!(windows);
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_ansi(use_ansi)
+            .init();
+    }
 
     // ── Bind the server socket ────────────────────────────────────────────
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
