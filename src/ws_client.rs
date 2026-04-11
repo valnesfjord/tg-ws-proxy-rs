@@ -218,8 +218,8 @@ pub async fn connect_ws_for_dc(
     (None, all_redirects)
 }
 
-/// WebSocket domains for a given DC when routing through a Cloudflare-proxied
-/// domain.
+/// WebSocket domains for a given DC when routing through one or more
+/// Cloudflare-proxied domains.
 ///
 /// Each DNS record `kws{N}.{cf_domain}` should be an **orange-cloud** (proxied)
 /// A record in Cloudflare pointing at the corresponding Telegram DC IP, with
@@ -228,20 +228,23 @@ pub async fn connect_ws_for_dc(
 ///
 /// The effective DC is remapped the same way as `ws_domains()` so that
 /// non-canonical DC numbers (e.g. DC 203) resolve to a valid subdomain.
-pub fn cf_ws_domains(dc: u32, cf_domain: &str, is_media: bool) -> Vec<String> {
+///
+/// When multiple CF domains are given, each domain's subdomains are generated
+/// in order — the first domain has highest priority.
+pub fn cf_ws_domains(dc: u32, cf_domains: &[String], is_media: bool) -> Vec<String> {
     let overrides = default_dc_overrides();
     let effective_dc = *overrides.get(&dc).unwrap_or(&dc);
-    if is_media {
-        vec![
-            format!("kws{}-1.{}", effective_dc, cf_domain),
-            format!("kws{}.{}", effective_dc, cf_domain),
-        ]
-    } else {
-        vec![
-            format!("kws{}.{}", effective_dc, cf_domain),
-            format!("kws{}-1.{}", effective_dc, cf_domain),
-        ]
+    let mut result = Vec::new();
+    for cf_domain in cf_domains {
+        if is_media {
+            result.push(format!("kws{}-1.{}", effective_dc, cf_domain));
+            result.push(format!("kws{}.{}", effective_dc, cf_domain));
+        } else {
+            result.push(format!("kws{}.{}", effective_dc, cf_domain));
+            result.push(format!("kws{}-1.{}", effective_dc, cf_domain));
+        }
     }
+    result
 }
 
 /// Try all Cloudflare-proxy domains for a DC in order.
@@ -254,12 +257,12 @@ pub fn cf_ws_domains(dc: u32, cf_domain: &str, is_media: bool) -> Vec<String> {
 /// [`connect_ws_for_dc`].
 pub async fn connect_cf_ws_for_dc(
     dc: u32,
-    cf_domain: &str,
+    cf_domains: &[String],
     is_media: bool,
     skip_tls_verify: bool,
     timeout: Duration,
 ) -> (Option<TgWsStream>, bool) {
-    let domains = cf_ws_domains(dc, cf_domain, is_media);
+    let domains = cf_ws_domains(dc, cf_domains, is_media);
     let mut all_redirects = true;
 
     for domain in &domains {

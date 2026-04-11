@@ -259,22 +259,22 @@ pub async fn handle_client(
         };
 
         // ── Try Cloudflare proxy if configured ────────────────────────────
-        if let Some(ref cf_domain) = config.cf_domain {
+        if !config.cf_domains.is_empty() {
             if !cf_in_cooldown(dc_id, is_media) {
                 debug!(
-                    "[{}] DC{}{} {} → trying CF proxy via {}",
-                    label, dc_id, media_tag, reason, cf_domain
+                    "[{}] DC{}{} {} → trying CF proxy via {:?}",
+                    label, dc_id, media_tag, reason, config.cf_domains
                 );
 
                 let (cf_ws_opt, _all_redirects) =
-                    connect_cf_ws_for_dc(dc_id, cf_domain, is_media, skip_tls, cf_connect_timeout)
+                    connect_cf_ws_for_dc(dc_id, &config.cf_domains, is_media, skip_tls, cf_connect_timeout)
                         .await;
 
                 if let Some(ws) = cf_ws_opt {
                     clear_cf_cooldown(dc_id, is_media);
                     info!(
-                        "[{}] DC{}{} {} → CF proxy connected via {}",
-                        label, dc_id, media_tag, reason, cf_domain
+                        "[{}] DC{}{} {} → CF proxy connected",
+                        label, dc_id, media_tag, reason
                     );
                     bridge_ws(
                         &label, reader, writer, ws, relay_init, ciphers, proto, dc_id, is_media,
@@ -370,6 +370,44 @@ pub async fn handle_client(
     let target_ip = target_ip.unwrap();
     let ws_timeout = ws_timeout_for(dc_id, is_media, ws_connect_timeout, ws_fail_probe_timeout);
 
+    // ── Step 6: CF priority — try CF proxy before direct WS if enabled ──
+    if config.cf_priority && !config.cf_domains.is_empty() {
+        if !cf_in_cooldown(dc_id, is_media) {
+            debug!(
+                "[{}] DC{}{} cf-priority → trying CF proxy first",
+                label, dc_id, media_tag
+            );
+
+            let (cf_ws_opt, _all_redirects) =
+                connect_cf_ws_for_dc(dc_id, &config.cf_domains, is_media, skip_tls, cf_connect_timeout)
+                    .await;
+
+            if let Some(ws) = cf_ws_opt {
+                clear_cf_cooldown(dc_id, is_media);
+                info!(
+                    "[{}] DC{}{} → CF proxy connected (priority)",
+                    label, dc_id, media_tag
+                );
+                bridge_ws(
+                    &label, reader, writer, ws, relay_init, ciphers, proto, dc_id, is_media,
+                )
+                .await;
+                return;
+            } else {
+                set_cf_cooldown(dc_id, is_media, cf_fail_cooldown);
+                warn!(
+                    "[{}] DC{}{} CF proxy failed (priority), cooldown {}s — falling back to WS",
+                    label, dc_id, media_tag, cf_fail_cooldown.as_secs()
+                );
+            }
+        } else {
+            debug!(
+                "[{}] DC{}{} CF proxy in cooldown (priority), trying WS",
+                label, dc_id, media_tag
+            );
+        }
+    }
+
     // ── Step 6a: try pool first ───────────────────────────────────────────
     let ws_opt = pool.get(dc_id, is_media, target_ip.clone(), skip_tls).await;
 
@@ -421,16 +459,17 @@ pub async fn handle_client(
                 }
 
                 // ── Try Cloudflare proxy if configured ────────────────────
-                if let Some(ref cf_domain) = config.cf_domain {
+                // (Skip if --cf-priority already tried the CF path above.)
+                if !config.cf_priority && !config.cf_domains.is_empty() {
                     if !cf_in_cooldown(dc_id, is_media) {
                         debug!(
-                            "[{}] DC{}{} WS failed → trying CF proxy via {}",
-                            label, dc_id, media_tag, cf_domain
+                            "[{}] DC{}{} WS failed → trying CF proxy",
+                            label, dc_id, media_tag
                         );
 
                         let (cf_ws_opt, _all_redirects) = connect_cf_ws_for_dc(
                             dc_id,
-                            cf_domain,
+                            &config.cf_domains,
                             is_media,
                             skip_tls,
                             cf_connect_timeout,
@@ -440,8 +479,8 @@ pub async fn handle_client(
                         if let Some(ws) = cf_ws_opt {
                             clear_cf_cooldown(dc_id, is_media);
                             info!(
-                                "[{}] DC{}{} → CF proxy connected via {}",
-                                label, dc_id, media_tag, cf_domain
+                                "[{}] DC{}{} → CF proxy connected",
+                                label, dc_id, media_tag
                             );
                             bridge_ws(
                                 &label, reader, writer, ws, relay_init, ciphers, proto, dc_id,

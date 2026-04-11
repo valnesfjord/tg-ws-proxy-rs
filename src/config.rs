@@ -176,7 +176,7 @@ pub struct Config {
     #[arg(long = "link-ip", env = "TG_LINK_IP")]
     pub link_ip: Option<String>,
 
-    /// Cloudflare-proxied domain for alternative WebSocket routing.
+    /// Cloudflare-proxied domain(s) for alternative WebSocket routing.
     ///
     /// When set, the proxy will attempt to connect to Telegram DCs through
     /// Cloudflare's CDN using `kws{N}.{cf-domain}` subdomains.  This can
@@ -186,10 +186,21 @@ pub struct Config {
     /// the respective Telegram DC IPs, enable the orange-cloud proxy, and set
     /// SSL/TLS mode to **Flexible**.  See docs/CfProxy.md for full instructions.
     ///
+    /// Multiple domains can be specified as a comma-separated list.  They are
+    /// tried in the order given (first domain has highest priority).
+    ///
     /// The CF proxy is tried as a fallback after direct WebSocket connections
     /// fail, and as the primary path when no `--dc-ip` is configured for a DC.
-    #[arg(long = "cf-domain", value_name = "DOMAIN", env = "TG_CF_DOMAIN")]
-    pub cf_domain: Option<String>,
+    #[arg(long = "cf-domain", value_name = "DOMAIN", value_delimiter = ',', env = "TG_CF_DOMAIN")]
+    pub cf_domains: Vec<String>,
+
+    /// Prioritise Cloudflare proxy over direct WebSocket connections for all
+    /// DCs (even those with `--dc-ip` configured).
+    ///
+    /// When set, the proxy tries the CF path first; if it fails, falls back to
+    /// the normal WS path, then upstream MTProto proxies, then direct TCP.
+    #[arg(long = "cf-priority", env = "TG_CF_PRIORITY")]
+    pub cf_priority: bool,
 
     // ── Timeout / cooldown knobs ─────────────────────────────────────────
 
@@ -252,8 +263,10 @@ impl Config {
             cfg.secret = Some(hex::encode(bytes));
         }
 
-        // If no --dc-ip was given, use the built-in defaults.
-        if cfg.dc_ip.is_empty() {
+        // If no --dc-ip was given, use the built-in defaults — unless a CF
+        // domain is configured (in which case CF proxy becomes the primary
+        // path for all DCs without explicit IPs).
+        if cfg.dc_ip.is_empty() && cfg.cf_domains.is_empty() {
             cfg.dc_ip = vec![
                 (2, "149.154.167.220".to_string()),
                 (4, "149.154.167.220".to_string()),

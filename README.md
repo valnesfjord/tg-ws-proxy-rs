@@ -95,10 +95,11 @@ tg-ws-proxy [OPTIONS]
 | `--host <HOST>` | `127.0.0.1` | Listen address |
 | `--link-ip <IP>` | auto-detected | IP shown in the `tg://` link (see [Router deployment](#router-deployment)) |
 | `--secret <HEX>` | random | 32 hex-char MTProto secret |
-| `--dc-ip <DC:IP>` | DC2 + DC4 | Target IP per DC (repeatable) |
+| `--dc-ip <DC:IP>` | DC2 + DC4 | Target IP per DC (repeatable); omit when using `--cf-domain` to let CF proxy handle all DCs |
 | `--buf-kb <KB>` | `256` | Socket buffer size |
 | `--pool-size <N>` | `4` | Pre-warmed WS connections per DC |
-| `--cf-domain <DOMAIN>` | — | Cloudflare-proxied domain for alternative WS routing (see [CF Proxy](#cloudflare-proxy)) |
+| `--cf-domain <DOMAIN>` | — | Cloudflare-proxied domain(s) for alternative WS routing, comma-separated (see [CF Proxy](#cloudflare-proxy)) |
+| `--cf-priority` | off | Try CF proxy **before** direct WS for all DCs (see [CF Proxy](#cloudflare-proxy)) |
 | `--max-connections <N>` | auto | Max concurrent client connections (auto-computed from `ulimit -n`) |
 | `--mtproto-proxy <HOST:PORT:SECRET>` | — | Upstream MTProto proxy fallback (repeatable) |
 | `--log-file <PATH>` | — | Write logs to a file instead of stderr (no ANSI color codes) |
@@ -109,7 +110,7 @@ tg-ws-proxy [OPTIONS]
 Every flag has a matching environment variable (`TG_PORT`, `TG_HOST`,
 `TG_SECRET`, `TG_BUF_KB`, `TG_POOL_SIZE`, `TG_MAX_CONNECTIONS`, `TG_QUIET`,
 `TG_VERBOSE`, `TG_SKIP_TLS_VERIFY`, `TG_LINK_IP`, `TG_MTPROTO_PROXY`,
-`TG_LOG_FILE`, `TG_CF_DOMAIN`).
+`TG_LOG_FILE`, `TG_CF_DOMAIN`, `TG_CF_PRIORITY`).
 
 ### Examples
 
@@ -125,6 +126,15 @@ tg-ws-proxy --mtproto-proxy proxy.example.com:443:abcdef1234567890abcdef12345678
 
 # With Cloudflare proxy domain (WS fallback via Cloudflare CDN)
 tg-ws-proxy --cf-domain yourdomain.com
+
+# CF proxy only (no --dc-ip → CF proxy handles all DCs)
+tg-ws-proxy --cf-domain yourdomain.com
+
+# Multiple CF domains (tried in order) with CF priority over direct WS
+tg-ws-proxy --cf-domain proxy.net,example.com --cf-priority
+
+# CF priority: CF proxy is tried first, falls back to direct WS on failure
+tg-ws-proxy --dc-ip 2:149.154.167.220 --cf-domain yourdomain.com --cf-priority
 
 # Multiple upstream proxies (tried in order until one succeeds)
 tg-ws-proxy \
@@ -193,12 +203,22 @@ name — no server-side component.
 # Use your own Cloudflare-proxied domain
 tg-ws-proxy --cf-domain yourdomain.com
 
+# Multiple domains (tried in order, first has highest priority)
+tg-ws-proxy --cf-domain primary.net,backup.com
+
+# CF-only mode: omit --dc-ip so CF proxy handles all DCs
+tg-ws-proxy --cf-domain yourdomain.com
+
+# CF priority: try CF proxy before direct WS, with WS as fallback
+tg-ws-proxy --dc-ip 2:149.154.167.220 --cf-domain yourdomain.com --cf-priority
+
 # Or via environment variable
 TG_CF_DOMAIN=yourdomain.com tg-ws-proxy
 ```
 
 The proxy will try the CF path as a fallback after direct WebSocket fails, and
-as the primary path for DCs that have no `--dc-ip` configured.
+as the primary path for DCs that have no `--dc-ip` configured.  With
+`--cf-priority`, the CF proxy is tried **before** direct WebSocket for all DCs.
 
 **One-time domain setup** (do this in the Cloudflare dashboard):
 
