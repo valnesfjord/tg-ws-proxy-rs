@@ -165,10 +165,9 @@ pub async fn connect_ws(
 
 /// Return `true` when `reason` describes a DNS lookup failure.
 ///
-/// These failures are expected when a user has not configured every optional
-/// DNS record variant (e.g. the `kws{N}-1` suffix records).  We log them at
-/// `debug` rather than `warn` to avoid alarming users who only have the
-/// primary `kws{N}` records set up.
+/// Used in the CF-proxy path to detect when a `kws{N}-1.domain` record is
+/// absent so that the connection can be transparently retried using the base
+/// `kws{N}.domain` record (which the user is only required to configure once).
 fn is_dns_not_found(reason: &str) -> bool {
     // The error originates from the "TCP connect" phase and contains one of
     // several platform-specific messages for "host not found":
@@ -272,6 +271,10 @@ pub fn cf_ws_domains(dc: u32, cf_domains: &[String], is_media: bool) -> Vec<Stri
 /// anycast IP, not directly to Telegram) and the TLS SNI, so no separate DC IP
 /// is required.
 ///
+/// `kws{N}-1` records are **optional** in a CF setup.  When one is absent the
+/// proxy transparently retries the same DC using `kws{N}` — the user only needs
+/// to configure the base record in Cloudflare.
+///
 /// Returns `(Some(stream), all_redirects)` with the same semantics as
 /// [`connect_ws_for_dc`].
 pub async fn connect_cf_ws_for_dc(
@@ -283,8 +286,17 @@ pub async fn connect_cf_ws_for_dc(
 ) -> (Option<TgWsStream>, bool) {
     let domains = cf_ws_domains(dc, cf_domains, is_media);
     let mut all_redirects = true;
+    // Track domains we have already attempted so that a transparent `-1` →
+    // base fallback does not cause the base domain to be tried a second time
+    // when it appears later in the list.
+    let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for domain in &domains {
+        if tried.contains(domain) {
+            continue;
+        }
+        tried.insert(domain.clone());
+
         debug!(
             "CF WS trying DC{}{} → {}",
             dc,
@@ -308,15 +320,43 @@ pub async fn connect_cf_ws_for_dc(
                 );
             }
             WsConnectResult::Failed(reason) => {
-                if is_dns_not_found(&reason) {
-                    // Expected when the user hasn't created the optional
-                    // kws{N}-1 DNS record; not a misconfiguration warning.
+                // kws{N}-1 records are optional in a user-managed CF zone.
+                // When one is absent in DNS, transparently retry using the
+                // base kws{N} record — no warning, as this is expected.
+                if is_dns_not_found(&reason) && domain.contains("-1.") {
+                    let fallback = domain.replacen("-1.", ".", 1);
                     debug!(
-                        "CF WS DC{}{} no DNS record for {} (optional, skipping)",
+                        "CF WS DC{}{}: {} not in DNS, retrying with {}",
                         dc,
                         if is_media { "m" } else { "" },
-                        domain
+                        domain,
+                        fallback
                     );
+                    tried.insert(fallback.clone());
+                    match connect_ws(&fallback, &fallback, skip_tls_verify, timeout).await {
+                        WsConnectResult::Connected(ws) => {
+                            return (Some(ws), false);
+                        }
+                        WsConnectResult::Redirect(code) => {
+                            warn!(
+                                "CF WS DC{}{} got {} from {} (redirect)",
+                                dc,
+                                if is_media { "m" } else { "" },
+                                code,
+                                fallback
+                            );
+                        }
+                        WsConnectResult::Failed(reason2) => {
+                            warn!(
+                                "CF WS DC{}{} failed on {}: {}",
+                                dc,
+                                if is_media { "m" } else { "" },
+                                fallback,
+                                reason2
+                            );
+                            all_redirects = false;
+                        }
+                    }
                 } else {
                     warn!(
                         "CF WS DC{}{} failed on {}: {}",
@@ -325,9 +365,8 @@ pub async fn connect_cf_ws_for_dc(
                         domain,
                         reason
                     );
+                    all_redirects = false;
                 }
-
-                all_redirects = false;
             }
         }
     }
