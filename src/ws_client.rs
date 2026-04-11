@@ -163,6 +163,25 @@ pub async fn connect_ws(
     }
 }
 
+/// Return `true` when `reason` describes a DNS lookup failure.
+///
+/// These failures are expected when a user has not configured every optional
+/// DNS record variant (e.g. the `kws{N}-1` suffix records).  We log them at
+/// `debug` rather than `warn` to avoid alarming users who only have the
+/// primary `kws{N}` records set up.
+fn is_dns_not_found(reason: &str) -> bool {
+    // The error originates from the "TCP connect" phase and contains one of
+    // several platform-specific messages for "host not found":
+    //   Linux glibc:  "failed to lookup address information: ..."
+    //   macOS/BSD:    "nodename nor servname provided, or not known"
+    //   Windows:      "No such host is known"
+    reason.starts_with("TCP connect:")
+        && (reason.contains("failed to lookup address information")
+            || reason.contains("nodename nor servname provided")
+            || reason.contains("No such host is known")
+            || reason.contains("Name or service not known"))
+}
+
 /// Try all domains for a DC in order; return the first success or the last error.
 ///
 /// Returns `(Some(stream), all_redirects)`:
@@ -289,13 +308,24 @@ pub async fn connect_cf_ws_for_dc(
                 );
             }
             WsConnectResult::Failed(reason) => {
-                warn!(
-                    "CF WS DC{}{} failed on {}: {}",
-                    dc,
-                    if is_media { "m" } else { "" },
-                    domain,
-                    reason
-                );
+                if is_dns_not_found(&reason) {
+                    // Expected when the user hasn't created the optional
+                    // kws{N}-1 DNS record; not a misconfiguration warning.
+                    debug!(
+                        "CF WS DC{}{} no DNS record for {} (optional, skipping)",
+                        dc,
+                        if is_media { "m" } else { "" },
+                        domain
+                    );
+                } else {
+                    warn!(
+                        "CF WS DC{}{} failed on {}: {}",
+                        dc,
+                        if is_media { "m" } else { "" },
+                        domain,
+                        reason
+                    );
+                }
 
                 all_redirects = false;
             }
