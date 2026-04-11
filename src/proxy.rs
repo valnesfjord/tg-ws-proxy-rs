@@ -408,7 +408,7 @@ pub async fn handle_client(
         }
     }
 
-    // ── Step 6a: try pool first ───────────────────────────────────────────
+    // ── Step 6a: try pool first ──────────────────────────────────────────
     let ws_opt = pool.get(dc_id, is_media, target_ip.clone(), skip_tls).await;
 
     let ws = if let Some(ws) = ws_opt {
@@ -419,7 +419,7 @@ pub async fn handle_client(
 
         ws
     } else {
-        // ── Step 6b: fresh WebSocket connect ─────────────────────────────
+        // ── Step 6b: fresh WebSocket connect ────────────────────────────
         let (ws_opt, all_redirects) =
             connect_ws_for_dc(&target_ip, ws_dc, is_media, skip_tls, ws_timeout).await;
 

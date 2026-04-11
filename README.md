@@ -127,8 +127,8 @@ tg-ws-proxy --mtproto-proxy proxy.example.com:443:abcdef1234567890abcdef12345678
 # With Cloudflare proxy domain (WS fallback via Cloudflare CDN)
 tg-ws-proxy --cf-domain yourdomain.com
 
-# CF proxy only (no --dc-ip → CF proxy handles all DCs)
-tg-ws-proxy --cf-domain yourdomain.com
+# CF proxy only: omit --dc-ip so CF proxy handles all DCs
+tg-ws-proxy --cf-domain yourdomain.com --cf-priority
 
 # Multiple CF domains (tried in order) with CF priority over direct WS
 tg-ws-proxy --cf-domain proxy.net,example.com --cf-priority
