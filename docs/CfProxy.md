@@ -62,6 +62,13 @@ default domain can stop working at any time.
    tg-ws-proxy --cf-domain yourdomain.com
    ```
 
+   Multiple domains can be specified as a comma-separated list.  They are
+   tried in the order given (first domain has highest priority):
+
+   ```sh
+   tg-ws-proxy --cf-domain primary.net,backup.com
+   ```
+
    Or set the environment variable:
 
    ```sh
@@ -75,11 +82,25 @@ When `--cf-domain` is configured the proxy:
 
 1. Tries the normal direct WebSocket connection to the Telegram DC first.
 2. If that fails, connects to `kws{N}.{cf_domain}:443` and `kws{N}-1.{cf_domain}:443`
-   (where `N` is the DC number).  DNS resolves to Cloudflare's anycast IP.
+   (where `N` is the DC number) for each configured domain in order.
+   DNS resolves to Cloudflare's anycast IP.
    Cloudflare terminates TLS and forwards the WebSocket traffic as plain HTTP
    to the origin (Flexible SSL mode) — which is Telegram's actual DC server.
 3. If the CF proxy also fails, falls back to upstream MTProto proxies (if
    configured) and finally direct TCP.
 
 When no `--dc-ip` is configured for a DC, the CF proxy is tried as the
-**primary** path (before upstreams / TCP fallback).
+**primary** path (before upstreams / TCP fallback).  If `--dc-ip` is omitted
+entirely and `--cf-domain` is set, CF proxy becomes the primary path for
+**all** DCs.
+
+### `--cf-priority`
+
+When `--cf-priority` is set, the CF proxy is tried **before** the normal
+direct WebSocket connection for **all** DCs (even those with `--dc-ip`
+configured).  If the CF proxy fails, the proxy falls back to the normal WS
+path, then upstream MTProto proxies, then direct TCP.
+
+```sh
+tg-ws-proxy --dc-ip 2:149.154.167.220 --cf-domain yourdomain.com --cf-priority
+```

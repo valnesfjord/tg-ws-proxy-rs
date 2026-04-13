@@ -163,6 +163,24 @@ pub async fn connect_ws(
     }
 }
 
+/// Return `true` when `reason` describes a DNS lookup failure.
+///
+/// Used in the CF-proxy path to detect when a `kws{N}-1.domain` record is
+/// absent so that the connection can be transparently retried using the base
+/// `kws{N}.domain` record (which the user is only required to configure once).
+fn is_dns_not_found(reason: &str) -> bool {
+    // The error originates from the "TCP connect" phase and contains one of
+    // several platform-specific messages for "host not found":
+    //   Linux glibc:  "failed to lookup address information: ..."
+    //   macOS/BSD:    "nodename nor servname provided, or not known"
+    //   Windows:      "No such host is known"
+    reason.starts_with("TCP connect:")
+        && (reason.contains("failed to lookup address information")
+            || reason.contains("nodename nor servname provided")
+            || reason.contains("No such host is known")
+            || reason.contains("Name or service not known"))
+}
+
 /// Try all domains for a DC in order; return the first success or the last error.
 ///
 /// Returns `(Some(stream), all_redirects)`:
@@ -218,8 +236,8 @@ pub async fn connect_ws_for_dc(
     (None, all_redirects)
 }
 
-/// WebSocket domains for a given DC when routing through a Cloudflare-proxied
-/// domain.
+/// WebSocket domains for a given DC when routing through one or more
+/// Cloudflare-proxied domains.
 ///
 /// Each DNS record `kws{N}.{cf_domain}` should be an **orange-cloud** (proxied)
 /// A record in Cloudflare pointing at the corresponding Telegram DC IP, with
@@ -228,20 +246,23 @@ pub async fn connect_ws_for_dc(
 ///
 /// The effective DC is remapped the same way as `ws_domains()` so that
 /// non-canonical DC numbers (e.g. DC 203) resolve to a valid subdomain.
-pub fn cf_ws_domains(dc: u32, cf_domain: &str, is_media: bool) -> Vec<String> {
+///
+/// When multiple CF domains are given, each domain's subdomains are generated
+/// in order — the first domain has highest priority.
+pub fn cf_ws_domains(dc: u32, cf_domains: &[String], is_media: bool) -> Vec<String> {
     let overrides = default_dc_overrides();
     let effective_dc = *overrides.get(&dc).unwrap_or(&dc);
-    if is_media {
-        vec![
-            format!("kws{}-1.{}", effective_dc, cf_domain),
-            format!("kws{}.{}", effective_dc, cf_domain),
-        ]
-    } else {
-        vec![
-            format!("kws{}.{}", effective_dc, cf_domain),
-            format!("kws{}-1.{}", effective_dc, cf_domain),
-        ]
+    let mut result = Vec::new();
+    for cf_domain in cf_domains {
+        if is_media {
+            result.push(format!("kws{}-1.{}", effective_dc, cf_domain));
+            result.push(format!("kws{}.{}", effective_dc, cf_domain));
+        } else {
+            result.push(format!("kws{}.{}", effective_dc, cf_domain));
+            result.push(format!("kws{}-1.{}", effective_dc, cf_domain));
+        }
     }
+    result
 }
 
 /// Try all Cloudflare-proxy domains for a DC in order.
@@ -250,19 +271,32 @@ pub fn cf_ws_domains(dc: u32, cf_domain: &str, is_media: bool) -> Vec<String> {
 /// anycast IP, not directly to Telegram) and the TLS SNI, so no separate DC IP
 /// is required.
 ///
+/// `kws{N}-1` records are **optional** in a CF setup.  When one is absent the
+/// proxy transparently retries the same DC using `kws{N}` — the user only needs
+/// to configure the base record in Cloudflare.
+///
 /// Returns `(Some(stream), all_redirects)` with the same semantics as
 /// [`connect_ws_for_dc`].
 pub async fn connect_cf_ws_for_dc(
     dc: u32,
-    cf_domain: &str,
+    cf_domains: &[String],
     is_media: bool,
     skip_tls_verify: bool,
     timeout: Duration,
 ) -> (Option<TgWsStream>, bool) {
-    let domains = cf_ws_domains(dc, cf_domain, is_media);
+    let domains = cf_ws_domains(dc, cf_domains, is_media);
     let mut all_redirects = true;
+    // Track domains we have already attempted so that a transparent `-1` →
+    // base fallback does not cause the base domain to be tried a second time
+    // when it appears later in the list.
+    let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for domain in &domains {
+        if tried.contains(domain) {
+            continue;
+        }
+        tried.insert(domain.clone());
+
         debug!(
             "CF WS trying DC{}{} → {}",
             dc,
@@ -286,15 +320,53 @@ pub async fn connect_cf_ws_for_dc(
                 );
             }
             WsConnectResult::Failed(reason) => {
-                warn!(
-                    "CF WS DC{}{} failed on {}: {}",
-                    dc,
-                    if is_media { "m" } else { "" },
-                    domain,
-                    reason
-                );
-
-                all_redirects = false;
+                // kws{N}-1 records are optional in a user-managed CF zone.
+                // When one is absent in DNS, transparently retry using the
+                // base kws{N} record — no warning, as this is expected.
+                if is_dns_not_found(&reason) && domain.contains("-1.") {
+                    let fallback = domain.replacen("-1.", ".", 1);
+                    debug!(
+                        "CF WS DC{}{}: {} not in DNS, retrying with {}",
+                        dc,
+                        if is_media { "m" } else { "" },
+                        domain,
+                        fallback
+                    );
+                    tried.insert(fallback.clone());
+                    match connect_ws(&fallback, &fallback, skip_tls_verify, timeout).await {
+                        WsConnectResult::Connected(ws) => {
+                            return (Some(ws), false);
+                        }
+                        WsConnectResult::Redirect(code) => {
+                            warn!(
+                                "CF WS DC{}{} got {} from {} (redirect)",
+                                dc,
+                                if is_media { "m" } else { "" },
+                                code,
+                                fallback
+                            );
+                        }
+                        WsConnectResult::Failed(reason2) => {
+                            warn!(
+                                "CF WS DC{}{} failed on {}: {}",
+                                dc,
+                                if is_media { "m" } else { "" },
+                                fallback,
+                                reason2
+                            );
+                            all_redirects = false;
+                        }
+                    }
+                } else {
+                    warn!(
+                        "CF WS DC{}{} failed on {}: {}",
+                        dc,
+                        if is_media { "m" } else { "" },
+                        domain,
+                        reason
+                    );
+                    all_redirects = false;
+                }
             }
         }
     }

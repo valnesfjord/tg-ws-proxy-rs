@@ -183,9 +183,14 @@ async fn main() {
         info!("  ⚠  TLS certificate verification DISABLED");
     }
 
-    if let Some(ref cf_domain) = config.cf_domain {
-        info!("  Cloudflare proxy domain: {}", cf_domain);
-        info!("    (used as WS fallback via kws{{N}}.{} subdomains)", cf_domain);
+    if !config.cf_domains.is_empty() {
+        info!("  Cloudflare proxy domain(s):");
+        for d in &config.cf_domains {
+            info!("    {} (kws{{N}}.{} subdomains)", d, d);
+        }
+        if config.cf_priority {
+            info!("    ⚡ CF priority mode: CF proxy is tried BEFORE direct WS");
+        }
     }
 
     if !config.mtproto_proxies.is_empty() {
