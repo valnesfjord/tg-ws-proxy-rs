@@ -244,22 +244,23 @@ pub async fn connect_ws_for_dc(
 /// the zone's SSL/TLS mode set to **Flexible**.  Cloudflare then terminates TLS
 /// from our side and forwards the WebSocket traffic as plain HTTP to Telegram.
 ///
-/// The effective DC is remapped the same way as `ws_domains()` so that
-/// non-canonical DC numbers (e.g. DC 203) resolve to a valid subdomain.
+/// Unlike `ws_domains()`, the raw DC number is used **without** applying
+/// `default_dc_overrides()`.  The user controls the Cloudflare DNS zone and
+/// creates explicit records for every DC — including non-canonical ones like
+/// DC 203 (`kws203.{cf_domain}`).  Remapping 203 → 2 would incorrectly route
+/// traffic to DC 2 instead of DC 203 (they have different IPs/servers).
 ///
 /// When multiple CF domains are given, each domain's subdomains are generated
 /// in order — the first domain has highest priority.
 pub fn cf_ws_domains(dc: u32, cf_domains: &[String], is_media: bool) -> Vec<String> {
-    let overrides = default_dc_overrides();
-    let effective_dc = *overrides.get(&dc).unwrap_or(&dc);
     let mut result = Vec::new();
     for cf_domain in cf_domains {
         if is_media {
-            result.push(format!("kws{}-1.{}", effective_dc, cf_domain));
-            result.push(format!("kws{}.{}", effective_dc, cf_domain));
+            result.push(format!("kws{}-1.{}", dc, cf_domain));
+            result.push(format!("kws{}.{}", dc, cf_domain));
         } else {
-            result.push(format!("kws{}.{}", effective_dc, cf_domain));
-            result.push(format!("kws{}-1.{}", effective_dc, cf_domain));
+            result.push(format!("kws{}.{}", dc, cf_domain));
+            result.push(format!("kws{}-1.{}", dc, cf_domain));
         }
     }
     result
