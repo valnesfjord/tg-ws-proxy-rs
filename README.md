@@ -122,7 +122,7 @@ tg-ws-proxy
 tg-ws-proxy --port 9050 --dc-ip 1:149.154.175.205 --dc-ip 2:149.154.167.220
 
 # With upstream MTProto proxy fallback
-tg-ws-proxy --mtproto-proxy proxy.example.com:443:abcdef1234567890abcdef1234567890
+tg-ws-proxy --mtproto-proxy proxy.example.com:443:ddabcdef1234567890abcdef1234567890
 
 # With Cloudflare proxy domain (WS fallback via Cloudflare CDN)
 tg-ws-proxy --cf-domain yourdomain.com
@@ -138,8 +138,8 @@ tg-ws-proxy --dc-ip 2:149.154.167.220 --cf-domain yourdomain.com --cf-priority
 
 # Multiple upstream proxies (tried in order until one succeeds)
 tg-ws-proxy \
-  --mtproto-proxy proxy.example.com:443:abcdef1234567890abcdef1234567890 \
-  --mtproto-proxy other.example.net:8888:deadbeef01234567deadbeef01234567
+  --mtproto-proxy proxy.example.com:443:ddabcdef1234567890abcdef1234567890 \
+  --mtproto-proxy other.example.net:8888:dddeadbeef01234567deadbeef01234567
 
 # Router deployment: listen on all interfaces, let all LAN devices use the proxy
 tg-ws-proxy --host 0.0.0.0
@@ -172,26 +172,35 @@ given; if one fails it enters a 60-second cooldown so subsequent connections
 skip it without delay.
 
 ```bash
+# Padded-intermediate proxy (dd prefix)
+tg-ws-proxy --mtproto-proxy proxy.example.com:443:ddabcdef1234567890abcdef1234567890
+
+# FakeTLS proxy (ee prefix — domain-fronting transport)
+tg-ws-proxy --mtproto-proxy proxy.example.com:443:ee<32-hex-key><hex-encoded-hostname>
+
+# Multiple proxies (tried in order until one succeeds)
 tg-ws-proxy \
-  --mtproto-proxy proxy.example.com:443:abcdef1234567890abcdef1234567890 \
-  --mtproto-proxy other.example.net:8888:deadbeef01234567deadbeef01234567
+  --mtproto-proxy proxy.example.com:443:ddabcdef1234567890abcdef1234567890 \
+  --mtproto-proxy other.example.net:8888:dddeadbeef01234567deadbeef01234567
 
 # Or via environment variable (comma-separated)
-TG_MTPROTO_PROXY="proxy.example.com:443:abcdef1234...,other.example.net:8888:deadbeef..." tg-ws-proxy
+TG_MTPROTO_PROXY="proxy.example.com:443:ddabcdef1234...,other.example.net:8888:dddeadbeef..." tg-ws-proxy
 ```
 
-> **⚠️ Secret format — no `dd` prefix!**
+> **ℹ️ Secret format — pass the secret exactly as shown in the `tg://proxy` link**
 >
-> Public MTProto proxies often display the secret
-> with a `dd` prefix, e.g. `ddabcdef1234567890abcdef1234567890`.  That `dd`
-> prefix is **not** part of the secret — it's a protocol marker indicating the
-> "padded intermediate" transport.  **Strip the leading `dd` before passing the
-> secret to `--mtproto-proxy`:**
+> Public MTProto proxies advertise secrets with a 1-byte prefix that tells the
+> proxy which transport mode to use.  **Copy the full secret as-is — prefix included:**
 >
-> ```
-> Proxy shows:  ddabcdef1234567890abcdef1234567890
-> Use this:       abcdef1234567890abcdef1234567890   ← drop the "dd"
-> ```
+> | Prefix | Meaning | Example |
+> |--------|---------|---------|
+> | `dd` | Padded-intermediate transport | `ddabcdef1234567890abcdef1234567890` |
+> | `ee` | FakeTLS (domain-fronting) transport | `ee` + 32 hex key chars + hex-encoded hostname |
+> | *(none)* | Plain transport (legacy, 32 hex chars) | `abcdef1234567890abcdef1234567890` |
+>
+> In the `tg://proxy?server=...&secret=` link the `secret=` value already
+> contains the correct prefix.  Copy everything after `secret=` and pass it
+> directly to `--mtproto-proxy`.
 
 ### Cloudflare Proxy
 
@@ -402,7 +411,7 @@ TG_QUIET=true
 TG_VERBOSE=false
 TG_CF_DOMAIN=yourdomain.com
 TG_LOG_FILE=/var/log/tg-ws-proxy.log
-TG_MTPROTO_PROXY=proxy.example.com:443:abcdef1234567890abcdef1234567890
+TG_MTPROTO_PROXY=proxy.example.com:443:ddabcdef1234567890abcdef1234567890
 ```
 
 ## Windows console — no garbled characters
