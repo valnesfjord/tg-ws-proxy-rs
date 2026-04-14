@@ -144,14 +144,14 @@ pub fn generate_relay_init(proto: ProtoTag, dc_idx: i16) -> [u8; HANDSHAKE_LEN] 
     loop {
         // Generate 64 random bytes.
         let mut rnd = [0u8; HANDSHAKE_LEN];
-        rand::thread_rng().fill_bytes(&mut rnd);
+        rand::rng().fill_bytes(&mut rnd);
 
         // Reject reserved prefixes that Telegram or intermediate proxies
         // would misinterpret as an HTTP/TLS connection.
         if RESERVED_FIRST_BYTES.contains(&rnd[0]) {
             continue;
         }
-        
+
         if RESERVED_STARTS.iter().any(|s| &rnd[..4] == s) {
             continue;
         }
@@ -175,7 +175,7 @@ pub fn generate_relay_init(proto: ProtoTag, dc_idx: i16) -> [u8; HANDSHAKE_LEN] 
         let mut tail_plain = [0u8; 8];
         tail_plain[..4].copy_from_slice(&proto_tag);
         tail_plain[4..6].copy_from_slice(&dc_bytes);
-        rand::thread_rng().fill_bytes(&mut tail_plain[6..]);
+        rand::rng().fill_bytes(&mut tail_plain[6..]);
 
         let mut result = rnd;
         for i in 0..8 {
@@ -217,7 +217,7 @@ pub fn generate_client_handshake(
 
     loop {
         let mut raw = [0u8; HANDSHAKE_LEN];
-        rand::thread_rng().fill_bytes(&mut raw);
+        rand::rng().fill_bytes(&mut raw);
 
         // Reject reserved prefixes (same rules as generate_relay_init).
         if RESERVED_FIRST_BYTES.contains(&raw[0]) {
