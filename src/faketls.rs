@@ -53,17 +53,18 @@ type HmacSha256 = Hmac<Sha256>;
 
 // ─── ClientHello construction ───────────────────────────────────────────────
 
-/// Build a TLS 1.2-style ClientHello with HMAC-SHA256 authentication.
+/// Build a TLS 1.2-style ClientHello with the `random` field zeroed.
 ///
-/// The `random` field carries the authentication digest:
+/// The returned record must be signed with [`sign_faketls_client_hello`]
+/// before sending — that function fills the `random` field with the
+/// HMAC-SHA256 authentication digest.
+///
+/// After signing, the `random` field carries:
 /// - bytes [0..28]: first 28 bytes of `HMAC-SHA256(secret, record_with_random_zeroed)`
 /// - bytes [28..32]: `XOR(hmac[28..32], timestamp_le)`
 ///
 /// The `session_id` is 32 random bytes (the upstream proxy ignores it for auth).
 /// The SNI extension carries the `hostname` from the decoded secret.
-///
-/// After the fake TLS handshake completes, the 64-byte MTProto init packet
-/// is sent inside the first Application Data record.
 pub fn build_faketls_client_hello(hostname: &str) -> Vec<u8> {
     // ── Extensions ────────────────────────────────────────────────────────
     let mut exts: Vec<u8> = Vec::new();
@@ -229,7 +230,8 @@ pub async fn drain_faketls_server_hello(
             return false;
         }
 
-        // TLS records must not exceed the maximum size.
+        // TLS records must not exceed max plaintext + AEAD expansion overhead.
+        // RFC 8446 §5.2: ciphertext record ≤ 2^14 + 256 bytes.
         if payload_len > TLS_MAX_RECORD_PAYLOAD + 256 {
             return false;
         }
