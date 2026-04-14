@@ -26,7 +26,7 @@ cipher = "0.4"
 sha2 = "0.10"
 
 # Random bytes for handshake generation
-rand = "0.8"
+rand = "0.9"
 
 # Hex encoding / decoding utilities
 hex = "0.4"
