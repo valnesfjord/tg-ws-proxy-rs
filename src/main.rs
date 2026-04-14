@@ -73,6 +73,7 @@ fn auto_max_connections(fd_limit: usize, pool_size: usize, dc_buckets: usize) ->
 
 mod config;
 mod crypto;
+mod faketls;
 mod pool;
 mod proxy;
 mod splitter;

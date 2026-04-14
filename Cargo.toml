@@ -25,6 +25,9 @@ cipher = "0.4"
 # SHA-256 for MTProto key derivation
 sha2 = "0.10"
 
+# HMAC-SHA256 for FakeTLS upstream proxy authentication
+hmac = "0.12"
+
 # Random bytes for handshake generation
 rand = "0.9"
 
