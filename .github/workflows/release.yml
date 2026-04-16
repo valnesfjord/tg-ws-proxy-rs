@@ -73,22 +73,20 @@ jobs:
               if: matrix.target == 'mips-unknown-linux-musl'
               run: cross +nightly build --release --bin tg-ws-proxy --target mips-unknown-linux-musl -Z build-std=std,panic_abort
 
-            - name: Upload to GitHub Release (mipsel)
-              if: matrix.target == 'mipsel-unknown-linux-musl'
-              env:
-                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            - name: Inspect build output (mips variants)
+              if: matrix.target == 'mipsel-unknown-linux-musl' || matrix.target == 'mips-unknown-linux-musl'
               run: |
-                  TAG="${GITHUB_REF_NAME}"
-                  gh release upload "$TAG" \
-                    "target/mipsel-unknown-linux-musl/release/tg-ws-proxy#tg-ws-proxy-mipsel-unknown-linux-musl" \
-                    --clobber
+                  FILE="target/${{ matrix.target }}/release/tg-ws-proxy"
+                  ls -lah "target/${{ matrix.target }}/release/" || true
+                  test -f "$FILE"
 
-            - name: Upload to GitHub Release (mips)
-              if: matrix.target == 'mips-unknown-linux-musl'
+            - name: Upload to GitHub Release (mips variants)
+              if: matrix.target == 'mipsel-unknown-linux-musl' || matrix.target == 'mips-unknown-linux-musl'
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
               run: |
                   TAG="${GITHUB_REF_NAME}"
+                  FILE="target/${{ matrix.target }}/release/tg-ws-proxy"
                   gh release upload "$TAG" \
-                    "target/mips-unknown-linux-musl/release/tg-ws-proxy#tg-ws-proxy-mips-unknown-linux-musl" \
+                    "$FILE#tg-ws-proxy-${{ matrix.target }}" \
                     --clobber
