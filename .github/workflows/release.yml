@@ -84,9 +84,12 @@ jobs:
               if: matrix.target == 'mipsel-unknown-linux-musl' || matrix.target == 'mips-unknown-linux-musl'
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              shell: bash
               run: |
+                  set -euxo pipefail
                   TAG="${GITHUB_REF_NAME}"
-                  FILE="target/${{ matrix.target }}/release/tg-ws-proxy"
-                  gh release upload "$TAG" \
-                    "$FILE#tg-ws-proxy-${{ matrix.target }}" \
-                    --clobber
+                  NAME="tg-ws-proxy-${{ matrix.target }}"
+                  mkdir -p "$NAME"
+                  cp "target/${{ matrix.target }}/release/tg-ws-proxy" "$NAME/"
+                  tar -czf "${NAME}.tar.gz" "$NAME"
+                  gh release upload "$TAG" "${NAME}.tar.gz" --clobber
