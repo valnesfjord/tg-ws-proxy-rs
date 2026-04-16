@@ -39,13 +39,15 @@ jobs:
                       os: windows-latest
                     - target: universal-apple-darwin
                       os: macos-latest
+                    - target: mips-unknown-linux-musl
+                      os: ubuntu-latest
         runs-on: ${{ matrix.os }}
         steps:
             - uses: actions/checkout@v6
 
             # Default path (all targets except mipsel)
             - name: Build & upload (default)
-              if: matrix.target != 'mipsel-unknown-linux-musl'
+              if: matrix.target != 'mipsel-unknown-linux-musl' && matrix.target != 'mips-unknown-linux-musl'
               uses: taiki-e/upload-rust-binary-action@v1
               with:
                   bin: tg-ws-proxy
@@ -53,19 +55,23 @@ jobs:
                   token: ${{ secrets.GITHUB_TOKEN }}
 
             # Special path for mipsel: nightly + build-std, then upload via gh cli
-            - name: Install nightly + rust-src (mipsel)
-              if: matrix.target == 'mipsel-unknown-linux-musl'
+            - name: Install nightly + rust-src (mipsel and mips)
+              if: matrix.target == 'mipsel-unknown-linux-musl' || matrix.target == 'mips-unknown-linux-musl'
               uses: dtolnay/rust-toolchain@nightly
               with:
                   components: rust-src
 
-            - name: Install cross (mipsel)
-              if: matrix.target == 'mipsel-unknown-linux-musl'
+            - name: Install cross (mipsel and mips)
+              if: matrix.target == 'mipsel-unknown-linux-musl' || matrix.target == 'mips-unknown-linux-musl'
               run: cargo install cross --locked
 
             - name: Build (mipsel, build-std)
               if: matrix.target == 'mipsel-unknown-linux-musl'
               run: cross +nightly build --release --bin tg-ws-proxy --target mipsel-unknown-linux-musl -Z build-std=std,panic_abort
+
+            - name: Build (mips, build-std)
+              if: matrix.target == 'mips-unknown-linux-musl'
+              run: cross +nightly build --release --bin tg-ws-proxy --target mips-unknown-linux-musl -Z build-std=std,panic_abort
 
             - name: Upload to GitHub Release (mipsel)
               if: matrix.target == 'mipsel-unknown-linux-musl'
@@ -75,4 +81,14 @@ jobs:
                   TAG="${GITHUB_REF_NAME}"
                   gh release upload "$TAG" \
                     "target/mipsel-unknown-linux-musl/release/tg-ws-proxy#tg-ws-proxy-mipsel-unknown-linux-musl" \
+                    --clobber
+
+            - name: Upload to GitHub Release (mips)
+              if: matrix.target == 'mips-unknown-linux-musl'
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  TAG="${GITHUB_REF_NAME}"
+                  gh release upload "$TAG" \
+                    "target/mips-unknown-linux-musl/release/tg-ws-proxy#tg-ws-proxy-mips-unknown-linux-musl" \
                     --clobber
