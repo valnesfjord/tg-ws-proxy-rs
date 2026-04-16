@@ -793,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "tg-ws-proxy-rs"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "aes",
  "cipher",
