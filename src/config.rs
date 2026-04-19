@@ -250,6 +250,22 @@ pub struct Config {
     /// Connections older than this are discarded and re-established.
     #[arg(long = "pool-max-age", default_value = "55", env = "TG_POOL_MAX_AGE")]
     pub pool_max_age: u64,
+
+    /// Test configured Cloudflare proxy domains and upstream MTProto proxies
+    /// for suitability, then exit.
+    ///
+    /// For each CF domain, a WebSocket connection is attempted through
+    /// `kws2.{domain}` (DC 2, non-media); the result is printed as OK/FAIL
+    /// with the round-trip latency.
+    ///
+    /// For each MTProto proxy, a TCP connection is made and the MTProto
+    /// obfuscation handshake is sent.  FakeTLS (0xee) proxies are also asked
+    /// to complete their TLS handshake so the check verifies end-to-end
+    /// protocol negotiation.
+    ///
+    /// Exits with status code 0 when all configured items pass, 1 otherwise.
+    #[arg(long = "check", env = "TG_CHECK")]
+    pub check: bool,
 }
 
 impl Config {

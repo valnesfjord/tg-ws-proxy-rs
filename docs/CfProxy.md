@@ -104,3 +104,44 @@ path, then upstream MTProto proxies, then direct TCP.
 ```sh
 tg-ws-proxy --dc-ip 2:149.154.167.220 --cf-domain yourdomain.com --cf-priority
 ```
+
+## Verifying your configuration with `--check`
+
+Before starting the proxy server, you can verify that your CF domain(s) and
+MTProto proxy(ies) are correctly configured with the `--check` flag:
+
+```sh
+tg-ws-proxy --cf-domain yourdomain.com --check
+```
+
+The check attempts a WebSocket connection through `kws2.{domain}` for each CF
+domain and reports the round-trip latency:
+
+```
+============================================================
+  tg-ws-proxy connectivity check
+============================================================
+
+Cloudflare proxy domains (DC2 WebSocket probe):
+  kws2.yourdomain.com                      ... [OK ]  143ms
+
+============================================================
+  Result: all checks passed
+============================================================
+```
+
+If the check fails, the output shows the reason, for example:
+
+```
+  kws2.yourdomain.com                      ... [FAIL]  WebSocket connection failed — check DNS records and Cloudflare settings
+```
+
+Common causes:
+- The DNS A records are missing or not proxied through Cloudflare (orange cloud disabled).
+- SSL/TLS mode is not set to **Flexible** in Cloudflare.
+- Cloudflare's own IP ranges are blocked by your ISP — add your domain to a
+  bypass tool such as [zapret](https://github.com/Flowseal/zapret-discord-youtube/).
+
+The check exits with status code `0` if all probes pass, or `1` if any fail,
+making it suitable for use in scripts or watchdog setups.
+

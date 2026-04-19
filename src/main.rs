@@ -71,6 +71,7 @@ fn auto_max_connections(fd_limit: usize, pool_size: usize, dc_buckets: usize) ->
     (fd_limit.saturating_sub(reserved) / 2).max(4)
 }
 
+mod check;
 mod config;
 mod crypto;
 mod faketls;
@@ -124,6 +125,15 @@ async fn main() {
             .with_env_filter(env_filter)
             .with_ansi(use_ansi)
             .init();
+    }
+
+    // ── Connectivity check mode (--check) ────────────────────────────────
+    // Run probes for every configured CF domain and MTProto proxy, print the
+    // results, then exit.  This lets the user verify their configuration
+    // before starting the proxy server.
+    if config.check {
+        let all_ok = check::run_check(&config).await;
+        std::process::exit(if all_ok { 0 } else { 1 });
     }
 
     // ── Bind the server socket ────────────────────────────────────────────
