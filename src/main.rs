@@ -80,7 +80,7 @@ mod splitter;
 mod ws_client;
 
 use config::Config;
-use pool::WsPool;
+use pool::{CfPool, WsPool};
 
 #[tokio::main]
 async fn main() {
@@ -238,6 +238,26 @@ async fn main() {
         });
     }
 
+    // ── Cloudflare connection pool warm-up ────────────────────────────────
+    let cf_pool: Option<Arc<CfPool>> = if !config.cf_domains.is_empty() {
+        let p = Arc::new(CfPool::new(
+            config.pool_size,
+            Duration::from_secs(config.pool_max_age),
+            config.cf_domains.clone(),
+            config.skip_tls_verify,
+        ));
+        {
+            let p_clone = p.clone();
+            let config_clone = config.clone();
+            tokio::spawn(async move {
+                p_clone.warmup(&config_clone).await;
+            });
+        }
+        Some(p)
+    } else {
+        None
+    };
+
     // ── Accept loop ───────────────────────────────────────────────────────
     // Acquire a permit before each accept() to cap concurrent connections.
     // This prevents EMFILE (too many open files) by keeping file-descriptor
@@ -258,11 +278,12 @@ async fn main() {
             Ok((stream, peer_addr)) => {
                 let cfg = config.clone();
                 let pool = pool.clone();
+                let cf_pool = cf_pool.clone();
                 tokio::spawn(async move {
                     // Hold the permit for the lifetime of this connection so
                     // it is released (and the slot freed) when the task ends.
                     let _permit = permit;
-                    proxy::handle_client(stream, peer_addr, cfg, pool).await;
+                    proxy::handle_client(stream, peer_addr, cfg, pool, cf_pool).await;
                 });
             }
             Err(e) => {

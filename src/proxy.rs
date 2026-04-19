@@ -37,7 +37,7 @@ use crate::crypto::{
     AesCtr256, ConnectionCiphers,
 };
 use crate::faketls::drain_faketls_server_hello;
-use crate::pool::WsPool;
+use crate::pool::{CfPool, WsPool};
 use crate::splitter::MsgSplitter;
 use crate::ws_client::{connect_cf_ws_for_dc, connect_ws_for_dc, ws_send, TgWsStream};
 
@@ -150,7 +150,34 @@ fn ws_timeout_for(dc: u32, is_media: bool, normal_timeout: Duration, fail_probe_
     normal_timeout
 }
 
-// ─── Client handler ──────────────────────────────────────────────────────────
+// ─── CF connection helper ─────────────────────────────────────────────────────
+
+/// Try to obtain a CF WebSocket connection: pool first, fresh connect on miss.
+///
+/// Using a pooled connection avoids Cloudflare's "cold start" penalty (the
+/// latency CF needs to establish a new backend connection to the Telegram
+/// origin server), which would otherwise cause the first client to see a
+/// session that closes with 0 bytes received.
+async fn get_cf_ws(
+    cf_pool: Option<&Arc<CfPool>>,
+    dc_id: u32,
+    is_media: bool,
+    cf_domains: &[String],
+    skip_tls: bool,
+    cf_connect_timeout: Duration,
+) -> Option<TgWsStream> {
+    if let Some(p) = cf_pool {
+        let pooled = p.get(dc_id, is_media).await;
+        if pooled.is_some() {
+            return pooled;
+        }
+    }
+    connect_cf_ws_for_dc(dc_id, cf_domains, is_media, skip_tls, cf_connect_timeout)
+        .await
+        .0
+}
+
+// ─── Client handler ───────────────────────────────────────────────────────────
 
 /// Handle one inbound client connection end-to-end.
 pub async fn handle_client(
@@ -158,6 +185,7 @@ pub async fn handle_client(
     peer: std::net::SocketAddr,
     config: Config,
     pool: Arc<WsPool>,
+    cf_pool: Option<Arc<CfPool>>,
 ) {
     let label = peer.to_string();
     let _ = stream.set_nodelay(true);
@@ -267,9 +295,15 @@ pub async fn handle_client(
                     label, dc_id, media_tag, reason, config.cf_domains
                 );
 
-                let (cf_ws_opt, _all_redirects) =
-                    connect_cf_ws_for_dc(dc_id, &config.cf_domains, is_media, skip_tls, cf_connect_timeout)
-                        .await;
+                let cf_ws_opt = get_cf_ws(
+                    cf_pool.as_ref(),
+                    dc_id,
+                    is_media,
+                    &config.cf_domains,
+                    skip_tls,
+                    cf_connect_timeout,
+                )
+                .await;
 
                 if let Some(ws) = cf_ws_opt {
                     clear_cf_cooldown(dc_id, is_media);
@@ -399,9 +433,15 @@ pub async fn handle_client(
                 label, dc_id, media_tag
             );
 
-            let (cf_ws_opt, _all_redirects) =
-                connect_cf_ws_for_dc(dc_id, &config.cf_domains, is_media, skip_tls, cf_connect_timeout)
-                    .await;
+            let cf_ws_opt = get_cf_ws(
+                cf_pool.as_ref(),
+                dc_id,
+                is_media,
+                &config.cf_domains,
+                skip_tls,
+                cf_connect_timeout,
+            )
+            .await;
 
             if let Some(ws) = cf_ws_opt {
                 clear_cf_cooldown(dc_id, is_media);
@@ -488,10 +528,11 @@ pub async fn handle_client(
                             label, dc_id, media_tag
                         );
 
-                        let (cf_ws_opt, _all_redirects) = connect_cf_ws_for_dc(
+                        let cf_ws_opt = get_cf_ws(
+                            cf_pool.as_ref(),
                             dc_id,
-                            &config.cf_domains,
                             is_media,
+                            &config.cf_domains,
                             skip_tls,
                             cf_connect_timeout,
                         )
