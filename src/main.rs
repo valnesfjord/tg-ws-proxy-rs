@@ -192,6 +192,9 @@ async fn main() {
         if config.cf_priority {
             info!("    ⚡ CF priority mode: CF proxy is tried BEFORE direct WS");
         }
+        if config.cf_balance && config.cf_domains.len() > 1 {
+            info!("    ⚖  CF balance mode: connections are round-robin'd across domains");
+        }
     }
 
     if !config.mtproto_proxies.is_empty() {

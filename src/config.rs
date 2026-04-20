@@ -202,6 +202,17 @@ pub struct Config {
     #[arg(long = "cf-priority", env = "TG_CF_PRIORITY")]
     pub cf_priority: bool,
 
+    /// Evenly distribute connections across multiple Cloudflare proxy domains.
+    ///
+    /// When set and multiple `--cf-domain` values are given, each new
+    /// connection starts from a different CF domain in round-robin order
+    /// instead of always trying the first domain first.  The remaining domains
+    /// are still tried in order as fallbacks if the primary one fails.
+    ///
+    /// Has no effect when only one CF domain is configured.
+    #[arg(long = "cf-balance", env = "TG_CF_BALANCE")]
+    pub cf_balance: bool,
+
     // ── Timeout / cooldown knobs ─────────────────────────────────────────
 
     /// WebSocket connection timeout in seconds (normal path).
