@@ -99,11 +99,17 @@ static CF_BALANCE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 /// domain should be tried first.  The remaining domains follow in their
 /// original order, wrapping around to the beginning of the slice, so the
 /// full fallback chain is always available.
+///
+/// `Relaxed` ordering is intentional: the counter only drives load distribution
+/// and does not guard access to any other shared state, so no cross-thread
+/// memory synchronisation is required.  Wrapping overflow on `usize` is
+/// harmless — the modulo operation still produces a valid index.
 fn balanced_cf_domains(cf_domains: &[String]) -> Vec<String> {
     let n = cf_domains.len();
     if n <= 1 {
         return cf_domains.to_vec();
     }
+    // `fetch_add` wraps silently on overflow, keeping the index valid.
     let idx = CF_BALANCE_COUNTER.fetch_add(1, Ordering::Relaxed) % n;
     let mut result = Vec::with_capacity(n);
     for i in 0..n {
