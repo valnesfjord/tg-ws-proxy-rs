@@ -139,8 +139,7 @@ If the check fails, the output shows the reason, for example:
 Common causes:
 - The DNS A records are missing or not proxied through Cloudflare (orange cloud disabled).
 - SSL/TLS mode is not set to **Flexible** in Cloudflare.
-- Cloudflare's own IP ranges are blocked by your ISP — add your domain to a
-  bypass tool such as [zapret](https://github.com/Flowseal/zapret-discord-youtube/).
+- Cloudflare's own IP ranges are blocked by your ISP.
 
 The check exits with status code `0` if all probes pass, or `1` if any fail,
 making it suitable for use in scripts or watchdog setups.
