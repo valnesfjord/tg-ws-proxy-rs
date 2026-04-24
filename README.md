@@ -100,6 +100,7 @@ tg-ws-proxy [OPTIONS]
 | `--pool-size <N>` | `4` | Pre-warmed WS connections per DC |
 | `--cf-domain <DOMAIN>` | — | Cloudflare-proxied domain(s) for alternative WS routing, comma-separated (see [CF Proxy](#cloudflare-proxy)) |
 | `--cf-priority` | off | Try CF proxy **before** direct WS for all DCs (see [CF Proxy](#cloudflare-proxy)) |
+| `--cf-balance` | off | Round-robin load balance across multiple `--cf-domain` values (see [CF Proxy](#cloudflare-proxy)) |
 | `--max-connections <N>` | auto | Max concurrent client connections (auto-computed from `ulimit -n`) |
 | `--mtproto-proxy <HOST:PORT:SECRET>` | — | Upstream MTProto proxy fallback (repeatable) |
 | `--log-file <PATH>` | — | Write logs to a file instead of stderr (no ANSI color codes) |
@@ -110,7 +111,7 @@ tg-ws-proxy [OPTIONS]
 Every flag has a matching environment variable (`TG_PORT`, `TG_HOST`,
 `TG_SECRET`, `TG_BUF_KB`, `TG_POOL_SIZE`, `TG_MAX_CONNECTIONS`, `TG_QUIET`,
 `TG_VERBOSE`, `TG_SKIP_TLS_VERIFY`, `TG_LINK_IP`, `TG_MTPROTO_PROXY`,
-`TG_LOG_FILE`, `TG_CF_DOMAIN`, `TG_CF_PRIORITY`).
+`TG_LOG_FILE`, `TG_CF_DOMAIN`, `TG_CF_PRIORITY`, `TG_CF_BALANCE`).
 
 ### Examples
 
@@ -132,6 +133,12 @@ tg-ws-proxy --cf-domain yourdomain.com --cf-priority
 
 # Multiple CF domains (tried in order) with CF priority over direct WS
 tg-ws-proxy --cf-domain proxy.net,example.com --cf-priority
+
+# Multiple CF domains with round-robin load balancing
+tg-ws-proxy --cf-domain proxy.net,example.com --cf-balance
+
+# CF balance + priority: round-robin across CF domains, tried before direct WS
+tg-ws-proxy --cf-domain proxy.net,example.com --cf-balance --cf-priority
 
 # CF priority: CF proxy is tried first, falls back to direct WS on failure
 tg-ws-proxy --dc-ip 2:149.154.167.220 --cf-domain yourdomain.com --cf-priority
@@ -215,6 +222,9 @@ tg-ws-proxy --cf-domain yourdomain.com
 # Multiple domains (tried in order, first has highest priority)
 tg-ws-proxy --cf-domain primary.net,backup.com
 
+# Multiple domains with round-robin load balancing
+tg-ws-proxy --cf-domain primary.net,backup.com --cf-balance
+
 # CF-only mode: omit --dc-ip so CF proxy handles all DCs
 tg-ws-proxy --cf-domain yourdomain.com
 
@@ -228,6 +238,28 @@ TG_CF_DOMAIN=yourdomain.com tg-ws-proxy
 The proxy will try the CF path as a fallback after direct WebSocket fails, and
 as the primary path for DCs that have no `--dc-ip` configured.  With
 `--cf-priority`, the CF proxy is tried **before** direct WebSocket for all DCs.
+
+#### `--cf-balance` — round-robin load balancing
+
+When multiple `--cf-domain` values are given, connections normally always start
+with the first domain.  Adding `--cf-balance` distributes connections evenly
+across all configured CF domains using round-robin selection:
+
+```bash
+tg-ws-proxy --cf-domain d1.example.com,d2.example.com,d3.example.com --cf-balance
+# connection 0 → tries d1, then d2, then d3
+# connection 1 → tries d2, then d3, then d1
+# connection 2 → tries d3, then d1, then d2
+```
+
+The remaining domains still serve as ordered fallbacks if the primary one
+fails, so resilience is unchanged.  Has no effect when only one CF domain is
+configured.  Can be combined with `--cf-priority`:
+
+```bash
+# Round-robin CF load balancing, tried before direct WS
+tg-ws-proxy --cf-domain d1.example.com,d2.example.com --cf-balance --cf-priority
+```
 
 **One-time domain setup** (do this in the Cloudflare dashboard):
 
@@ -410,6 +442,8 @@ TG_MAX_CONNECTIONS=64
 TG_QUIET=true
 TG_VERBOSE=false
 TG_CF_DOMAIN=yourdomain.com
+TG_CF_PRIORITY=false
+TG_CF_BALANCE=false
 TG_LOG_FILE=/var/log/tg-ws-proxy.log
 TG_MTPROTO_PROXY=proxy.example.com:443:ddabcdef1234567890abcdef1234567890
 ```

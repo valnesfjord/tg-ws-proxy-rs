@@ -44,6 +44,7 @@ use crate::ws_client::{connect_cf_ws_for_dc, connect_ws_for_dc, ws_send, TgWsStr
 // WS failure cooldown is global for the process lifetime.
 use std::collections::HashMap;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 // ─── Global failure tracking ─────────────────────────────────────────────────
@@ -88,6 +89,34 @@ fn upstream_in_cooldown(host: &str, port: u16) -> bool {
 }
 
 // ─── Cloudflare proxy failure tracking ───────────────────────────────────────
+
+/// Round-robin counter for CF domain balancing (`--cf-balance`).
+static CF_BALANCE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// Return a rotated view of `cf_domains` based on a global round-robin counter.
+///
+/// Each call atomically increments the counter and uses it to determine which
+/// domain should be tried first.  The remaining domains follow in their
+/// original order, wrapping around to the beginning of the slice, so the
+/// full fallback chain is always available.
+///
+/// `Relaxed` ordering is intentional: the counter only drives load distribution
+/// and does not guard access to any other shared state, so no cross-thread
+/// memory synchronisation is required.  Wrapping overflow on `usize` is
+/// harmless — the modulo operation still produces a valid index.
+fn balanced_cf_domains(cf_domains: &[String]) -> Vec<String> {
+    let n = cf_domains.len();
+    if n <= 1 {
+        return cf_domains.to_vec();
+    }
+    // `fetch_add` wraps silently on overflow, keeping the index valid.
+    let idx = CF_BALANCE_COUNTER.fetch_add(1, Ordering::Relaxed) % n;
+    let mut result = Vec::with_capacity(n);
+    for i in 0..n {
+        result.push(cf_domains[(idx + i) % n].clone());
+    }
+    result
+}
 
 /// Per-DC cooldown for the CF proxy path.
 static CF_FAIL_UNTIL: StdMutex<Option<HashMap<(u32, bool), Instant>>> = StdMutex::new(None);
@@ -262,13 +291,18 @@ pub async fn handle_client(
         // ── Try Cloudflare proxy if configured ────────────────────────────
         if !config.cf_domains.is_empty() {
             if !cf_in_cooldown(dc_id, is_media) {
+                let cf_domains_for_conn = if config.cf_balance {
+                    balanced_cf_domains(&config.cf_domains)
+                } else {
+                    config.cf_domains.clone()
+                };
                 debug!(
                     "[{}] DC{}{} {} → trying CF proxy via {:?}",
-                    label, dc_id, media_tag, reason, config.cf_domains
+                    label, dc_id, media_tag, reason, cf_domains_for_conn
                 );
 
                 let (cf_ws_opt, _all_redirects) =
-                    connect_cf_ws_for_dc(dc_id, &config.cf_domains, is_media, skip_tls, cf_connect_timeout)
+                    connect_cf_ws_for_dc(dc_id, &cf_domains_for_conn, is_media, skip_tls, cf_connect_timeout)
                         .await;
 
                 if let Some(ws) = cf_ws_opt {
@@ -394,13 +428,18 @@ pub async fn handle_client(
     // ── Step 6: CF priority — try CF proxy before direct WS if enabled ──
     if config.cf_priority && !config.cf_domains.is_empty() {
         if !cf_in_cooldown(dc_id, is_media) {
+            let cf_domains_for_conn = if config.cf_balance {
+                balanced_cf_domains(&config.cf_domains)
+            } else {
+                config.cf_domains.clone()
+            };
             debug!(
                 "[{}] DC{}{} cf-priority → trying CF proxy first",
                 label, dc_id, media_tag
             );
 
             let (cf_ws_opt, _all_redirects) =
-                connect_cf_ws_for_dc(dc_id, &config.cf_domains, is_media, skip_tls, cf_connect_timeout)
+                connect_cf_ws_for_dc(dc_id, &cf_domains_for_conn, is_media, skip_tls, cf_connect_timeout)
                     .await;
 
             if let Some(ws) = cf_ws_opt {
@@ -483,6 +522,11 @@ pub async fn handle_client(
                 // (Skip if --cf-priority already tried the CF path above.)
                 if !config.cf_priority && !config.cf_domains.is_empty() {
                     if !cf_in_cooldown(dc_id, is_media) {
+                        let cf_domains_for_conn = if config.cf_balance {
+                            balanced_cf_domains(&config.cf_domains)
+                        } else {
+                            config.cf_domains.clone()
+                        };
                         debug!(
                             "[{}] DC{}{} WS failed → trying CF proxy",
                             label, dc_id, media_tag
@@ -490,7 +534,7 @@ pub async fn handle_client(
 
                         let (cf_ws_opt, _all_redirects) = connect_cf_ws_for_dc(
                             dc_id,
-                            &config.cf_domains,
+                            &cf_domains_for_conn,
                             is_media,
                             skip_tls,
                             cf_connect_timeout,
