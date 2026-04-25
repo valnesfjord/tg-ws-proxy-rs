@@ -20,7 +20,7 @@ permissions:
   contents: read
 
 env:
-  IMAGE_NAME: lyedok/tg-ws-proxy-rs
+  IMAGE_NAME: valnesfjord/tg-ws-proxy-rs
 
 jobs:
   build:
