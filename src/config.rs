@@ -111,6 +111,11 @@ pub struct Config {
     #[arg(long, env = "TG_SECRET")]
     pub secret: Option<String>,
 
+    /// Accept inbound Telegram clients using `ee` FakeTLS camouflage with this
+    /// SNI hostname. The generated proxy link will use `secret=ee<key><hosthex>`.
+    #[arg(long = "listen-faketls-domain", env = "TG_LISTEN_FAKETLS_DOMAIN")]
+    pub listen_faketls_domain: Option<String>,
+
     /// Target IP for a DC, e.g. `--dc-ip 2:149.154.167.220`.
     /// Can be specified multiple times.
     /// Default: DC 2 and DC 4 → 149.154.167.220
@@ -305,7 +310,47 @@ impl Config {
 
     /// The proxy secret as raw bytes (decoded from hex).
     pub fn secret_bytes(&self) -> Vec<u8> {
-        hex::decode(self.secret.as_deref().unwrap_or("")).expect("secret must be valid hex")
+        let raw = hex::decode(self.secret.as_deref().unwrap_or("")).expect("secret must be valid hex");
+        if raw.len() >= 17 && matches!(raw[0], 0xdd | 0xee) {
+            raw[1..17].to_vec()
+        } else {
+            raw
+        }
+    }
+
+    /// Inbound FakeTLS domain, either from `--listen-faketls-domain` or from
+    /// an `ee<key><domainhex>` secret.
+    pub fn listen_faketls_domain(&self) -> Option<String> {
+        if let Some(domain) = &self.listen_faketls_domain {
+            return Some(domain.clone());
+        }
+
+        let raw = hex::decode(self.secret.as_deref().unwrap_or("")).ok()?;
+        if raw.len() > 17 && raw[0] == 0xee {
+            return std::str::from_utf8(&raw[17..]).ok().map(ToOwned::to_owned);
+        }
+
+        None
+    }
+
+    /// Full secret value for the generated Telegram link.
+    pub fn link_secret(&self) -> String {
+        let secret = self.secret.as_deref().unwrap_or("");
+        if let Some(domain) = self.listen_faketls_domain() {
+            let raw = hex::decode(secret).expect("secret must be valid hex");
+            let key = if raw.len() >= 17 && matches!(raw[0], 0xdd | 0xee) {
+                &raw[1..17]
+            } else {
+                &raw[..]
+            };
+            return format!("ee{}{}", hex::encode(key), hex::encode(domain.as_bytes()));
+        }
+
+        if secret.starts_with("dd") || secret.starts_with("ee") {
+            secret.to_string()
+        } else {
+            format!("dd{}", secret)
+        }
     }
 
     /// Map of DC ID → target IP from `--dc-ip` flags.

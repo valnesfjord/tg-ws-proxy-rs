@@ -1,0 +1,7 @@
+target/
+.git/
+.github/
+.cargo/
+Dockerfile
+.dockerignore
+*.log

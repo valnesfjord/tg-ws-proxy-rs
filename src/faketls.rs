@@ -17,7 +17,7 @@
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::Sha256;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 // ─── TLS protocol constants ─────────────────────────────────────────────────
@@ -38,8 +38,8 @@ const TLS_RECORD_VERSION: [u8; 2] = [0x03, 0x01];
 
 /// Maximum TLS record payload (RFC 8446 §5.1: 2^14 bytes).
 pub const TLS_MAX_RECORD_PAYLOAD: usize = 16_384;
-/// Maximum Application Data record size including framing overhead.
-const TLS_MAX_APPDATA_WRITE: usize = TLS_MAX_RECORD_PAYLOAD + 24;
+/// Maximum Application Data payload per record.
+const TLS_MAX_APPDATA_WRITE: usize = TLS_MAX_RECORD_PAYLOAD;
 /// Maximum number of TLS records to read during the server's fake handshake.
 const TLS_MAX_HANDSHAKE_RECORDS: usize = 20;
 
@@ -48,8 +48,21 @@ const TLS_MAX_HANDSHAKE_RECORDS: usize = 20;
 const TLS_DIGEST_POS: usize = 11;
 /// Length of the `random` field (= HMAC-SHA256 digest length).
 const TLS_DIGEST_LEN: usize = 32;
+const TLS_HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
+const TLS_HANDSHAKE_SERVER_HELLO: u8 = 0x02;
+const TLS_CLIENT_RANDOM_OFFSET_IN_HANDSHAKE: usize = 6;
+const TLS_SERVER_RANDOM_OFFSET_IN_PACKET: usize = 11;
+const TLS_CHANGE_CIPHER_SPEC_VALUE: u8 = 0x01;
 
 type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Clone, Debug)]
+pub struct FakeTlsClientHello {
+    pub random: [u8; TLS_DIGEST_LEN],
+    pub session_id: Vec<u8>,
+    pub cipher_suite: [u8; 2],
+    pub hostname: Option<String>,
+}
 
 // ─── ClientHello construction ───────────────────────────────────────────────
 
@@ -201,6 +214,190 @@ pub fn sign_faketls_client_hello(record: &mut [u8], secret: &[u8]) {
     }
 }
 
+// ─── Inbound ClientHello validation / ServerHello construction ─────────────
+
+pub fn parse_faketls_client_hello(
+    record: &[u8],
+    secret: &[u8],
+) -> Option<FakeTlsClientHello> {
+    if record.len() < 5 + 4 + TLS_CLIENT_RANDOM_OFFSET_IN_HANDSHAKE + TLS_DIGEST_LEN {
+        return None;
+    }
+    if record[0] != TLS_RECORD_HANDSHAKE {
+        return None;
+    }
+    let record_len = u16::from_be_bytes([record[3], record[4]]) as usize;
+    if record.len() != 5 + record_len {
+        return None;
+    }
+
+    let handshake = &record[5..];
+    if handshake.len() < 4 || handshake[0] != TLS_HANDSHAKE_CLIENT_HELLO {
+        return None;
+    }
+    let handshake_len =
+        ((handshake[1] as usize) << 16) | ((handshake[2] as usize) << 8) | handshake[3] as usize;
+    if handshake.len() != 4 + handshake_len {
+        return None;
+    }
+
+    let random_offset = 5 + TLS_CLIENT_RANDOM_OFFSET_IN_HANDSHAKE;
+    let mut client_random = [0u8; TLS_DIGEST_LEN];
+    client_random.copy_from_slice(&record[random_offset..random_offset + TLS_DIGEST_LEN]);
+
+    let mut signed = record.to_vec();
+    signed[random_offset..random_offset + TLS_DIGEST_LEN].fill(0);
+    let mut mac = HmacSha256::new_from_slice(secret).ok()?;
+    mac.update(&signed);
+    let computed = mac.finalize().into_bytes();
+
+    let mut xored = [0u8; TLS_DIGEST_LEN];
+    for i in 0..TLS_DIGEST_LEN {
+        xored[i] = computed[i] ^ client_random[i];
+    }
+    if xored[..28].iter().any(|&b| b != 0) {
+        return None;
+    }
+
+    let body = &handshake[4..];
+    if body.len() < 2 + 32 + 1 {
+        return None;
+    }
+    let session_id_len = body[34] as usize;
+    let session_start = 35;
+    let session_end = session_start + session_id_len;
+    if body.len() < session_end + 2 {
+        return None;
+    }
+    let session_id = body[session_start..session_end].to_vec();
+
+    let cipher_suites_len = u16::from_be_bytes([body[session_end], body[session_end + 1]]) as usize;
+    if cipher_suites_len < 2 || body.len() < session_end + 2 + cipher_suites_len + 1 {
+        return None;
+    }
+    let cipher_suite = [body[session_end + 2], body[session_end + 3]];
+
+    let mut p = session_end + 2 + cipher_suites_len;
+    let compression_len = *body.get(p)? as usize;
+    p += 1 + compression_len;
+    if body.len() < p + 2 {
+        return None;
+    }
+    let extensions_len = u16::from_be_bytes([body[p], body[p + 1]]) as usize;
+    p += 2;
+    if body.len() < p + extensions_len {
+        return None;
+    }
+
+    let hostname = parse_sni_extension(&body[p..p + extensions_len]);
+
+    Some(FakeTlsClientHello {
+        random: client_random,
+        session_id,
+        cipher_suite,
+        hostname,
+    })
+}
+
+fn parse_sni_extension(mut extensions: &[u8]) -> Option<String> {
+    while extensions.len() >= 4 {
+        let ext_type = u16::from_be_bytes([extensions[0], extensions[1]]);
+        let ext_len = u16::from_be_bytes([extensions[2], extensions[3]]) as usize;
+        extensions = &extensions[4..];
+        if extensions.len() < ext_len {
+            return None;
+        }
+        let ext = &extensions[..ext_len];
+        extensions = &extensions[ext_len..];
+
+        if ext_type != 0x0000 || ext.len() < 5 {
+            continue;
+        }
+        let list_len = u16::from_be_bytes([ext[0], ext[1]]) as usize;
+        if ext.len() < 2 + list_len || list_len < 3 || ext[2] != 0 {
+            return None;
+        }
+        let host_len = u16::from_be_bytes([ext[3], ext[4]]) as usize;
+        if ext.len() < 5 + host_len {
+            return None;
+        }
+        return std::str::from_utf8(&ext[5..5 + host_len])
+            .ok()
+            .map(ToOwned::to_owned);
+    }
+
+    None
+}
+
+pub fn build_faketls_server_hello(secret: &[u8], hello: &FakeTlsClientHello) -> Vec<u8> {
+    let mut server_body = Vec::new();
+    server_body.extend_from_slice(&TLS_VERSION_12);
+    server_body.extend_from_slice(&[0u8; TLS_DIGEST_LEN]);
+    server_body.push(hello.session_id.len() as u8);
+    server_body.extend_from_slice(&hello.session_id);
+    server_body.extend_from_slice(&hello.cipher_suite);
+    server_body.extend_from_slice(&[
+        0x00, 0x00, 0x2e, 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04, 0x00, 0x33, 0x00, 0x24, 0x00,
+        0x1d, 0x00, 0x20,
+    ]);
+    let mut rng = rand::rng();
+    let mut key_share = [0u8; 32];
+    rng.fill_bytes(&mut key_share);
+    server_body.extend_from_slice(&key_share);
+
+    let mut handshake = Vec::with_capacity(4 + server_body.len());
+    handshake.push(TLS_HANDSHAKE_SERVER_HELLO);
+    handshake.push(((server_body.len() >> 16) & 0xff) as u8);
+    handshake.push(((server_body.len() >> 8) & 0xff) as u8);
+    handshake.push((server_body.len() & 0xff) as u8);
+    handshake.extend_from_slice(&server_body);
+
+    let mut packet = Vec::new();
+    push_tls_record(&mut packet, TLS_RECORD_HANDSHAKE, &handshake);
+    push_tls_record(
+        &mut packet,
+        TLS_RECORD_CHANGE_CIPHER_SPEC,
+        &[TLS_CHANGE_CIPHER_SPEC_VALUE],
+    );
+
+    let mut cert = vec![0u8; 1024 + (rng.next_u32() as usize % 3092)];
+    rng.fill_bytes(&mut cert);
+    push_tls_record(&mut packet, TLS_RECORD_APPLICATION_DATA, &cert);
+
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC-SHA256 accepts any key length");
+    mac.update(&hello.random);
+    mac.update(&packet);
+    let digest = mac.finalize().into_bytes();
+    packet[TLS_SERVER_RANDOM_OFFSET_IN_PACKET..TLS_SERVER_RANDOM_OFFSET_IN_PACKET + TLS_DIGEST_LEN]
+        .copy_from_slice(&digest);
+
+    packet
+}
+
+fn push_tls_record(out: &mut Vec<u8>, record_type: u8, payload: &[u8]) {
+    out.push(record_type);
+    out.extend_from_slice(&TLS_VERSION_12);
+    out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    out.extend_from_slice(payload);
+}
+
+pub async fn read_tls_record<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max_payload_len: usize,
+) -> std::io::Result<Option<(u8, [u8; 2], Vec<u8>)>> {
+    let mut header = [0u8; 5];
+    if reader.read_exact(&mut header).await.is_err() {
+        return Ok(None);
+    }
+    let payload_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+    if payload_len > max_payload_len {
+        return Ok(None);
+    }
+    let mut payload = vec![0u8; payload_len];
+    reader.read_exact(&mut payload).await?;
+    Ok(Some((header[0], [header[1], header[2]], payload)))
+}
+
 // ─── Server handshake draining ──────────────────────────────────────────────
 
 /// Read and discard TLS records until the fake TLS handshake is complete.
@@ -265,7 +462,7 @@ pub async fn drain_faketls_server_hello(
 /// Each record has the format: `\x17\x03\x03` + 2-byte BE length + payload.
 /// Chunks larger than `TLS_MAX_APPDATA_WRITE` are split into multiple records.
 pub async fn write_tls_appdata(
-    writer: &mut tokio::io::WriteHalf<TcpStream>,
+    writer: &mut (impl AsyncWrite + Unpin),
     data: &[u8],
 ) -> std::io::Result<()> {
     let mut offset = 0;
@@ -295,7 +492,7 @@ pub async fn write_tls_appdata(
 /// Returns `Ok(0)` on EOF or if a non-Application-Data record is encountered
 /// after the handshake phase (other than ChangeCipherSpec which is skipped).
 pub async fn read_tls_appdata(
-    reader: &mut tokio::io::ReadHalf<TcpStream>,
+    reader: &mut (impl AsyncRead + Unpin),
     buf: &mut [u8],
 ) -> std::io::Result<usize> {
     let mut header = [0u8; 5];

@@ -95,6 +95,7 @@ tg-ws-proxy [OPTIONS]
 | `--host <HOST>` | `127.0.0.1` | Listen address |
 | `--link-ip <IP>` | auto-detected | IP shown in the `tg://` link (see [Router deployment](#router-deployment)) |
 | `--secret <HEX>` | random | 32 hex-char MTProto secret |
+| `--listen-faketls-domain <DOMAIN>` | — | Accept inbound clients with `ee` FakeTLS and advertise this SNI domain in the link |
 | `--dc-ip <DC:IP>` | DC2 + DC4 | Target IP per DC (repeatable); omit when using `--cf-domain` to let CF proxy handle all DCs |
 | `--buf-kb <KB>` | `256` | Socket buffer size |
 | `--pool-size <N>` | `4` | Pre-warmed WS connections per DC |
@@ -110,7 +111,7 @@ tg-ws-proxy [OPTIONS]
 
 Every flag has a matching environment variable (`TG_PORT`, `TG_HOST`,
 `TG_SECRET`, `TG_BUF_KB`, `TG_POOL_SIZE`, `TG_MAX_CONNECTIONS`, `TG_QUIET`,
-`TG_VERBOSE`, `TG_SKIP_TLS_VERIFY`, `TG_LINK_IP`, `TG_MTPROTO_PROXY`,
+`TG_VERBOSE`, `TG_SKIP_TLS_VERIFY`, `TG_LINK_IP`, `TG_LISTEN_FAKETLS_DOMAIN`, `TG_MTPROTO_PROXY`,
 `TG_LOG_FILE`, `TG_CF_DOMAIN`, `TG_CF_PRIORITY`, `TG_CF_BALANCE`).
 
 ### Examples
@@ -151,6 +152,12 @@ tg-ws-proxy \
 # Router deployment: listen on all interfaces, let all LAN devices use the proxy
 tg-ws-proxy --host 0.0.0.0
 
+# Public home server: inbound ee FakeTLS, backend still WSS to Telegram Web
+tg-ws-proxy --host 0.0.0.0 --port 443 --listen-faketls-domain www.yandex.ru
+
+# Equivalent: pass a full ee secret directly
+tg-ws-proxy --host 0.0.0.0 --port 443 --secret ee<32-hex-key><hex-encoded-domain>
+
 # Verbose logging
 tg-ws-proxy -v
 
@@ -162,7 +169,28 @@ TG_PORT=1443 TG_SECRET=deadbeef... tg-ws-proxy
 ```
 
 On startup the proxy prints a `tg://proxy?...` link you can paste into
-Telegram Desktop to configure it automatically.
+Telegram Desktop to configure it automatically. With `--listen-faketls-domain`,
+the printed link uses `secret=ee<key><domain_hex>`; otherwise it uses the
+classic `dd<key>` padded MTProto secret.
+
+### Inbound FakeTLS listener
+
+For public home servers where DPI blocks raw inbound MTProto, enable inbound
+FakeTLS:
+
+```bash
+tg-ws-proxy --host 0.0.0.0 --port 443 --listen-faketls-domain www.yandex.ru
+```
+
+This changes only the client-facing transport:
+
+```
+Telegram client → ee FakeTLS → tg-ws-proxy-rs → WSS/TLS → kws*.web.telegram.org
+```
+
+The proxy accepts the TLS ClientHello, validates the FakeTLS HMAC, sends a
+synthetic TLS ServerHello, unwraps TLS Application Data records, and then
+passes the recovered MTProto init into the existing WebSocket backend path.
 
 ### Upstream MTProto proxy fallback
 
