@@ -27,11 +27,3 @@ jobs:
 
       - name: Release build
         run: cargo build --release --locked
-
-  docker:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Build Docker image
-        run: docker build -t tg-ws-proxy-rs:ci .

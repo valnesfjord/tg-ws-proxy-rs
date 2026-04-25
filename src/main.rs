@@ -71,17 +71,7 @@ fn auto_max_connections(fd_limit: usize, pool_size: usize, dc_buckets: usize) ->
     (fd_limit.saturating_sub(reserved) / 2).max(4)
 }
 
-mod check;
-mod config;
-mod crypto;
-mod faketls;
-mod pool;
-mod proxy;
-mod splitter;
-mod ws_client;
-
-use config::Config;
-use pool::WsPool;
+use tg_ws_proxy_rs::{check, config::Config, pool::WsPool, proxy};
 
 #[tokio::main]
 async fn main() {

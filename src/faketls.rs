@@ -47,7 +47,7 @@ const TLS_MAX_HANDSHAKE_RECORDS: usize = 20;
 /// + handshake header + ClientHello version = 5 + 4 + 2 = 11 bytes).
 const TLS_DIGEST_POS: usize = 11;
 /// Length of the `random` field (= HMAC-SHA256 digest length).
-const TLS_DIGEST_LEN: usize = 32;
+pub const TLS_DIGEST_LEN: usize = 32;
 const TLS_HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
 const TLS_HANDSHAKE_SERVER_HELLO: u8 = 0x02;
 const TLS_CLIENT_RANDOM_OFFSET_IN_HANDSHAKE: usize = 6;
@@ -531,62 +531,5 @@ pub async fn read_tls_appdata(
                 return Ok(0);
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn signed_client_hello_parses_hostname_and_auth() {
-        let secret = [0x2a; 16];
-        let hostname = "www.yandex.ru";
-        let mut hello = build_faketls_client_hello(hostname);
-
-        sign_faketls_client_hello(&mut hello, &secret);
-
-        let parsed = parse_faketls_client_hello(&hello, &secret).expect("valid FakeTLS hello");
-        assert_eq!(parsed.hostname.as_deref(), Some(hostname));
-        assert_eq!(parsed.session_id.len(), 32);
-        assert_ne!(parsed.random, [0u8; TLS_DIGEST_LEN]);
-    }
-
-    #[test]
-    fn signed_client_hello_rejects_wrong_secret() {
-        let good_secret = [0x11; 16];
-        let bad_secret = [0x22; 16];
-        let mut hello = build_faketls_client_hello("www.yandex.ru");
-
-        sign_faketls_client_hello(&mut hello, &good_secret);
-
-        assert!(parse_faketls_client_hello(&hello, &bad_secret).is_none());
-    }
-
-    #[test]
-    fn server_hello_contains_expected_fake_tls_records() {
-        let secret = [0x33; 16];
-        let mut client_hello = build_faketls_client_hello("www.yandex.ru");
-        sign_faketls_client_hello(&mut client_hello, &secret);
-        let parsed = parse_faketls_client_hello(&client_hello, &secret).unwrap();
-
-        let server_hello = build_faketls_server_hello(&secret, &parsed);
-
-        assert_eq!(server_hello[0], TLS_RECORD_HANDSHAKE);
-        assert_eq!(
-            server_hello[TLS_SERVER_RANDOM_OFFSET_IN_PACKET
-                ..TLS_SERVER_RANDOM_OFFSET_IN_PACKET + TLS_DIGEST_LEN]
-                .len(),
-            TLS_DIGEST_LEN
-        );
-
-        let first_len = u16::from_be_bytes([server_hello[3], server_hello[4]]) as usize;
-        let second = 5 + first_len;
-        assert_eq!(server_hello[second], TLS_RECORD_CHANGE_CIPHER_SPEC);
-
-        let second_len =
-            u16::from_be_bytes([server_hello[second + 3], server_hello[second + 4]]) as usize;
-        let third = second + 5 + second_len;
-        assert_eq!(server_hello[third], TLS_RECORD_APPLICATION_DATA);
     }
 }
