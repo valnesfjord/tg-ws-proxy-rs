@@ -181,20 +181,32 @@ fn ws_timeout_for(dc: u32, is_media: bool, normal_timeout: Duration, fail_probe_
 
 enum ClientReader {
     Plain(tokio::io::ReadHalf<TcpStream>),
-    FakeTls(tokio::io::ReadHalf<TcpStream>),
+    FakeTls {
+        reader: tokio::io::ReadHalf<TcpStream>,
+        pending: Vec<u8>,
+    },
 }
 
 impl ClientReader {
     async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::Plain(reader) => reader.read(buf).await,
-            Self::FakeTls(reader) => crate::faketls::read_tls_appdata(reader, buf).await,
+            Self::FakeTls { reader, pending } => {
+                if !pending.is_empty() {
+                    let n = std::cmp::min(buf.len(), pending.len());
+                    buf[..n].copy_from_slice(&pending[..n]);
+                    pending.drain(..n);
+                    return Ok(n);
+                }
+
+                crate::faketls::read_tls_appdata(reader, buf).await
+            }
         }
     }
 
     async fn drain(self) {
         match self {
-            Self::Plain(mut reader) | Self::FakeTls(mut reader) => {
+            Self::Plain(mut reader) | Self::FakeTls { mut reader, .. } => {
                 let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
             }
         }
@@ -221,7 +233,7 @@ async fn accept_inbound_faketls(
     writer: &mut tokio::io::WriteHalf<TcpStream>,
     secret: &[u8],
     expected_domain: &str,
-) -> Option<[u8; 64]> {
+) -> Option<([u8; 64], Vec<u8>)> {
     let (record_type, version, payload) =
         crate::faketls::read_tls_record(reader, crate::faketls::TLS_MAX_RECORD_PAYLOAD + 256)
             .await
@@ -271,12 +283,11 @@ async fn accept_inbound_faketls(
         handshake_buf[filled..filled + take].copy_from_slice(&buf[..take]);
         filled += take;
         if take != n {
-            debug!("[{}] FakeTLS first AppData contains extra bytes", label);
-            return None;
+            return Some((handshake_buf, buf[take..n].to_vec()));
         }
     }
 
-    Some(handshake_buf)
+    Some((handshake_buf, Vec::new()))
 }
 
 // ─── Client handler ──────────────────────────────────────────────────────────
@@ -315,6 +326,7 @@ pub async fn handle_client(
     // ── Step 1: read the 64-byte MTProto obfuscation init ────────────────
     let inbound_faketls_domain = config.listen_faketls_domain();
     let mut handshake_buf = [0u8; 64];
+    let mut faketls_pending = Vec::new();
     if let Some(domain) = inbound_faketls_domain.as_deref() {
         match tokio::time::timeout(
             handshake_timeout,
@@ -322,7 +334,10 @@ pub async fn handle_client(
         )
         .await
         {
-            Ok(Some(buf)) => handshake_buf = buf,
+            Ok(Some((buf, pending))) => {
+                handshake_buf = buf;
+                faketls_pending = pending;
+            }
             Ok(None) => return,
             Err(_) => {
                 warn!("[{}] FakeTLS handshake timeout", label);
@@ -344,7 +359,10 @@ pub async fn handle_client(
     }
 
     let reader = if inbound_faketls_domain.is_some() {
-        ClientReader::FakeTls(reader)
+        ClientReader::FakeTls {
+            reader,
+            pending: faketls_pending,
+        }
     } else {
         ClientReader::Plain(reader)
     };
