@@ -26,7 +26,7 @@ use std::time::Duration;
 use cipher::StreamCipher;
 use futures_util::SinkExt;
 use futures_util::StreamExt;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 use tungstenite::Message;
@@ -36,7 +36,11 @@ use crate::crypto::{
     build_connection_ciphers, generate_client_handshake, generate_relay_init, parse_handshake,
     AesCtr256, ConnectionCiphers,
 };
-use crate::faketls::drain_faketls_server_hello;
+use crate::faketls::{
+    TLS_MAX_RECORD_PAYLOAD, TLS_RECORD_HANDSHAKE, build_faketls_server_hello,
+    build_faketls_client_hello, drain_faketls_server_hello, parse_faketls_client_hello,
+    read_tls_appdata, read_tls_record, sign_faketls_client_hello, write_tls_appdata,
+};
 use crate::pool::WsPool;
 use crate::splitter::MsgSplitter;
 use crate::ws_client::{connect_cf_ws_for_dc, connect_ws_for_dc, ws_send, TgWsStream};
@@ -120,6 +124,8 @@ fn balanced_cf_domains(cf_domains: &[String]) -> Vec<String> {
 
 /// Per-DC cooldown for the CF proxy path.
 static CF_FAIL_UNTIL: StdMutex<Option<HashMap<(u32, bool), Instant>>> = StdMutex::new(None);
+type TcpReader = ReadHalf<TcpStream>;
+type TcpWriter = WriteHalf<TcpStream>;
 
 fn set_cf_cooldown(dc: u32, is_media: bool, cooldown: Duration) {
     let mut lock = CF_FAIL_UNTIL.lock().unwrap();
@@ -179,6 +185,120 @@ fn ws_timeout_for(dc: u32, is_media: bool, normal_timeout: Duration, fail_probe_
     normal_timeout
 }
 
+enum ClientReader {
+    Plain(TcpReader),
+    FakeTls {
+        reader: TcpReader,
+        pending: Vec<u8>,
+    },
+}
+
+impl ClientReader {
+    async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(reader) => reader.read(buf).await,
+            Self::FakeTls { reader, pending } => {
+                if !pending.is_empty() {
+                    let n = std::cmp::min(buf.len(), pending.len());
+                    buf[..n].copy_from_slice(&pending[..n]);
+                    pending.drain(..n);
+                    return Ok(n);
+                }
+
+                read_tls_appdata(reader, buf).await
+            }
+        }
+    }
+
+    async fn drain(self) {
+        match self {
+            Self::Plain(mut reader) | Self::FakeTls { mut reader, .. } => {
+                let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
+            }
+        }
+    }
+}
+
+enum ClientWriter {
+    Plain(TcpWriter),
+    FakeTls(TcpWriter),
+}
+
+impl ClientWriter {
+    async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+        match self {
+            Self::Plain(writer) => writer.write_all(data).await,
+            Self::FakeTls(writer) => write_tls_appdata(writer, data).await,
+        }
+    }
+}
+
+async fn accept_inbound_faketls(
+    label: &str,
+    reader: &mut TcpReader,
+    writer: &mut TcpWriter,
+    secret: &[u8],
+    expected_domain: &str,
+) -> Option<([u8; 64], Vec<u8>)> {
+    let (record_type, version, payload) = read_tls_record(reader, TLS_MAX_RECORD_PAYLOAD + 256)
+        .await
+        .ok()??;
+    if record_type != TLS_RECORD_HANDSHAKE || version != [0x03, 0x01] {
+        debug!("[{}] bad FakeTLS ClientHello record", label);
+        return None;
+    }
+
+    let mut record = Vec::with_capacity(5 + payload.len());
+    record.push(record_type);
+    record.extend_from_slice(&version);
+    record.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    record.extend_from_slice(&payload);
+
+    let hello = match parse_faketls_client_hello(&record, secret) {
+        Some(hello) => hello,
+        None => {
+            debug!("[{}] bad FakeTLS ClientHello digest", label);
+            return None;
+        }
+    };
+
+    if hello.hostname.as_deref() != Some(expected_domain) {
+        debug!(
+            "[{}] FakeTLS SNI mismatch: got {:?}, expected {}",
+            label, hello.hostname, expected_domain
+        );
+        return None;
+    }
+
+    let server_hello = build_faketls_server_hello(secret, &hello);
+    if let Err(e) = writer.write_all(&server_hello).await {
+        debug!("[{}] write FakeTLS ServerHello: {}", label, e);
+        return None;
+    }
+
+    let mut handshake_buf = [0u8; 64];
+    let mut filled = 0;
+    let mut buf = vec![0u8; TLS_MAX_RECORD_PAYLOAD + 256];
+    while filled < handshake_buf.len() {
+        let n = match read_tls_appdata(reader, &mut buf).await {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => n,
+        };
+        let before = filled;
+        let take = std::cmp::min(n, handshake_buf.len() - filled);
+        handshake_buf[filled..filled + take].copy_from_slice(&buf[..take]);
+        filled += take;
+        if take != n {
+            if before == 0 {
+                return split_mtproto_init_and_pending(&buf[..n]);
+            }
+            return Some((handshake_buf, buf[take..n].to_vec()));
+        }
+    }
+
+    Some((handshake_buf, Vec::new()))
+}
+
 // ─── Client handler ──────────────────────────────────────────────────────────
 
 /// Handle one inbound client connection end-to-end.
@@ -210,26 +330,43 @@ pub async fn handle_client(
     let cf_fail_cooldown = Duration::from_secs(config.cf_fail_cooldown);
 
     // Split into independent read / write halves.
-    let (mut reader, writer) = tokio::io::split(stream);
+    let (mut reader, mut writer) = tokio::io::split(stream);
 
     // ── Step 1: read the 64-byte MTProto obfuscation init ────────────────
-    let mut handshake_buf = [0u8; 64];
-    match tokio::time::timeout(
+    let inbound_faketls_domain = config.listen_faketls_domain();
+    let (handshake_buf, faketls_pending) = match tokio::time::timeout(
         handshake_timeout,
-        reader.read_exact(&mut handshake_buf),
+        read_inbound_handshake(
+            &label,
+            &mut reader,
+            &mut writer,
+            &secret,
+            inbound_faketls_domain.as_deref(),
+        ),
     )
     .await
     {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => {
-            debug!("[{}] read handshake: {}", label, e);
-            return;
-        }
+        Ok(Some(result)) => result,
+        Ok(None) => return,
         Err(_) => {
-            warn!("[{}] handshake timeout", label);
+            debug!("[{}] handshake timeout", label);
             return;
         }
-    }
+    };
+
+    let reader = if inbound_faketls_domain.is_some() {
+        ClientReader::FakeTls {
+            reader,
+            pending: faketls_pending,
+        }
+    } else {
+        ClientReader::Plain(reader)
+    };
+    let writer = if inbound_faketls_domain.is_some() {
+        ClientWriter::FakeTls(writer)
+    } else {
+        ClientWriter::Plain(writer)
+    };
 
     // ── Step 2: parse and validate the handshake ─────────────────────────
     let info = match parse_handshake(&handshake_buf, &secret) {
@@ -241,7 +378,7 @@ pub async fn handle_client(
             );
 
             // Drain the connection silently to avoid giving information to scanners.
-            let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
+            reader.drain().await;
 
             return;
         }
@@ -691,8 +828,8 @@ pub async fn handle_client(
 /// ```
 async fn bridge_ws(
     label: &str,
-    reader: tokio::io::ReadHalf<TcpStream>,
-    writer: tokio::io::WriteHalf<TcpStream>,
+    reader: ClientReader,
+    writer: ClientWriter,
     mut ws: TgWsStream,
     relay_init: [u8; 64],
     ciphers: crate::crypto::ConnectionCiphers,
@@ -929,9 +1066,8 @@ async fn connect_mtproto_upstream(
         };
 
         // Build the ClientHello with HMAC authentication.
-        let mut client_hello =
-            crate::faketls::build_faketls_client_hello(hostname);
-        crate::faketls::sign_faketls_client_hello(&mut client_hello, key_bytes);
+        let mut client_hello = build_faketls_client_hello(hostname);
+        sign_faketls_client_hello(&mut client_hello, key_bytes);
 
         if let Err(e) = writer.write_all(&client_hello).await {
             warn!(
@@ -951,9 +1087,7 @@ async fn connect_mtproto_upstream(
         }
 
         // Send the 64-byte MTProto init as the first Application Data record.
-        if let Err(e) =
-            crate::faketls::write_tls_appdata(&mut writer, &handshake).await
-        {
+        if let Err(e) = write_tls_appdata(&mut writer, &handshake).await {
             warn!(
                 "[upstream] {}:{} FakeTLS send MTProto init error: {}",
                 host, port, e
@@ -982,16 +1116,14 @@ async fn connect_mtproto_upstream(
 /// session ciphers returned by [`connect_mtproto_upstream`].
 async fn bridge_mtproto_relay(
     label: &str,
-    reader: tokio::io::ReadHalf<TcpStream>,
-    writer: tokio::io::WriteHalf<TcpStream>,
+    reader: ClientReader,
+    writer: ClientWriter,
     rem_reader: tokio::io::ReadHalf<TcpStream>,
     mut rem_writer: tokio::io::WriteHalf<TcpStream>,
     ciphers: ConnectionCiphers,
     dc: u32,
     is_media: bool,
 ) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     let ConnectionCiphers {
         mut clt_dec,
         mut clt_enc,
@@ -1087,16 +1219,14 @@ async fn bridge_mtproto_relay(
 /// operates on the payload inside TLS records, exactly as in the plain bridge.
 async fn bridge_faketls_relay(
     label: &str,
-    reader: tokio::io::ReadHalf<TcpStream>,
-    writer: tokio::io::WriteHalf<TcpStream>,
+    reader: ClientReader,
+    writer: ClientWriter,
     rem_reader: tokio::io::ReadHalf<TcpStream>,
     rem_writer: tokio::io::WriteHalf<TcpStream>,
     ciphers: ConnectionCiphers,
     dc: u32,
     is_media: bool,
 ) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     let ConnectionCiphers {
         mut clt_dec,
         mut clt_enc,
@@ -1110,7 +1240,7 @@ async fn bridge_faketls_relay(
     let mut upload = tokio::spawn(async move {
         let mut reader = reader;
         let mut rem_writer = rem_writer;
-        let mut buf = vec![0u8; crate::faketls::TLS_MAX_RECORD_PAYLOAD];
+        let mut buf = vec![0u8; TLS_MAX_RECORD_PAYLOAD];
         let mut total = 0u64;
 
         loop {
@@ -1122,10 +1252,7 @@ async fn bridge_faketls_relay(
             clt_dec.apply_keystream(chunk);
             tg_enc.apply_keystream(chunk);
 
-            if crate::faketls::write_tls_appdata(&mut rem_writer, &buf[..n])
-                .await
-                .is_err()
-            {
+            if write_tls_appdata(&mut rem_writer, &buf[..n]).await.is_err() {
                 break;
             }
             total += n as u64;
@@ -1138,11 +1265,11 @@ async fn bridge_faketls_relay(
     let mut download = tokio::spawn(async move {
         let mut rem_reader = rem_reader;
         let mut writer = writer;
-        let mut buf = vec![0u8; crate::faketls::TLS_MAX_RECORD_PAYLOAD + 256];
+        let mut buf = vec![0u8; TLS_MAX_RECORD_PAYLOAD + 256];
         let mut total = 0u64;
 
         loop {
-            let n = match crate::faketls::read_tls_appdata(&mut rem_reader, &mut buf).await {
+            let n = match read_tls_appdata(&mut rem_reader, &mut buf).await {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(_) => break,
@@ -1195,8 +1322,8 @@ async fn bridge_faketls_relay(
 /// Logs a session-close line on return (matching the `bridge_ws` format).
 async fn bridge_tcp(
     label: &str,
-    mut reader: tokio::io::ReadHalf<TcpStream>,
-    mut writer: tokio::io::WriteHalf<TcpStream>,
+    mut reader: ClientReader,
+    mut writer: ClientWriter,
     dst: &str,
     relay_init: &[u8; 64],
     ciphers: crate::crypto::ConnectionCiphers,
@@ -1321,6 +1448,38 @@ async fn bridge_tcp(
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+async fn read_inbound_handshake(
+    label: &str,
+    reader: &mut TcpReader,
+    writer: &mut TcpWriter,
+    secret: &[u8],
+    faketls_domain: Option<&str>,
+) -> Option<([u8; 64], Vec<u8>)> {
+    if let Some(domain) = faketls_domain {
+        return accept_inbound_faketls(label, reader, writer, secret, domain).await;
+    }
+
+    let mut handshake_buf = [0u8; 64];
+    match reader.read_exact(&mut handshake_buf).await {
+        Ok(_) => Some((handshake_buf, Vec::new())),
+        Err(e) => {
+            debug!("[{}] read handshake: {}", label, e);
+            None
+        }
+    }
+}
+
+pub fn split_mtproto_init_and_pending(data: &[u8]) -> Option<([u8; 64], Vec<u8>)> {
+    if data.len() < 64 {
+        return None;
+    }
+
+    let mut handshake_buf = [0u8; 64];
+    handshake_buf.copy_from_slice(&data[..64]);
+
+    Some((handshake_buf, data[64..].to_vec()))
+}
 
 fn human_bytes(n: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];

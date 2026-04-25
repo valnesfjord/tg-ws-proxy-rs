@@ -71,17 +71,7 @@ fn auto_max_connections(fd_limit: usize, pool_size: usize, dc_buckets: usize) ->
     (fd_limit.saturating_sub(reserved) / 2).max(4)
 }
 
-mod check;
-mod config;
-mod crypto;
-mod faketls;
-mod pool;
-mod proxy;
-mod splitter;
-mod ws_client;
-
-use config::Config;
-use pool::WsPool;
+use tg_ws_proxy_rs::{check, config::Config, pool::WsPool, proxy};
 
 #[tokio::main]
 async fn main() {
@@ -175,14 +165,21 @@ async fn main() {
 
     let link_host = config.link_host();
     let tg_link = format!(
-        "tg://proxy?server={}&port={}&secret=dd{}",
-        link_host, config.port, secret
+        "tg://proxy?server={}&port={}&secret={}",
+        link_host,
+        config.port,
+        config.link_secret()
     );
 
     info!("{}", "=".repeat(60));
     info!("  Telegram MTProto WS Bridge Proxy  (tg-ws-proxy-rs)");
     info!("  Listening on   {}:{}", config.host, config.port);
     info!("  Secret:        {}", secret);
+    if let Some(domain) = config.listen_faketls_domain() {
+        info!("  Inbound mode:   FakeTLS ee (SNI: {})", domain);
+    } else {
+        info!("  Inbound mode:   padded MTProto dd");
+    }
     info!("  Target DC IPs:");
     let mut dcs: Vec<_> = dc_redirects.iter().collect();
     dcs.sort_by_key(|(k, _)| *k);
