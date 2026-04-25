@@ -340,7 +340,7 @@ pub async fn handle_client(
             }
             Ok(None) => return,
             Err(_) => {
-                warn!("[{}] FakeTLS handshake timeout", label);
+                debug!("[{}] FakeTLS handshake timeout", label);
                 return;
             }
         }
@@ -352,7 +352,7 @@ pub async fn handle_client(
                 return;
             }
             Err(_) => {
-                warn!("[{}] handshake timeout", label);
+                debug!("[{}] handshake timeout", label);
                 return;
             }
         }
@@ -1471,4 +1471,38 @@ fn human_bytes(n: u64) -> String {
     }
 
     format!("{:.1}PB", v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClientReader;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test]
+    async fn faketls_reader_returns_pending_bytes_before_socket_reads() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server, _) = listener.accept().await.unwrap();
+        let mut client = client.await.unwrap();
+        let (reader, _) = tokio::io::split(server);
+
+        let mut reader = ClientReader::FakeTls {
+            reader,
+            pending: b"hello".to_vec(),
+        };
+        let mut buf = [0u8; 3];
+
+        let n = reader.read(&mut buf).await.unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(&buf, b"hel");
+
+        let n = reader.read(&mut buf).await.unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(&buf[..2], b"lo");
+
+        client.shutdown().await.unwrap();
+    }
 }
