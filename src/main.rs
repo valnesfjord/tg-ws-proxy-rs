@@ -71,7 +71,7 @@ fn auto_max_connections(fd_limit: usize, pool_size: usize, dc_buckets: usize) ->
     (fd_limit.saturating_sub(reserved) / 2).max(4)
 }
 
-use tg_ws_proxy_rs::{check, config::Config, pool::WsPool, proxy};
+use tg_ws_proxy_rs::{check, config::Config, default_domains, pool::WsPool, proxy};
 
 #[tokio::main]
 async fn main() {
@@ -79,7 +79,7 @@ async fn main() {
         .install_default()
         .expect("failed to install rustls ring CryptoProvider");
 
-    let config = Config::from_args();
+    let mut config = Config::from_args();
 
     // ── Logging ──────────────────────────────────────────────────────────
     let log_level = if config.quiet {
@@ -122,8 +122,23 @@ async fn main() {
     // results, then exit.  This lets the user verify their configuration
     // before starting the proxy server.
     if config.check {
+        // Fetch default domains first so --check also probes them.
+        if config.default_domains {
+            let fetched = default_domains::fetch_default_domains().await;
+            config.cf_domains.extend(fetched);
+        }
         let all_ok = check::run_check(&config).await;
         std::process::exit(if all_ok { 0 } else { 1 });
+    }
+
+    // ── Default CF domain list (--default-domains) ────────────────────────
+    // Fetch the obfuscated domain list from GitHub, deobfuscate it, and
+    // append the resulting domains to any that were supplied with --cf-domain.
+    if config.default_domains {
+        info!("Fetching default CF proxy domain list from GitHub…");
+        let fetched = default_domains::fetch_default_domains().await;
+        info!("  Got {} default CF domain(s)", fetched.len());
+        config.cf_domains.extend(fetched);
     }
 
     // ── Bind the server socket ────────────────────────────────────────────

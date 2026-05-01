@@ -282,6 +282,22 @@ pub struct Config {
     /// Exits with status code 0 when all configured items pass, 1 otherwise.
     #[arg(long = "check", env = "TG_CHECK")]
     pub check: bool,
+
+    /// Use the default Cloudflare-proxy domain list from the upstream repository.
+    ///
+    /// When set, the proxy fetches an obfuscated list of working CF proxy
+    /// domains from GitHub at startup, deobfuscates them, and uses them as
+    /// `--cf-domain` entries.  This lets users get started without having to
+    /// configure their own Cloudflare DNS zone.
+    ///
+    /// The fetched domains are appended after any domains supplied with
+    /// `--cf-domain`.  If the fetch fails the proxy falls back to a small
+    /// built-in list.
+    ///
+    /// Source:
+    ///   https://github.com/Flowseal/tg-ws-proxy/blob/main/.github/cfproxy-domains.txt
+    #[arg(long = "default-domains", env = "TG_DEFAULT_DOMAINS")]
+    pub default_domains: bool,
 }
 
 impl Config {
@@ -296,9 +312,10 @@ impl Config {
         }
 
         // If no --dc-ip was given, use the built-in defaults — unless a CF
-        // domain is configured (in which case CF proxy becomes the primary
-        // path for all DCs without explicit IPs).
-        if cfg.dc_ip.is_empty() && cfg.cf_domains.is_empty() {
+        // domain is configured or --default-domains was requested (in which
+        // case CF proxy becomes the primary path for all DCs without explicit
+        // IPs, and the default dc_ip list would be misleading).
+        if cfg.dc_ip.is_empty() && cfg.cf_domains.is_empty() && !cfg.default_domains {
             cfg.dc_ip = vec![
                 (2, "149.154.167.220".to_string()),
                 (4, "149.154.167.220".to_string()),

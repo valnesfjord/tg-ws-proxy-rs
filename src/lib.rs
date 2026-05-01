@@ -1,6 +1,7 @@
 pub mod check;
 pub mod config;
 pub mod crypto;
+pub mod default_domains;
 pub mod faketls;
 pub mod pool;
 pub mod proxy;

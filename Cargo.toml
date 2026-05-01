@@ -49,6 +49,8 @@ rustls = { version = "0.23", features = ["ring"] }
 rustls-pki-types = "1"
 # Bundled Mozilla root cert store (used by the default TLS connector)
 webpki-roots = "0.26"
+# Async TLS streams (transitive dep of tokio-tungstenite; used for HTTPS GET in default_domains)
+tokio-rustls = "0.26"
 
 [profile.release]
 opt-level = 3
