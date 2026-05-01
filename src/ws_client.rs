@@ -24,14 +24,13 @@ use crate::config::default_dc_overrides;
 use futures_util::{SinkExt, StreamExt};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{
-    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     DigitallySignedStruct, Error as TlsError, SignatureScheme,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
 };
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
-    client_async_tls_with_config,
+    Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
     tungstenite::{client::IntoClientRequest, http::HeaderValue},
-    Connector, MaybeTlsStream, WebSocketStream,
 };
 use tracing::{debug, warn};
 use tungstenite::Error as WsError;

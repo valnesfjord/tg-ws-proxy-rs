@@ -195,8 +195,7 @@ pub fn sign_faketls_client_hello(record: &mut [u8], secret: &[u8]) {
     record[TLS_DIGEST_POS..TLS_DIGEST_POS + TLS_DIGEST_LEN].fill(0);
 
     // Compute HMAC-SHA256(secret, record_with_zeroed_random).
-    let mut mac =
-        HmacSha256::new_from_slice(secret).expect("HMAC-SHA256 accepts any key length");
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC-SHA256 accepts any key length");
     mac.update(record);
     let computed = mac.finalize().into_bytes();
 
@@ -216,10 +215,7 @@ pub fn sign_faketls_client_hello(record: &mut [u8], secret: &[u8]) {
 
 // ─── Inbound ClientHello validation / ServerHello construction ─────────────
 
-pub fn parse_faketls_client_hello(
-    record: &[u8],
-    secret: &[u8],
-) -> Option<FakeTlsClientHello> {
+pub fn parse_faketls_client_hello(record: &[u8], secret: &[u8]) -> Option<FakeTlsClientHello> {
     if record.len() < 5 + 4 + TLS_CLIENT_RANDOM_OFFSET_IN_HANDSHAKE + TLS_DIGEST_LEN {
         return None;
     }
@@ -337,8 +333,8 @@ pub fn build_faketls_server_hello(secret: &[u8], hello: &FakeTlsClientHello) -> 
     server_body.extend_from_slice(&hello.session_id);
     server_body.extend_from_slice(&hello.cipher_suite);
     server_body.extend_from_slice(&[
-        0x00, 0x00, 0x2e, 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04, 0x00, 0x33, 0x00, 0x24, 0x00,
-        0x1d, 0x00, 0x20,
+        0x00, 0x00, 0x2e, 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04, 0x00, 0x33, 0x00, 0x24, 0x00, 0x1d,
+        0x00, 0x20,
     ]);
     let mut rng = rand::rng();
     let mut key_share = [0u8; 32];
@@ -408,9 +404,7 @@ pub async fn read_tls_record<R: AsyncRead + Unpin>(
 /// We discard Handshake and ChangeCipherSpec records unconditionally and stop
 /// (returning `true`) as soon as we see the first Application Data record,
 /// which is the server's synthetic "finished" / fake certificate.
-pub async fn drain_faketls_server_hello(
-    reader: &mut tokio::io::ReadHalf<TcpStream>,
-) -> bool {
+pub async fn drain_faketls_server_hello(reader: &mut tokio::io::ReadHalf<TcpStream>) -> bool {
     let mut header = [0u8; 5];
 
     for _ in 0..TLS_MAX_HANDSHAKE_RECORDS {

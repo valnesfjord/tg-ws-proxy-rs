@@ -196,7 +196,12 @@ pub struct Config {
     ///
     /// The CF proxy is tried as a fallback after direct WebSocket connections
     /// fail, and as the primary path when no `--dc-ip` is configured for a DC.
-    #[arg(long = "cf-domain", value_name = "DOMAIN", value_delimiter = ',', env = "TG_CF_DOMAIN")]
+    #[arg(
+        long = "cf-domain",
+        value_name = "DOMAIN",
+        value_delimiter = ',',
+        env = "TG_CF_DOMAIN"
+    )]
     pub cf_domains: Vec<String>,
 
     /// Prioritise Cloudflare proxy over direct WebSocket connections for all
@@ -219,47 +224,86 @@ pub struct Config {
     pub cf_balance: bool,
 
     // ── Timeout / cooldown knobs ─────────────────────────────────────────
-
     /// WebSocket connection timeout in seconds (normal path).
-    #[arg(long = "ws-connect-timeout", default_value = "10", env = "TG_WS_CONNECT_TIMEOUT")]
+    #[arg(
+        long = "ws-connect-timeout",
+        default_value = "10",
+        env = "TG_WS_CONNECT_TIMEOUT"
+    )]
     pub ws_connect_timeout: u64,
 
     /// WebSocket connection timeout in seconds when the DC is in failure
     /// cooldown (fast-probe path, allows quick recovery after a network change).
-    #[arg(long = "ws-fail-probe-timeout", default_value = "2", env = "TG_WS_FAIL_PROBE_TIMEOUT")]
+    #[arg(
+        long = "ws-fail-probe-timeout",
+        default_value = "2",
+        env = "TG_WS_FAIL_PROBE_TIMEOUT"
+    )]
     pub ws_fail_probe_timeout: u64,
 
     /// Seconds to back off from a DC's WebSocket after a connection failure.
-    #[arg(long = "ws-fail-cooldown", default_value = "30", env = "TG_WS_FAIL_COOLDOWN")]
+    #[arg(
+        long = "ws-fail-cooldown",
+        default_value = "30",
+        env = "TG_WS_FAIL_COOLDOWN"
+    )]
     pub ws_fail_cooldown: u64,
 
     /// Seconds to back off from a DC's WebSocket after all domains returned
     /// a redirect (WS blacklisted by Telegram).
-    #[arg(long = "ws-redirect-cooldown", default_value = "300", env = "TG_WS_REDIRECT_COOLDOWN")]
+    #[arg(
+        long = "ws-redirect-cooldown",
+        default_value = "300",
+        env = "TG_WS_REDIRECT_COOLDOWN"
+    )]
     pub ws_redirect_cooldown: u64,
 
     /// Client MTProto handshake read timeout in seconds.
-    #[arg(long = "handshake-timeout", default_value = "10", env = "TG_HANDSHAKE_TIMEOUT")]
+    #[arg(
+        long = "handshake-timeout",
+        default_value = "10",
+        env = "TG_HANDSHAKE_TIMEOUT"
+    )]
     pub handshake_timeout: u64,
 
     /// TCP fallback connect timeout in seconds.
-    #[arg(long = "tcp-fallback-timeout", default_value = "10", env = "TG_TCP_FALLBACK_TIMEOUT")]
+    #[arg(
+        long = "tcp-fallback-timeout",
+        default_value = "10",
+        env = "TG_TCP_FALLBACK_TIMEOUT"
+    )]
     pub tcp_fallback_timeout: u64,
 
     /// Connect timeout in seconds for upstream MTProto proxies.
-    #[arg(long = "upstream-connect-timeout", default_value = "5", env = "TG_UPSTREAM_CONNECT_TIMEOUT")]
+    #[arg(
+        long = "upstream-connect-timeout",
+        default_value = "5",
+        env = "TG_UPSTREAM_CONNECT_TIMEOUT"
+    )]
     pub upstream_connect_timeout: u64,
 
     /// Seconds to back off from an upstream MTProto proxy after a failure.
-    #[arg(long = "upstream-fail-cooldown", default_value = "60", env = "TG_UPSTREAM_FAIL_COOLDOWN")]
+    #[arg(
+        long = "upstream-fail-cooldown",
+        default_value = "60",
+        env = "TG_UPSTREAM_FAIL_COOLDOWN"
+    )]
     pub upstream_fail_cooldown: u64,
 
     /// Connect timeout in seconds for the Cloudflare proxy path.
-    #[arg(long = "cf-connect-timeout", default_value = "10", env = "TG_CF_CONNECT_TIMEOUT")]
+    #[arg(
+        long = "cf-connect-timeout",
+        default_value = "10",
+        env = "TG_CF_CONNECT_TIMEOUT"
+    )]
     pub cf_connect_timeout: u64,
 
     /// Seconds to back off from the Cloudflare proxy path after a failure.
-    #[arg(long = "cf-fail-cooldown", default_value = "60", env = "TG_CF_FAIL_COOLDOWN")]
+    #[arg(
+        long = "cf-fail-cooldown",
+        default_value = "60",
+        env = "TG_CF_FAIL_COOLDOWN"
+    )]
     pub cf_fail_cooldown: u64,
 
     /// Maximum age of a pooled WebSocket connection in seconds.
@@ -282,6 +326,22 @@ pub struct Config {
     /// Exits with status code 0 when all configured items pass, 1 otherwise.
     #[arg(long = "check", env = "TG_CHECK")]
     pub check: bool,
+
+    /// Use the default Cloudflare-proxy domain list from the upstream repository.
+    ///
+    /// When set, the proxy fetches an obfuscated list of working CF proxy
+    /// domains from GitHub at startup, deobfuscates them, and uses them as
+    /// `--cf-domain` entries.  This lets users get started without having to
+    /// configure their own Cloudflare DNS zone.
+    ///
+    /// The fetched domains are appended after any domains supplied with
+    /// `--cf-domain`.  If the fetch fails the proxy falls back to a small
+    /// built-in list.
+    ///
+    /// Source:
+    ///   https://github.com/Flowseal/tg-ws-proxy/blob/main/.github/cfproxy-domains.txt
+    #[arg(long = "default-domains", env = "TG_DEFAULT_DOMAINS")]
+    pub default_domains: bool,
 }
 
 impl Config {
@@ -296,9 +356,10 @@ impl Config {
         }
 
         // If no --dc-ip was given, use the built-in defaults — unless a CF
-        // domain is configured (in which case CF proxy becomes the primary
-        // path for all DCs without explicit IPs).
-        if cfg.dc_ip.is_empty() && cfg.cf_domains.is_empty() {
+        // domain is configured or --default-domains was requested (in which
+        // case CF proxy becomes the primary path for all DCs without explicit
+        // IPs, and the default dc_ip list would be misleading).
+        if cfg.dc_ip.is_empty() && cfg.cf_domains.is_empty() && !cfg.default_domains {
             cfg.dc_ip = vec![
                 (2, "149.154.167.220".to_string()),
                 (4, "149.154.167.220".to_string()),
@@ -310,7 +371,8 @@ impl Config {
 
     /// The proxy secret as raw bytes (decoded from hex).
     pub fn secret_bytes(&self) -> Vec<u8> {
-        let raw = hex::decode(self.secret.as_deref().unwrap_or("")).expect("secret must be valid hex");
+        let raw =
+            hex::decode(self.secret.as_deref().unwrap_or("")).expect("secret must be valid hex");
         if raw.len() >= 17 && matches!(raw[0], 0xdd | 0xee) {
             raw[1..17].to_vec()
         } else {

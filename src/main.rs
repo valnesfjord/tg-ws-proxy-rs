@@ -71,7 +71,7 @@ fn auto_max_connections(fd_limit: usize, pool_size: usize, dc_buckets: usize) ->
     (fd_limit.saturating_sub(reserved) / 2).max(4)
 }
 
-use tg_ws_proxy_rs::{check, config::Config, pool::WsPool, proxy};
+use tg_ws_proxy_rs::{check, config::Config, default_domains, pool::WsPool, proxy};
 
 #[tokio::main]
 async fn main() {
@@ -79,7 +79,7 @@ async fn main() {
         .install_default()
         .expect("failed to install rustls ring CryptoProvider");
 
-    let config = Config::from_args();
+    let mut config = Config::from_args();
 
     // ── Logging ──────────────────────────────────────────────────────────
     let log_level = if config.quiet {
@@ -90,8 +90,8 @@ async fn main() {
         "info"
     };
 
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| log_level.into());
+    let env_filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| log_level.into());
 
     if let Some(ref path) = config.log_file {
         // File output: always disable ANSI color codes in log files.
@@ -115,6 +115,18 @@ async fn main() {
             .with_env_filter(env_filter)
             .with_ansi(use_ansi)
             .init();
+    }
+
+    // ── Default CF domain list (--default-domains) ────────────────────────
+    // Fetch the obfuscated domain list from GitHub, deobfuscate it, and
+    // append the resulting domains to any that were supplied with --cf-domain.
+    // Done once here so both --check mode and the normal server path share
+    // the same fetched list.
+    if config.default_domains {
+        info!("Fetching default CF proxy domain list from GitHub…");
+        let fetched = default_domains::fetch_default_domains().await;
+        info!("  Got {} default CF domain(s)", fetched.len());
+        config.cf_domains.extend(fetched);
     }
 
     // ── Connectivity check mode (--check) ────────────────────────────────

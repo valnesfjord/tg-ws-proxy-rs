@@ -18,7 +18,7 @@ use tracing::{debug, warn};
 use futures_util::{FutureExt, StreamExt};
 
 use crate::config::Config;
-use crate::ws_client::{connect_ws_for_dc, TgWsStream};
+use crate::ws_client::{TgWsStream, connect_ws_for_dc};
 
 struct PoolEntry {
     ws: TgWsStream,

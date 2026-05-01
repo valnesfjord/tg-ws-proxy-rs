@@ -24,11 +24,11 @@
 
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use crate::config::{Config, MtProtoProxy};
-use crate::crypto::{generate_client_handshake, ProtoTag};
+use crate::crypto::{ProtoTag, generate_client_handshake};
 use crate::faketls;
 use crate::ws_client::connect_cf_ws_for_dc;
 
@@ -68,8 +68,7 @@ impl ProbeStatus {
 /// SSL), this probe will succeed and other DCs should work too.
 async fn probe_cf_domain(domain: &str, skip_tls: bool, timeout: Duration) -> ProbeStatus {
     let start = Instant::now();
-    let (ws, _) =
-        connect_cf_ws_for_dc(2, &[domain.to_string()], false, skip_tls, timeout).await;
+    let (ws, _) = connect_cf_ws_for_dc(2, &[domain.to_string()], false, skip_tls, timeout).await;
     if ws.is_some() {
         ProbeStatus::Ok(start.elapsed())
     } else {
@@ -123,9 +122,7 @@ async fn probe_mtproto_proxy(proxy: &MtProtoProxy, timeout: Duration) -> ProbeSt
         let hostname = match std::str::from_utf8(&secret[17..]) {
             Ok(h) => h,
             Err(_) => {
-                return ProbeStatus::Fail(
-                    "FakeTLS secret contains non-UTF-8 hostname".to_string(),
-                )
+                return ProbeStatus::Fail("FakeTLS secret contains non-UTF-8 hostname".to_string());
             }
         };
 
@@ -137,12 +134,10 @@ async fn probe_mtproto_proxy(proxy: &MtProtoProxy, timeout: Duration) -> ProbeSt
         }
 
         // Drain the server's fake TLS handshake (ServerHello → CCS → AppData).
-        let drained = tokio::time::timeout(
-            timeout,
-            faketls::drain_faketls_server_hello(&mut reader),
-        )
-        .await
-        .unwrap_or(false);
+        let drained =
+            tokio::time::timeout(timeout, faketls::drain_faketls_server_hello(&mut reader))
+                .await
+                .unwrap_or(false);
 
         if !drained {
             return ProbeStatus::Fail(

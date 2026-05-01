@@ -793,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "tg-ws-proxy-rs"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "aes",
  "cipher",
@@ -807,6 +807,7 @@ dependencies = [
  "rustls-pki-types",
  "sha2",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
