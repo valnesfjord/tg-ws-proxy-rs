@@ -12,7 +12,7 @@
 
 use cipher::StreamCipher;
 
-use crate::crypto::{make_cipher, AesCtr256, ProtoTag, HANDSHAKE_LEN, SKIP_LEN};
+use crate::crypto::{AesCtr256, HANDSHAKE_LEN, ProtoTag, SKIP_LEN, make_cipher};
 
 const PREKEY_LEN: usize = 32;
 const IV_LEN: usize = 16;

@@ -20,8 +20,7 @@ use tokio_rustls::TlsConnector;
 use tracing::warn;
 
 const DOMAINS_URL_HOST: &str = "raw.githubusercontent.com";
-const DOMAINS_URL_PATH: &str =
-    "/Flowseal/tg-ws-proxy/refs/heads/main/.github/cfproxy-domains.txt";
+const DOMAINS_URL_PATH: &str = "/Flowseal/tg-ws-proxy/refs/heads/main/.github/cfproxy-domains.txt";
 
 /// The real TLD suffix that the encoded `.com` maps back to.
 const REAL_SUFFIX: &str = ".co.uk";
@@ -85,26 +84,20 @@ async fn https_get(host: &str, path: &str) -> Result<String, String> {
     let connector = TlsConnector::from(Arc::new(build_tls_config()));
 
     // TCP connect.
-    let tcp = tokio::time::timeout(
-        FETCH_TIMEOUT,
-        TcpStream::connect(format!("{}:443", host)),
-    )
-    .await
-    .map_err(|_| "TCP connect timed out".to_string())?
-    .map_err(|e| format!("TCP connect: {}", e))?;
+    let tcp = tokio::time::timeout(FETCH_TIMEOUT, TcpStream::connect(format!("{}:443", host)))
+        .await
+        .map_err(|_| "TCP connect timed out".to_string())?
+        .map_err(|e| format!("TCP connect: {}", e))?;
 
     let _ = tcp.set_nodelay(true);
 
     // TLS handshake.
     let server_name = ServerName::try_from(host.to_string())
         .map_err(|e| format!("invalid server name: {}", e))?;
-    let mut tls = tokio::time::timeout(
-        FETCH_TIMEOUT,
-        connector.connect(server_name, tcp),
-    )
-    .await
-    .map_err(|_| "TLS handshake timed out".to_string())?
-    .map_err(|e| format!("TLS handshake: {}", e))?;
+    let mut tls = tokio::time::timeout(FETCH_TIMEOUT, connector.connect(server_name, tcp))
+        .await
+        .map_err(|_| "TLS handshake timed out".to_string())?
+        .map_err(|e| format!("TLS handshake: {}", e))?;
 
     // HTTP/1.1 GET.
     let request = format!(
@@ -213,9 +206,6 @@ mod tests {
     ///   v→p, i→c, r→l, k→e, g→a, j→d  → `pclead.co.uk`
     #[test]
     fn deobfuscate_known_pair() {
-        assert_eq!(
-            deobfuscate("virkgj.com"),
-            Some("pclead.co.uk".to_string())
-        );
+        assert_eq!(deobfuscate("virkgj.com"), Some("pclead.co.uk".to_string()));
     }
 }

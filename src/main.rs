@@ -90,8 +90,8 @@ async fn main() {
         "info"
     };
 
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| log_level.into());
+    let env_filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| log_level.into());
 
     if let Some(ref path) = config.log_file {
         // File output: always disable ANSI color codes in log files.

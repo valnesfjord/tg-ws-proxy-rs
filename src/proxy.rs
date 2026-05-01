@@ -31,19 +31,19 @@ use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 use tungstenite::Message;
 
-use crate::config::{default_dc_ips, default_dc_overrides, Config};
+use crate::config::{Config, default_dc_ips, default_dc_overrides};
 use crate::crypto::{
-    build_connection_ciphers, generate_client_handshake, generate_relay_init, parse_handshake,
-    AesCtr256, ConnectionCiphers,
+    AesCtr256, ConnectionCiphers, build_connection_ciphers, generate_client_handshake,
+    generate_relay_init, parse_handshake,
 };
 use crate::faketls::{
-    TLS_MAX_RECORD_PAYLOAD, TLS_RECORD_HANDSHAKE, build_faketls_server_hello,
-    build_faketls_client_hello, drain_faketls_server_hello, parse_faketls_client_hello,
+    TLS_MAX_RECORD_PAYLOAD, TLS_RECORD_HANDSHAKE, build_faketls_client_hello,
+    build_faketls_server_hello, drain_faketls_server_hello, parse_faketls_client_hello,
     read_tls_appdata, read_tls_record, sign_faketls_client_hello, write_tls_appdata,
 };
 use crate::pool::WsPool;
 use crate::splitter::MsgSplitter;
-use crate::ws_client::{connect_cf_ws_for_dc, connect_ws_for_dc, ws_send, TgWsStream};
+use crate::ws_client::{TgWsStream, connect_cf_ws_for_dc, connect_ws_for_dc, ws_send};
 
 // WS failure cooldown is global for the process lifetime.
 use std::collections::HashMap;
@@ -172,7 +172,12 @@ fn clear_dc_cooldown(dc: u32, is_media: bool) {
     }
 }
 
-fn ws_timeout_for(dc: u32, is_media: bool, normal_timeout: Duration, fail_probe_timeout: Duration) -> Duration {
+fn ws_timeout_for(
+    dc: u32,
+    is_media: bool,
+    normal_timeout: Duration,
+    fail_probe_timeout: Duration,
+) -> Duration {
     let lock = DC_FAIL_UNTIL.lock().unwrap();
     if let Some(map) = lock.as_ref() {
         if let Some(&until) = map.get(&(dc, is_media)) {
@@ -187,10 +192,7 @@ fn ws_timeout_for(dc: u32, is_media: bool, normal_timeout: Duration, fail_probe_
 
 enum ClientReader {
     Plain(TcpReader),
-    FakeTls {
-        reader: TcpReader,
-        pending: Vec<u8>,
-    },
+    FakeTls { reader: TcpReader, pending: Vec<u8> },
 }
 
 impl ClientReader {
@@ -438,9 +440,14 @@ pub async fn handle_client(
                     label, dc_id, media_tag, reason, cf_domains_for_conn
                 );
 
-                let (cf_ws_opt, _all_redirects) =
-                    connect_cf_ws_for_dc(dc_id, &cf_domains_for_conn, is_media, skip_tls, cf_connect_timeout)
-                        .await;
+                let (cf_ws_opt, _all_redirects) = connect_cf_ws_for_dc(
+                    dc_id,
+                    &cf_domains_for_conn,
+                    is_media,
+                    skip_tls,
+                    cf_connect_timeout,
+                )
+                .await;
 
                 if let Some(ws) = cf_ws_opt {
                     clear_cf_cooldown(dc_id, is_media);
@@ -457,7 +464,10 @@ pub async fn handle_client(
                     set_cf_cooldown(dc_id, is_media, cf_fail_cooldown);
                     warn!(
                         "[{}] DC{}{} CF proxy failed, cooldown {}s",
-                        label, dc_id, media_tag, cf_fail_cooldown.as_secs()
+                        label,
+                        dc_id,
+                        media_tag,
+                        cf_fail_cooldown.as_secs()
                     );
                 }
             } else {
@@ -493,11 +503,17 @@ pub async fn handle_client(
                     clear_upstream_cooldown(&upstream.host, upstream.port);
                     info!(
                         "[{}] DC{}{} {} → upstream {} MTProto {}:{}",
-                        label, dc_id, media_tag, reason,
+                        label,
+                        dc_id,
+                        media_tag,
+                        reason,
                         if is_ft { "FakeTLS" } else { "plain" },
-                        upstream.host, upstream.port
+                        upstream.host,
+                        upstream.port
                     );
-                    let ConnectionCiphers { clt_dec, clt_enc, .. } = ciphers;
+                    let ConnectionCiphers {
+                        clt_dec, clt_enc, ..
+                    } = ciphers;
                     match conn {
                         UpstreamConnection::Plain(rem_reader, rem_writer, up_enc, up_dec) => {
                             let up_ciphers = ConnectionCiphers {
@@ -507,8 +523,8 @@ pub async fn handle_client(
                                 tg_dec: up_dec,
                             };
                             bridge_mtproto_relay(
-                                &label, reader, writer, rem_reader, rem_writer,
-                                up_ciphers, dc_id, is_media,
+                                &label, reader, writer, rem_reader, rem_writer, up_ciphers, dc_id,
+                                is_media,
                             )
                             .await;
                         }
@@ -520,8 +536,8 @@ pub async fn handle_client(
                                 tg_dec: up_dec,
                             };
                             bridge_faketls_relay(
-                                &label, reader, writer, rem_reader, rem_writer,
-                                up_ciphers, dc_id, is_media,
+                                &label, reader, writer, rem_reader, rem_writer, up_ciphers, dc_id,
+                                is_media,
                             )
                             .await;
                         }
@@ -575,9 +591,14 @@ pub async fn handle_client(
                 label, dc_id, media_tag
             );
 
-            let (cf_ws_opt, _all_redirects) =
-                connect_cf_ws_for_dc(dc_id, &cf_domains_for_conn, is_media, skip_tls, cf_connect_timeout)
-                    .await;
+            let (cf_ws_opt, _all_redirects) = connect_cf_ws_for_dc(
+                dc_id,
+                &cf_domains_for_conn,
+                is_media,
+                skip_tls,
+                cf_connect_timeout,
+            )
+            .await;
 
             if let Some(ws) = cf_ws_opt {
                 clear_cf_cooldown(dc_id, is_media);
@@ -594,7 +615,10 @@ pub async fn handle_client(
                 set_cf_cooldown(dc_id, is_media, cf_fail_cooldown);
                 warn!(
                     "[{}] DC{}{} CF proxy failed (priority), cooldown {}s — falling back to WS",
-                    label, dc_id, media_tag, cf_fail_cooldown.as_secs()
+                    label,
+                    dc_id,
+                    media_tag,
+                    cf_fail_cooldown.as_secs()
                 );
             }
         } else {
@@ -680,10 +704,7 @@ pub async fn handle_client(
 
                         if let Some(ws) = cf_ws_opt {
                             clear_cf_cooldown(dc_id, is_media);
-                            info!(
-                                "[{}] DC{}{} → CF proxy connected",
-                                label, dc_id, media_tag
-                            );
+                            info!("[{}] DC{}{} → CF proxy connected", label, dc_id, media_tag);
                             bridge_ws(
                                 &label, reader, writer, ws, relay_init, ciphers, proto, dc_id,
                                 is_media,
@@ -694,7 +715,10 @@ pub async fn handle_client(
                             set_cf_cooldown(dc_id, is_media, cf_fail_cooldown);
                             warn!(
                                 "[{}] DC{}{} CF proxy failed, cooldown {}s",
-                                label, dc_id, media_tag, cf_fail_cooldown.as_secs()
+                                label,
+                                dc_id,
+                                media_tag,
+                                cf_fail_cooldown.as_secs()
                             );
                         }
                     } else {
@@ -730,14 +754,22 @@ pub async fn handle_client(
                             clear_upstream_cooldown(&upstream.host, upstream.port);
                             info!(
                                 "[{}] DC{}{} → upstream {} MTProto {}:{}",
-                                label, dc_id, media_tag,
+                                label,
+                                dc_id,
+                                media_tag,
                                 if is_ft { "FakeTLS" } else { "plain" },
-                                upstream.host, upstream.port
+                                upstream.host,
+                                upstream.port
                             );
-                            let ConnectionCiphers { clt_dec, clt_enc, .. } = ciphers;
+                            let ConnectionCiphers {
+                                clt_dec, clt_enc, ..
+                            } = ciphers;
                             match conn {
                                 UpstreamConnection::Plain(
-                                    rem_reader, rem_writer, up_enc, up_dec,
+                                    rem_reader,
+                                    rem_writer,
+                                    up_enc,
+                                    up_dec,
                                 ) => {
                                     let up_ciphers = ConnectionCiphers {
                                         clt_dec,
@@ -746,13 +778,16 @@ pub async fn handle_client(
                                         tg_dec: up_dec,
                                     };
                                     bridge_mtproto_relay(
-                                        &label, reader, writer, rem_reader, rem_writer,
-                                        up_ciphers, dc_id, is_media,
+                                        &label, reader, writer, rem_reader, rem_writer, up_ciphers,
+                                        dc_id, is_media,
                                     )
                                     .await;
                                 }
                                 UpstreamConnection::FakeTls(
-                                    rem_reader, rem_writer, up_enc, up_dec,
+                                    rem_reader,
+                                    rem_writer,
+                                    up_enc,
+                                    up_dec,
                                 ) => {
                                     let up_ciphers = ConnectionCiphers {
                                         clt_dec,
@@ -761,8 +796,8 @@ pub async fn handle_client(
                                         tg_dec: up_dec,
                                     };
                                     bridge_faketls_relay(
-                                        &label, reader, writer, rem_reader, rem_writer,
-                                        up_ciphers, dc_id, is_media,
+                                        &label, reader, writer, rem_reader, rem_writer, up_ciphers,
+                                        dc_id, is_media,
                                     )
                                     .await;
                                 }
@@ -770,7 +805,11 @@ pub async fn handle_client(
                             return;
                         }
                         None => {
-                            set_upstream_cooldown(&upstream.host, upstream.port, upstream_fail_cooldown);
+                            set_upstream_cooldown(
+                                &upstream.host,
+                                upstream.port,
+                                upstream_fail_cooldown,
+                            );
                             warn!(
                                 "[{}] upstream {}:{} failed, cooldown {}s",
                                 label,
@@ -1010,10 +1049,7 @@ async fn connect_mtproto_upstream(
     let secret = match hex::decode(secret_hex) {
         Ok(b) => b,
         Err(e) => {
-            warn!(
-                "[upstream] {}:{} invalid hex secret: {}",
-                host, port, e
-            );
+            warn!("[upstream] {}:{} invalid hex secret: {}", host, port, e);
             return None;
         }
     };
@@ -1031,22 +1067,19 @@ async fn connect_mtproto_upstream(
     };
 
     // ── TCP connect ───────────────────────────────────────────────────────
-    let stream = match tokio::time::timeout(
-        timeout,
-        TcpStream::connect(format!("{}:{}", host, port)),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            warn!("[upstream] {}:{} connect error: {}", host, port, e);
-            return None;
-        }
-        Err(_) => {
-            warn!("[upstream] {}:{} connect timed out", host, port);
-            return None;
-        }
-    };
+    let stream =
+        match tokio::time::timeout(timeout, TcpStream::connect(format!("{}:{}", host, port))).await
+        {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                warn!("[upstream] {}:{} connect error: {}", host, port, e);
+                return None;
+            }
+            Err(_) => {
+                warn!("[upstream] {}:{} connect timed out", host, port);
+                return None;
+            }
+        };
     let _ = stream.set_nodelay(true);
 
     let (handshake, enc, dec) = generate_client_handshake(key_bytes, dc_idx, proto);
@@ -1331,22 +1364,20 @@ async fn bridge_tcp(
     is_media: bool,
     connect_timeout: Duration,
 ) {
-    let remote = match tokio::time::timeout(
-        connect_timeout,
-        TcpStream::connect(format!("{}:443", dst)),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            warn!("[{}] TCP fallback connect failed: {}", label, e);
-            return;
-        }
-        Err(_) => {
-            warn!("[{}] TCP fallback connect timed out", label);
-            return;
-        }
-    };
+    let remote =
+        match tokio::time::timeout(connect_timeout, TcpStream::connect(format!("{}:443", dst)))
+            .await
+        {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                warn!("[{}] TCP fallback connect failed: {}", label, e);
+                return;
+            }
+            Err(_) => {
+                warn!("[{}] TCP fallback connect timed out", label);
+                return;
+            }
+        };
 
     let _ = remote.set_nodelay(true);
     let (mut rem_reader, mut rem_writer) = tokio::io::split(remote);

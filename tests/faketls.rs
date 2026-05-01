@@ -48,8 +48,8 @@ fn server_hello_contains_expected_fake_tls_records() {
 
     assert_eq!(server_hello[0], TLS_RECORD_HANDSHAKE);
     assert_eq!(
-        server_hello
-            [TLS_SERVER_RANDOM_OFFSET_IN_PACKET..TLS_SERVER_RANDOM_OFFSET_IN_PACKET + TLS_DIGEST_LEN]
+        server_hello[TLS_SERVER_RANDOM_OFFSET_IN_PACKET
+            ..TLS_SERVER_RANDOM_OFFSET_IN_PACKET + TLS_DIGEST_LEN]
             .len(),
         TLS_DIGEST_LEN
     );
