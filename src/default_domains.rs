@@ -127,7 +127,7 @@ async fn https_get(host: &str, path: &str) -> Result<String, String> {
     if let Some(pos) = response.find("\r\n\r\n") {
         Ok(response[pos + 4..].to_string())
     } else {
-        Err("response has no body separator (\\r\\n\\r\\n)".to_string())
+        Err("response has no body separator".to_string())
     }
 }
 

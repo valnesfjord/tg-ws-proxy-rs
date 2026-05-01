@@ -117,28 +117,25 @@ async fn main() {
             .init();
     }
 
-    // ── Connectivity check mode (--check) ────────────────────────────────
-    // Run probes for every configured CF domain and MTProto proxy, print the
-    // results, then exit.  This lets the user verify their configuration
-    // before starting the proxy server.
-    if config.check {
-        // Fetch default domains first so --check also probes them.
-        if config.default_domains {
-            let fetched = default_domains::fetch_default_domains().await;
-            config.cf_domains.extend(fetched);
-        }
-        let all_ok = check::run_check(&config).await;
-        std::process::exit(if all_ok { 0 } else { 1 });
-    }
-
     // ── Default CF domain list (--default-domains) ────────────────────────
     // Fetch the obfuscated domain list from GitHub, deobfuscate it, and
     // append the resulting domains to any that were supplied with --cf-domain.
+    // Done once here so both --check mode and the normal server path share
+    // the same fetched list.
     if config.default_domains {
         info!("Fetching default CF proxy domain list from GitHub…");
         let fetched = default_domains::fetch_default_domains().await;
         info!("  Got {} default CF domain(s)", fetched.len());
         config.cf_domains.extend(fetched);
+    }
+
+    // ── Connectivity check mode (--check) ────────────────────────────────
+    // Run probes for every configured CF domain and MTProto proxy, print the
+    // results, then exit.  This lets the user verify their configuration
+    // before starting the proxy server.
+    if config.check {
+        let all_ok = check::run_check(&config).await;
+        std::process::exit(if all_ok { 0 } else { 1 });
     }
 
     // ── Bind the server socket ────────────────────────────────────────────
