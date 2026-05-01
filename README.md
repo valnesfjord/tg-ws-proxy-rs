@@ -100,6 +100,7 @@ tg-ws-proxy [OPTIONS]
 | `--buf-kb <KB>` | `256` | Socket buffer size |
 | `--pool-size <N>` | `4` | Pre-warmed WS connections per DC |
 | `--cf-domain <DOMAIN>` | — | Cloudflare-proxied domain(s) for alternative WS routing, comma-separated (see [CF Proxy](#cloudflare-proxy)) |
+| `--default-domains` | off | Fetch and use the built-in CF proxy domain list from GitHub (no Cloudflare setup needed, see [Default domains](#default-domains)) |
 | `--cf-priority` | off | Try CF proxy **before** direct WS for all DCs (see [CF Proxy](#cloudflare-proxy)) |
 | `--cf-balance` | off | Round-robin load balance across multiple `--cf-domain` values (see [CF Proxy](#cloudflare-proxy)) |
 | `--max-connections <N>` | auto | Max concurrent client connections (auto-computed from `ulimit -n`) |
@@ -112,7 +113,7 @@ tg-ws-proxy [OPTIONS]
 Every flag has a matching environment variable (`TG_PORT`, `TG_HOST`,
 `TG_SECRET`, `TG_BUF_KB`, `TG_POOL_SIZE`, `TG_MAX_CONNECTIONS`, `TG_QUIET`,
 `TG_VERBOSE`, `TG_SKIP_TLS_VERIFY`, `TG_LINK_IP`, `TG_LISTEN_FAKETLS_DOMAIN`, `TG_MTPROTO_PROXY`,
-`TG_LOG_FILE`, `TG_CF_DOMAIN`, `TG_CF_PRIORITY`, `TG_CF_BALANCE`).
+`TG_LOG_FILE`, `TG_CF_DOMAIN`, `TG_CF_PRIORITY`, `TG_CF_BALANCE`, `TG_DEFAULT_DOMAINS`).
 
 ### Examples
 
@@ -131,6 +132,15 @@ tg-ws-proxy --cf-domain yourdomain.com
 
 # CF proxy only: omit --dc-ip so CF proxy handles all DCs
 tg-ws-proxy --cf-domain yourdomain.com --cf-priority
+
+# Use default CF domains from GitHub — no Cloudflare setup required
+tg-ws-proxy --default-domains
+
+# Default domains + CF priority (try CF first, fall back to direct WS)
+tg-ws-proxy --default-domains --cf-priority
+
+# Default domains + your own domain (yours goes first)
+tg-ws-proxy --cf-domain yourdomain.com --default-domains
 
 # Multiple CF domains (tried in order) with CF priority over direct WS
 tg-ws-proxy --cf-domain proxy.net,example.com --cf-priority
@@ -311,6 +321,43 @@ tg-ws-proxy --cf-domain d1.example.com,d2.example.com --cf-balance --cf-priority
 
 See [docs/CfProxy.md](docs/CfProxy.md) for full instructions.
 
+### Default domains
+
+Don't want to configure your own Cloudflare DNS zone?  Use `--default-domains`
+to automatically fetch a pre-configured, working list of CF proxy domains from
+the upstream repository:
+
+```bash
+# No Cloudflare account or DNS setup required
+tg-ws-proxy --default-domains
+
+# Enable CF priority so CF path is tried first
+tg-ws-proxy --default-domains --cf-priority
+
+# Combine with your own domain (yours gets highest priority)
+tg-ws-proxy --cf-domain yourdomain.com --default-domains
+
+# Test the fetched domains before starting the proxy
+tg-ws-proxy --default-domains --check
+```
+
+Or via environment variable:
+
+```bash
+TG_DEFAULT_DOMAINS=true tg-ws-proxy
+```
+
+At startup the proxy fetches an obfuscated domain list from
+[Flowseal/tg-ws-proxy](https://github.com/Flowseal/tg-ws-proxy/blob/main/.github/cfproxy-domains.txt),
+deobfuscates it, and appends the decoded domains after any explicit
+`--cf-domain` entries.  If the fetch fails (network not yet available,
+GitHub unreachable) the proxy falls back to a small built-in list and logs a
+warning — it will still start normally.
+
+> **Note:** These are community-maintained domains; availability may change
+> over time.  For maximum reliability, consider setting up your own
+> Cloudflare zone (see [docs/CfProxy.md](docs/CfProxy.md)).
+
 ### Router deployment
 
 Run the proxy on your router with `--host 0.0.0.0` so it accepts connections
@@ -446,16 +493,17 @@ chmod +x /etc/init.d/tg-ws-proxy
 
 ```
 src/
-  main.rs       — Entry point, CLI parsing, server startup, banner
-  config.rs     — ProxyConfig struct, argument parsing, env-var aliases
-  crypto.rs     — MTProto obfuscation: handshake parsing, relay init generation,
-                  AES-256-CTR key derivation and cipher construction
-  splitter.rs   — MTProto packet splitter for correct WebSocket framing
-  ws_client.rs  — WebSocket client for Telegram DC connections (IP routing + SNI)
-  pool.rs       — Pre-warmed WebSocket connection pool per DC
-  proxy.rs      — Client handler, re-encryption bridge, TCP fallback logic
+  main.rs              — Entry point, CLI parsing, server startup, banner
+  config.rs            — ProxyConfig struct, argument parsing, env-var aliases
+  crypto.rs            — MTProto obfuscation: handshake parsing, relay init generation,
+                         AES-256-CTR key derivation and cipher construction
+  splitter.rs          — MTProto packet splitter for correct WebSocket framing
+  ws_client.rs         — WebSocket client for Telegram DC connections (IP routing + SNI)
+  pool.rs              — Pre-warmed WebSocket connection pool per DC
+  proxy.rs             — Client handler, re-encryption bridge, TCP fallback logic
+  default_domains.rs   — Fetches and deobfuscates the default CF proxy domain list
 .cargo/
-  config.toml   — Cross-compilation target presets (commented out)
+  config.toml          — Cross-compilation target presets (commented out)
 ```
 
 ## Configuration via environment
@@ -472,6 +520,7 @@ TG_VERBOSE=false
 TG_CF_DOMAIN=yourdomain.com
 TG_CF_PRIORITY=false
 TG_CF_BALANCE=false
+TG_DEFAULT_DOMAINS=false
 TG_LOG_FILE=/var/log/tg-ws-proxy.log
 TG_MTPROTO_PROXY=proxy.example.com:443:ddabcdef1234567890abcdef1234567890
 ```
