@@ -176,12 +176,16 @@ async fn main() {
     let secret = config.secret.as_deref().unwrap_or("");
 
     let link_host = config.link_host();
-    let tg_link = format!(
+    let mut tg_link = format!(
         "tg://proxy?server={}&port={}&secret={}",
         link_host,
         config.port,
         config.link_secret()
     );
+    if let Some(tag) = config.ad_tag.as_deref() {
+        tg_link.push_str("&tag=");
+        tg_link.push_str(tag);
+    }
 
     info!("{}", "=".repeat(60));
     info!("  Telegram MTProto WS Bridge Proxy  (tg-ws-proxy-rs)");
@@ -201,6 +205,9 @@ async fn main() {
 
     if config.skip_tls_verify {
         info!("  ⚠  TLS certificate verification DISABLED");
+    }
+    if let Some(tag) = config.ad_tag.as_deref() {
+        info!("  Ad tag:        {}", tag);
     }
 
     if !config.cf_domains.is_empty() {

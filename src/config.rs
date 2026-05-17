@@ -69,6 +69,24 @@ fn parse_mtproto_proxy(s: &str) -> Result<MtProtoProxy, String> {
     Ok(MtProtoProxy { host, port, secret })
 }
 
+/// Parse a 16-byte proxy ad tag (32 hex chars).
+fn parse_ad_tag(s: &str) -> Result<String, String> {
+    if s.len() != 32 {
+        return Err(format!(
+            "invalid ad tag length: expected 32 hex chars, got {}",
+            s.len()
+        ));
+    }
+    let raw = hex::decode(s).map_err(|_| format!("invalid ad tag hex {:?}", s))?;
+    if raw.len() != 16 {
+        return Err(format!(
+            "invalid ad tag size: expected 16 bytes, got {}",
+            raw.len()
+        ));
+    }
+    Ok(hex::encode(raw))
+}
+
 // ─── CLI / env-var configuration ─────────────────────────────────────────────
 
 /// Parse a `DC:IP` pair such as `2:149.154.167.220`.
@@ -180,6 +198,11 @@ pub struct Config {
     /// if that fails it falls back to `--host`.
     #[arg(long = "link-ip", env = "TG_LINK_IP")]
     pub link_ip: Option<String>,
+
+    /// Proxy ad tag (from @MTProxybot) to include in generated proxy links.
+    /// Must be 32 hex chars (16 bytes).
+    #[arg(long = "ad-tag", env = "TG_AD_TAG", value_parser = parse_ad_tag)]
+    pub ad_tag: Option<String>,
 
     /// Cloudflare-proxied domain(s) for alternative WebSocket routing.
     ///

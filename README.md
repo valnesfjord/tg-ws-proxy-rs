@@ -95,6 +95,7 @@ tg-ws-proxy [OPTIONS]
 | `--host <HOST>` | `127.0.0.1` | Listen address |
 | `--link-ip <IP>` | auto-detected | IP shown in the `tg://` link (see [Router deployment](#router-deployment)) |
 | `--secret <HEX>` | random | 32 hex-char MTProto secret |
+| `--ad-tag <HEX>` | — | 32 hex-char MTProxy ad tag from `@MTProxybot` (added to generated `tg://` link as `tag=`) |
 | `--listen-faketls-domain <DOMAIN>` | — | Accept inbound clients with `ee` FakeTLS and advertise this SNI domain in the link |
 | `--dc-ip <DC:IP>` | DC2 + DC4 | Target IP per DC (repeatable); omit when using `--cf-domain` to let CF proxy handle all DCs |
 | `--buf-kb <KB>` | `256` | Socket buffer size |
@@ -113,7 +114,7 @@ tg-ws-proxy [OPTIONS]
 Every flag has a matching environment variable (`TG_PORT`, `TG_HOST`,
 `TG_SECRET`, `TG_BUF_KB`, `TG_POOL_SIZE`, `TG_MAX_CONNECTIONS`, `TG_QUIET`,
 `TG_VERBOSE`, `TG_SKIP_TLS_VERIFY`, `TG_LINK_IP`, `TG_LISTEN_FAKETLS_DOMAIN`, `TG_MTPROTO_PROXY`,
-`TG_LOG_FILE`, `TG_CF_DOMAIN`, `TG_CF_PRIORITY`, `TG_CF_BALANCE`, `TG_DEFAULT_DOMAINS`).
+`TG_LOG_FILE`, `TG_AD_TAG`, `TG_CF_DOMAIN`, `TG_CF_PRIORITY`, `TG_CF_BALANCE`, `TG_DEFAULT_DOMAINS`).
 
 ### Examples
 
@@ -165,6 +166,9 @@ tg-ws-proxy --host 0.0.0.0
 # Public home server: inbound ee FakeTLS, backend still WSS to Telegram Web
 tg-ws-proxy --host 0.0.0.0 --port 443 --listen-faketls-domain www.yandex.ru
 
+# Include ad tag from @MTProxybot in generated tg:// link
+tg-ws-proxy --ad-tag 0123456789abcdef0123456789abcdef
+
 # Equivalent: pass a full ee secret directly
 tg-ws-proxy --host 0.0.0.0 --port 443 --secret ee<32-hex-key><hex-encoded-domain>
 
@@ -181,7 +185,8 @@ TG_PORT=1443 TG_SECRET=deadbeef... tg-ws-proxy
 On startup the proxy prints a `tg://proxy?...` link you can paste into
 Telegram Desktop to configure it automatically. With `--listen-faketls-domain`,
 the printed link uses `secret=ee<key><domain_hex>`; otherwise it uses the
-classic `dd<key>` padded MTProto secret.
+classic `dd<key>` padded MTProto secret. If `--ad-tag` is set, the link also
+includes `&tag=<ad_tag>`.
 
 ### Inbound FakeTLS listener
 
@@ -517,6 +522,7 @@ TG_BUF_KB=256
 TG_MAX_CONNECTIONS=64
 TG_QUIET=true
 TG_VERBOSE=false
+TG_AD_TAG=0123456789abcdef0123456789abcdef
 TG_CF_DOMAIN=yourdomain.com
 TG_CF_PRIORITY=false
 TG_CF_BALANCE=false

@@ -40,3 +40,21 @@ fn plain_secret_still_generates_dd_link() {
     assert_eq!(cfg.listen_faketls_domain(), None);
     assert_eq!(cfg.link_secret(), format!("dd{}", key));
 }
+
+#[test]
+fn ad_tag_is_accepted_and_normalized() {
+    let cfg = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--ad-tag",
+        "AABBCCDDEEFF00112233445566778899",
+    ])
+    .unwrap();
+
+    assert_eq!(cfg.ad_tag.as_deref(), Some("aabbccddeeff00112233445566778899"));
+}
+
+#[test]
+fn ad_tag_must_be_32_hex_chars() {
+    assert!(Config::try_parse_from(["tg-ws-proxy", "--ad-tag", "abcd"]).is_err());
+    assert!(Config::try_parse_from(["tg-ws-proxy", "--ad-tag", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"]).is_err());
+}
