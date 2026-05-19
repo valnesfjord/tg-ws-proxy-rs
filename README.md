@@ -96,6 +96,7 @@ tg-ws-proxy [OPTIONS]
 | `--link-ip <IP>` | auto-detected | IP shown in the `tg://` link (see [Router deployment](#router-deployment)) |
 | `--secret <HEX>` | random | 32 hex-char MTProto secret |
 | `--listen-faketls-domain <DOMAIN>` | — | Accept inbound clients with `ee` FakeTLS and advertise this SNI domain in the link |
+| `--ad-tag <HEX32>` | — | Optional Telegram ad tag (32 hex chars) appended to the generated link as `adtag=...` |
 | `--dc-ip <DC:IP>` | DC2 + DC4 | Target IP per DC (repeatable); omit when using `--cf-domain` to let CF proxy handle all DCs |
 | `--buf-kb <KB>` | `256` | Socket buffer size |
 | `--pool-size <N>` | `4` | Pre-warmed WS connections per DC |
@@ -113,7 +114,7 @@ tg-ws-proxy [OPTIONS]
 Every flag has a matching environment variable (`TG_PORT`, `TG_HOST`,
 `TG_SECRET`, `TG_BUF_KB`, `TG_POOL_SIZE`, `TG_MAX_CONNECTIONS`, `TG_QUIET`,
 `TG_VERBOSE`, `TG_SKIP_TLS_VERIFY`, `TG_LINK_IP`, `TG_LISTEN_FAKETLS_DOMAIN`, `TG_MTPROTO_PROXY`,
-`TG_LOG_FILE`, `TG_CF_DOMAIN`, `TG_CF_PRIORITY`, `TG_CF_BALANCE`, `TG_DEFAULT_DOMAINS`).
+`TG_LOG_FILE`, `TG_CF_DOMAIN`, `TG_CF_PRIORITY`, `TG_CF_BALANCE`, `TG_DEFAULT_DOMAINS`, `TG_AD_TAG`).
 
 ### Examples
 
@@ -165,6 +166,9 @@ tg-ws-proxy --host 0.0.0.0
 # Public home server: inbound ee FakeTLS, backend still WSS to Telegram Web
 tg-ws-proxy --host 0.0.0.0 --port 443 --listen-faketls-domain www.yandex.ru
 
+# Same, but with ad-tag for sponsored channel attribution
+tg-ws-proxy --host 0.0.0.0 --port 443 --listen-faketls-domain www.yandex.ru --ad-tag 1234567890abcdef1234567890abcdef
+
 # Equivalent: pass a full ee secret directly
 tg-ws-proxy --host 0.0.0.0 --port 443 --secret ee<32-hex-key><hex-encoded-domain>
 
@@ -181,7 +185,8 @@ TG_PORT=1443 TG_SECRET=deadbeef... tg-ws-proxy
 On startup the proxy prints a `tg://proxy?...` link you can paste into
 Telegram Desktop to configure it automatically. With `--listen-faketls-domain`,
 the printed link uses `secret=ee<key><domain_hex>`; otherwise it uses the
-classic `dd<key>` padded MTProto secret.
+classic `dd<key>` padded MTProto secret. With `--ad-tag`, it also appends
+`&adtag=<32-hex-tag>`.
 
 ### Inbound FakeTLS listener
 

@@ -176,12 +176,16 @@ async fn main() {
     let secret = config.secret.as_deref().unwrap_or("");
 
     let link_host = config.link_host();
-    let tg_link = format!(
+    let mut tg_link = format!(
         "tg://proxy?server={}&port={}&secret={}",
         link_host,
         config.port,
         config.link_secret()
     );
+    if let Some(ad_tag) = config.ad_tag.as_deref() {
+        tg_link.push_str("&adtag=");
+        tg_link.push_str(ad_tag);
+    }
 
     info!("{}", "=".repeat(60));
     info!("  Telegram MTProto WS Bridge Proxy  (tg-ws-proxy-rs)");
@@ -191,6 +195,9 @@ async fn main() {
         info!("  Inbound mode:   FakeTLS ee (SNI: {})", domain);
     } else {
         info!("  Inbound mode:   padded MTProto dd");
+    }
+    if let Some(ad_tag) = config.ad_tag.as_deref() {
+        info!("  Ad tag:        {}", ad_tag);
     }
     info!("  Target DC IPs:");
     let mut dcs: Vec<_> = dc_redirects.iter().collect();

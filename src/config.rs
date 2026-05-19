@@ -69,6 +69,17 @@ fn parse_mtproto_proxy(s: &str) -> Result<MtProtoProxy, String> {
     Ok(MtProtoProxy { host, port, secret })
 }
 
+/// Parse ad-tag value (`32` hex chars).
+fn parse_ad_tag(s: &str) -> Result<String, String> {
+    if s.len() != 32 || !s.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(format!(
+            "invalid ad-tag {:?}: expected exactly 32 hex characters",
+            s
+        ));
+    }
+    Ok(s.to_string())
+}
+
 // ─── CLI / env-var configuration ─────────────────────────────────────────────
 
 /// Parse a `DC:IP` pair such as `2:149.154.167.220`.
@@ -115,6 +126,11 @@ pub struct Config {
     /// SNI hostname. The generated proxy link will use `secret=ee<key><hosthex>`.
     #[arg(long = "listen-faketls-domain", env = "TG_LISTEN_FAKETLS_DOMAIN")]
     pub listen_faketls_domain: Option<String>,
+
+    /// Optional Telegram ad-tag (32 hex chars) for sponsor channel attribution.
+    /// Added to generated `tg://proxy` links as `&adtag=<hex>`.
+    #[arg(long = "ad-tag", env = "TG_AD_TAG", value_parser = parse_ad_tag)]
+    pub ad_tag: Option<String>,
 
     /// Target IP for a DC, e.g. `--dc-ip 2:149.154.167.220`.
     /// Can be specified multiple times.
