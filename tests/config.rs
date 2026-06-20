@@ -45,14 +45,8 @@ fn plain_secret_still_generates_dd_link() {
 fn multiple_secrets_are_parsed_and_primary_link_uses_first_secret() {
     let first = "11111111111111111111111111111111";
     let second = "22222222222222222222222222222222";
-    let cfg = Config::try_parse_from([
-        "tg-ws-proxy",
-        "--secret",
-        first,
-        "--secret",
-        second,
-    ])
-    .unwrap();
+    let cfg =
+        Config::try_parse_from(["tg-ws-proxy", "--secret", first, "--secret", second]).unwrap();
 
     assert_eq!(cfg.secrets, vec![first.to_string(), second.to_string()]);
     assert_eq!(cfg.secret_bytes(), hex::decode(first).unwrap());
