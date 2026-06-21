@@ -111,6 +111,8 @@ tg-ws-proxy [OPTIONS]
 | `--no-outbound-proxy` | off | Ignore standard outbound proxy environment variables |
 | `--no-proxy <LIST>` | — | Comma-separated host bypass list for `--outbound-proxy` |
 | `--log-file <PATH>` | — | Write logs to a file instead of stderr (no ANSI color codes) |
+| `--ws-keepalive <SECONDS>` | `30` | Interval between WS PING frames sent to the upstream connection; `0` disables |
+| `--proxy-protocol` | off | Expect a PROXY protocol v1 header on every inbound connection (for use behind nginx/haproxy) |
 | `-q / --quiet` | off | Suppress all log output |
 | `-v / --verbose` | off | Debug logging |
 | `--danger-accept-invalid-certs` | off | Skip TLS verification |
@@ -119,11 +121,22 @@ Every flag has a matching environment variable (`TG_PORT`, `TG_HOST`,
 `TG_SECRET`, `TG_BUF_KB`, `TG_POOL_SIZE`, `TG_MAX_CONNECTIONS`, `TG_QUIET`,
 `TG_VERBOSE`, `TG_SKIP_TLS_VERIFY`, `TG_LINK_IP`, `TG_LISTEN_FAKETLS_DOMAIN`, `TG_MTPROTO_PROXY`,
 `TG_LOG_FILE`, `TG_CF_DOMAIN`, `TG_CF_WORKER_DOMAIN`, `TG_CF_PRIORITY`,
-`TG_CF_BALANCE`, `TG_DEFAULT_DOMAINS`, `TG_OUTBOUND_PROXY`, `TG_NO_OUTBOUND_PROXY`, `TG_NO_PROXY`).
+`TG_CF_BALANCE`, `TG_DEFAULT_DOMAINS`, `TG_OUTBOUND_PROXY`, `TG_NO_OUTBOUND_PROXY`, `TG_NO_PROXY`,
+`TG_WS_KEEPALIVE`, `TG_PROXY_PROTOCOL`).
 When `TG_OUTBOUND_PROXY` is not set, standard `HTTPS_PROXY`, `ALL_PROXY`,
 `HTTP_PROXY` and `NO_PROXY` environment variables are also honored. `https://`
 proxy URLs are skipped when discovered from the standard environment if a later
 supported `http://`, `socks5://`, or `socks5h://` fallback is present.
+
+On every startup the proxy checks GitHub for a newer release in the
+background (through the same `--outbound-proxy` setting as everything else)
+and logs a one-line notice if one is found. This never blocks startup or
+serving connections, and any failure (no network, GitHub rate limit, etc.)
+is silently ignored — it's purely informational. The result is cached for
+an hour in `$XDG_CACHE_HOME/tg-ws-proxy/update_check` (falling back to
+`~/.cache/tg-ws-proxy/update_check`), so frequent restarts reuse the cached
+answer instead of repeatedly calling the GitHub API; if neither cache
+directory is available, it just checks live every time.
 
 ### Examples
 
@@ -231,6 +244,18 @@ Telegram client → ee FakeTLS → tg-ws-proxy-rs → WSS/TLS → kws*.web.teleg
 The proxy accepts the TLS ClientHello, validates the FakeTLS HMAC, sends a
 synthetic TLS ServerHello, unwraps TLS Application Data records, and then
 passes the recovered MTProto init into the existing WebSocket backend path.
+
+**Anti-probing behaviour.** A connection that doesn't authenticate is never
+just dropped, since an instant reset is itself a fingerprint an active
+prober can use to tell this proxy apart from a real webserver:
+
+- A bare non-TLS request (e.g. a plaintext HTTP probe) gets a real-looking
+  `301 Moved Permanently` redirect to `https://<domain>/`.
+- A TLS ClientHello with the wrong key, an expired/replayed timestamp
+  (handshakes are only accepted within a 120s window), or the wrong SNI is
+  transparently relayed to the real `--listen-faketls-domain` over a plain
+  TCP connection (through the configured `--outbound-proxy`, if any), so the
+  prober sees an ordinary HTTPS session to that site.
 
 ### Upstream MTProto proxy fallback
 
