@@ -21,7 +21,14 @@ fn build_tls_config() -> rustls::ClientConfig {
 }
 
 /// Perform an HTTPS GET and return the response body as a `String`.
-pub(super) async fn https_get(
+///
+/// Shared by [`crate::default_domains`] (CF proxy domain list) and
+/// [`crate::update_check`] (GitHub release check) — both just need a small,
+/// dependency-free HTTPS client, so this one hand-rolled implementation
+/// (TLS via `tokio-rustls`, headers via `httparse`, both already
+/// dependencies for other reasons) is reused rather than adding a full HTTP
+/// client crate.
+pub(crate) async fn https_get(
     host: &str,
     path: &str,
     outbound: &OutboundConnector,
