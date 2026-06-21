@@ -1,10 +1,11 @@
 use tg_ws_proxy_rs::faketls::{
     TLS_DIGEST_LEN, TLS_RECORD_APPLICATION_DATA, TLS_RECORD_CHANGE_CIPHER_SPEC,
-    TLS_RECORD_HANDSHAKE, build_faketls_client_hello, build_faketls_server_hello,
-    parse_faketls_client_hello, sign_faketls_client_hello,
+    TLS_RECORD_HANDSHAKE, TLS_TIMESTAMP_TOLERANCE_SECS, build_faketls_client_hello,
+    build_faketls_server_hello, parse_faketls_client_hello, sign_faketls_client_hello,
 };
 
 const TLS_SERVER_RANDOM_OFFSET_IN_PACKET: usize = 11;
+const TLS_DIGEST_POS: usize = 11;
 
 #[test]
 fn signed_client_hello_parses_hostname_and_auth() {
@@ -33,6 +34,32 @@ fn signed_client_hello_rejects_wrong_secret() {
     sign_faketls_client_hello(&mut hello, &good_secret);
 
     assert!(parse_faketls_client_hello(&hello, &bad_secret).is_none());
+}
+
+#[test]
+fn signed_client_hello_rejects_stale_timestamp() {
+    // A captured ClientHello replayed long after it was first sent must be
+    // rejected even though its HMAC is otherwise valid, so an active prober
+    // can't reuse a sniffed handshake indefinitely to probe the proxy.
+    let secret = [0x44; 16];
+    let mut hello = build_faketls_client_hello("www.yandex.ru");
+    sign_faketls_client_hello(&mut hello, &secret);
+
+    // Rewrite the embedded timestamp to well outside the tolerance window
+    // while preserving a valid-looking digest: the timestamp bytes are
+    // XOR'd with the HMAC output, so re-XORing with old and new timestamps
+    // swaps the embedded time without touching the HMAC bytes themselves.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32;
+    let stale = now.wrapping_sub(TLS_TIMESTAMP_TOLERANCE_SECS as u32 * 5);
+
+    for i in 0..4 {
+        hello[TLS_DIGEST_POS + 28 + i] ^= now.to_le_bytes()[i] ^ stale.to_le_bytes()[i];
+    }
+
+    assert!(parse_faketls_client_hello(&hello, &secret).is_none());
 }
 
 #[test]
