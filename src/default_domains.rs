@@ -10,7 +10,7 @@
 //! Reference Python implementation:
 //!   <https://github.com/Flowseal/tg-ws-proxy/blob/main/proxy/config.py#L36>
 
-mod http;
+pub(crate) mod http;
 
 use tracing::warn;
 
