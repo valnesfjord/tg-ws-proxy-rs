@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 // ── File-descriptor budget helpers ───────────────────────────────────────────
 
@@ -72,7 +72,7 @@ fn auto_max_connections(fd_limit: usize, pool_size: usize, dc_buckets: usize) ->
 }
 
 use tg_ws_proxy_rs::{
-    check, config::Config, default_domains, pool::WsPool, proxy, runtime::Runtime,
+    check, config::Config, default_domains, pool::WsPool, proxy, runtime::Runtime, update_check,
 };
 
 #[tokio::main]
@@ -149,6 +149,50 @@ async fn main() {
         std::process::exit(if all_ok { 0 } else { 1 });
     }
 
+    // ── Update check ──────────────────────────────────────────────────────
+    // Always runs, in the background, so a slow/blocked GitHub API call
+    // never delays accepting connections. Failures (no network, rate
+    // limited, unparsable response) are logged at debug level only and
+    // never affect startup — this is purely informational. Results are
+    // cached to disk for an hour (see update_check.rs) so frequent restarts
+    // don't hammer the GitHub API.
+
+    let runtime_for_update = Arc::clone(&runtime);
+    tokio::spawn(async move {
+        match update_check::check_for_update(runtime_for_update.outbound()).await {
+            update_check::UpdateCheck::UpdateAvailable {
+                current,
+                latest,
+                html_url,
+            } => {
+                let link = html_url
+                    .unwrap_or_else(|| format!("{}/releases/latest", env!("CARGO_PKG_REPOSITORY")));
+                info!(
+                    "  A newer version is available: v{} (running v{}). See {}",
+                    latest, current, link
+                );
+            }
+            update_check::UpdateCheck::AheadOfRelease { current, latest } => {
+                debug!(
+                    "Running v{}, ahead of the latest tagged release (v{})",
+                    current, latest
+                );
+            }
+            update_check::UpdateCheck::UpToDate => {
+                info!(
+                    "Running the latest released version (v{})",
+                    env!("CARGO_PKG_VERSION")
+                );
+            }
+            update_check::UpdateCheck::Failed(e) => {
+                // Never surfaced above debug: this must not look like a
+                // real problem (no network, GitHub rate limit, etc. are
+                // all expected and harmless here).
+                debug!("Update check skipped: {}", e);
+            }
+        }
+    });
+
     // ── Bind the server socket ────────────────────────────────────────────
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
         .parse()
@@ -212,6 +256,15 @@ async fn main() {
 
     if config.skip_tls_verify {
         info!("  ⚠  TLS certificate verification DISABLED");
+    }
+
+    if config.proxy_protocol {
+        info!("  ℹ  PROXY protocol v1 expected on every inbound connection");
+    }
+
+    match config.ws_keepalive_interval() {
+        Some(d) => info!("  WS keepalive:  every {:.0}s", d.as_secs_f64()),
+        None => info!("  WS keepalive:  disabled"),
     }
 
     if !config.cf_domains.is_empty() {
