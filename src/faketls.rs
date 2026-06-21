@@ -54,6 +54,16 @@ const TLS_CLIENT_RANDOM_OFFSET_IN_HANDSHAKE: usize = 6;
 const TLS_SERVER_RANDOM_OFFSET_IN_PACKET: usize = 11;
 const TLS_CHANGE_CIPHER_SPEC_VALUE: u8 = 0x01;
 
+/// Maximum allowed clock skew (in either direction) between the timestamp
+/// embedded in a FakeTLS ClientHello and the server's current time.
+///
+/// The last 4 bytes of the (HMAC-authenticated) `random` field carry a
+/// little-endian Unix timestamp XOR'd with the corresponding HMAC bytes.
+/// Rejecting handshakes outside this window prevents a captured ClientHello
+/// from being replayed indefinitely by an active prober. Matches the Python
+/// reference implementation's `TIMESTAMP_TOLERANCE = 120`.
+pub const TLS_TIMESTAMP_TOLERANCE_SECS: u64 = 120;
+
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone, Debug)]
@@ -252,6 +262,20 @@ pub fn parse_faketls_client_hello(record: &[u8], secret: &[u8]) -> Option<FakeTl
         xored[i] = computed[i] ^ client_random[i];
     }
     if xored[..28].iter().any(|&b| b != 0) {
+        return None;
+    }
+
+    // The remaining 4 bytes are the little-endian Unix timestamp the client
+    // signed (see `sign_faketls_client_hello`). Reject handshakes that are
+    // too old or too far in the future — this is what stops a captured
+    // ClientHello from being replayed by an active prober at an arbitrary
+    // later time.
+    let claimed_ts = u32::from_le_bytes([xored[28], xored[29], xored[30], xored[31]]) as i64;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    if (now - claimed_ts).unsigned_abs() > TLS_TIMESTAMP_TOLERANCE_SECS {
         return None;
     }
 

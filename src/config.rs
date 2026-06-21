@@ -163,6 +163,32 @@ pub struct Config {
     #[arg(long = "log-file", value_name = "PATH", env = "TG_LOG_FILE")]
     pub log_file: Option<String>,
 
+    /// Seconds between WebSocket keepalive PINGs sent to the upstream
+    /// (Telegram DC / CF proxy / CF Worker) connection. `0` disables
+    /// keepalive entirely. Keeps idle sessions alive through NAT/firewall
+    /// timeouts that would otherwise silently drop the WS connection.
+    /// Matches the Python reference implementation's `--ws-keepalive`
+    /// (default 30s).
+    #[arg(
+        long = "ws-keepalive",
+        default_value = "30",
+        env = "TG_WS_KEEPALIVE"
+    )]
+    pub ws_keepalive: f64,
+
+    /// Accept a PROXY protocol v1 header (`PROXY TCP4 ...\r\n`) before the
+    /// MTProto/FakeTLS handshake on each inbound connection.
+    ///
+    /// Enable this when the proxy sits behind nginx/haproxy with
+    /// `proxy_protocol on` so that logs and per-client cooldowns use the
+    /// real client IP instead of the reverse proxy's address. Connections
+    /// that don't start with a `PROXY ` line are still served normally
+    /// (the original peer address is kept), matching the Python reference
+    /// implementation's lenient behaviour — only enable this flag when
+    /// every client is guaranteed to send the header.
+    #[arg(long = "proxy-protocol", env = "TG_PROXY_PROTOCOL")]
+    pub proxy_protocol: bool,
+
     /// Upstream MTProto proxy to try when the WebSocket path fails.
     /// Format: `HOST:PORT:SECRET` (32 hex chars).  Can be specified multiple times.
     /// Multiple proxies are tried in order until one succeeds.
@@ -557,6 +583,17 @@ impl Config {
     #[allow(dead_code)]
     pub fn buf_bytes(&self) -> usize {
         self.buf_kb * 1024
+    }
+
+    /// WebSocket keepalive interval as a `Duration`, or `None` when disabled
+    /// (`--ws-keepalive 0`). Mirrors the Python reference implementation's
+    /// `max(1.0, interval)` floor for any positive value.
+    pub fn ws_keepalive_interval(&self) -> Option<std::time::Duration> {
+        if self.ws_keepalive <= 0.0 {
+            None
+        } else {
+            Some(std::time::Duration::from_secs_f64(self.ws_keepalive.max(1.0)))
+        }
     }
 }
 

@@ -40,7 +40,7 @@ use crate::crypto::{
 use crate::faketls::{
     TLS_MAX_RECORD_PAYLOAD, TLS_RECORD_HANDSHAKE, build_faketls_client_hello,
     build_faketls_server_hello, drain_faketls_server_hello, parse_faketls_client_hello,
-    read_tls_appdata, read_tls_record, sign_faketls_client_hello, write_tls_appdata,
+    read_tls_appdata, sign_faketls_client_hello, write_tls_appdata,
 };
 use crate::outbound::OutboundConnector;
 use crate::pool::WsPool;
@@ -281,26 +281,76 @@ impl ClientWriter {
     }
 }
 
+/// Outcome of reading the inbound handshake on a connection.
+///
+/// When `--listen-faketls-domain` is enabled, a connection that doesn't
+/// present a valid, freshly-signed ClientHello for the expected domain is
+/// not simply dropped — it is treated the way a real webserver fronting
+/// that domain would treat it, so that active probing (a censor connecting
+/// and inspecting the response) cannot distinguish this proxy from a
+/// genuine HTTPS endpoint. Mirrors the Python reference implementation's
+/// `proxy_to_masking_domain` / HTTP-redirect fallback in `_read_client_init`.
+enum InboundHandshake {
+    /// A valid 64-byte MTProto obfuscation init was recovered; proceed with
+    /// the normal MTProto routing logic.
+    Handshake([u8; 64], Vec<u8>),
+    /// The client sent what looks like a TLS ClientHello but it failed
+    /// FakeTLS authentication (no secret's HMAC matched, expired/replayed
+    /// timestamp, or wrong SNI). Carries the raw bytes already read from the
+    /// socket so they can be replayed to the real masking domain.
+    Masquerade(Vec<u8>),
+    /// The very first byte wasn't a TLS record at all (e.g. a bare HTTP
+    /// probe). No FakeTLS bytes were consumed beyond that one byte.
+    PlaintextProbe,
+}
+
 async fn accept_inbound_faketls(
     label: &str,
     reader: &mut TcpReader,
     writer: &mut TcpWriter,
     secrets: &[Vec<u8>],
     expected_domain: &str,
-) -> Option<([u8; 64], Vec<u8>)> {
-    let (record_type, version, payload) = read_tls_record(reader, TLS_MAX_RECORD_PAYLOAD + 256)
-        .await
-        .ok()??;
-    if record_type != TLS_RECORD_HANDSHAKE || version != [0x03, 0x01] {
-        debug!("[{}] bad FakeTLS ClientHello record", label);
+) -> Option<InboundHandshake> {
+    // Peek the record-type byte before committing to reading a full TLS
+    // record, so a bare non-TLS probe (e.g. a plain HTTP request) can be
+    // answered immediately instead of blocking on a payload length derived
+    // from garbage bytes that may never fully arrive.
+    let mut record_type = [0u8; 1];
+    if reader.read_exact(&mut record_type).await.is_err() {
+        return None;
+    }
+
+    if record_type[0] != TLS_RECORD_HANDSHAKE {
+        debug!(
+            "[{}] non-TLS byte 0x{:02X} on FakeTLS listener -> masking",
+            label, record_type[0]
+        );
+        return Some(InboundHandshake::PlaintextProbe);
+    }
+
+    let mut rest = [0u8; 4];
+    if reader.read_exact(&mut rest).await.is_err() {
+        return None;
+    }
+    let version = [rest[0], rest[1]];
+    let payload_len = u16::from_be_bytes([rest[2], rest[3]]) as usize;
+    if payload_len > TLS_MAX_RECORD_PAYLOAD + 256 {
+        return None;
+    }
+    let mut payload = vec![0u8; payload_len];
+    if reader.read_exact(&mut payload).await.is_err() {
         return None;
     }
 
     let mut record = Vec::with_capacity(5 + payload.len());
-    record.push(record_type);
-    record.extend_from_slice(&version);
-    record.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    record.push(record_type[0]);
+    record.extend_from_slice(&rest);
     record.extend_from_slice(&payload);
+
+    if version != [0x03, 0x01] {
+        debug!("[{}] bad FakeTLS ClientHello record version", label);
+        return Some(InboundHandshake::Masquerade(record));
+    }
 
     let (hello, matched_secret) = match secrets
         .iter()
@@ -308,8 +358,8 @@ async fn accept_inbound_faketls(
     {
         Some(v) => v,
         None => {
-            debug!("[{}] bad FakeTLS ClientHello digest", label);
-            return None;
+            debug!("[{}] bad FakeTLS ClientHello digest/timestamp", label);
+            return Some(InboundHandshake::Masquerade(record));
         }
     };
 
@@ -318,7 +368,7 @@ async fn accept_inbound_faketls(
             "[{}] FakeTLS SNI mismatch: got {:?}, expected {}",
             label, hello.hostname, expected_domain
         );
-        return None;
+        return Some(InboundHandshake::Masquerade(record));
     }
 
     let server_hello = build_faketls_server_hello(matched_secret, &hello);
@@ -341,13 +391,135 @@ async fn accept_inbound_faketls(
         filled += take;
         if take != n {
             if before == 0 {
-                return split_mtproto_init_and_pending(&buf[..n]);
+                return split_mtproto_init_and_pending(&buf[..n])
+                    .map(|(h, p)| InboundHandshake::Handshake(h, p));
             }
-            return Some((handshake_buf, buf[take..n].to_vec()));
+            return Some(InboundHandshake::Handshake(
+                handshake_buf,
+                buf[take..n].to_vec(),
+            ));
         }
     }
 
-    Some((handshake_buf, Vec::new()))
+    Some(InboundHandshake::Handshake(handshake_buf, Vec::new()))
+}
+
+/// Transparently relay a misauthenticated FakeTLS connection to the real
+/// masking domain over plain TCP, so an active prober sees a normal-looking
+/// HTTPS session to that domain rather than an instant connection reset or a
+/// behaviour distinguishable from a real webserver. `initial` is the raw
+/// bytes already read from the client (the TLS record that failed
+/// authentication) and is forwarded first. Routed through the shared
+/// [`OutboundConnector`] so it honours `--outbound-proxy` like every other
+/// outgoing connection this proxy makes. Mirrors the Python reference
+/// implementation's `proxy_to_masking_domain`.
+async fn masquerade_to_domain(
+    label: &str,
+    mut client_reader: TcpReader,
+    mut client_writer: TcpWriter,
+    initial: Vec<u8>,
+    domain: &str,
+    outbound: &OutboundConnector,
+) {
+    if domain.is_empty() {
+        return;
+    }
+
+    let upstream = match outbound.connect(domain, 443, Duration::from_secs(10)).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            debug!("[{}] masking: cannot connect to {}:443: {}", label, domain, e);
+            return;
+        }
+    };
+
+    debug!("[{}] masking -> {}:443", label, domain);
+    let _ = upstream.set_nodelay(true);
+    let (mut up_reader, mut up_writer) = tokio::io::split(upstream);
+
+    if !initial.is_empty() && up_writer.write_all(&initial).await.is_err() {
+        return;
+    }
+
+    let start = std::time::Instant::now();
+
+    // Mirror bridge_tcp's spawn-per-direction structure: each task owns its
+    // half of the relay outright, so neither blocks the other and the whole
+    // session unwinds promptly once either side hangs up.
+    let mut upload = tokio::spawn(async move {
+        let mut buf = vec![0u8; 16384];
+        let mut total = 0u64;
+        loop {
+            let n = match client_reader.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if up_writer.write_all(&buf[..n]).await.is_err() {
+                break;
+            }
+            total += n as u64;
+        }
+        total
+    });
+
+    let mut download = tokio::spawn(async move {
+        let mut buf = vec![0u8; 16384];
+        let mut total = 0u64;
+        loop {
+            let n = match up_reader.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if client_writer.write_all(&buf[..n]).await.is_err() {
+                break;
+            }
+            total += n as u64;
+        }
+        total
+    });
+
+    let (bytes_up, bytes_down) = tokio::select! {
+        result = &mut upload => {
+            let up = result.unwrap_or(0);
+            download.abort();
+            let down = download.await.unwrap_or(0);
+            (up, down)
+        }
+        result = &mut download => {
+            let down = result.unwrap_or(0);
+            upload.abort();
+            let up = upload.await.unwrap_or(0);
+            (up, down)
+        }
+    };
+
+    debug!(
+        "[{}] masking session to {} closed: ↑{}  ↓{}  {:.1}s",
+        label,
+        domain,
+        human_bytes(bytes_up),
+        human_bytes(bytes_down),
+        start.elapsed().as_secs_f32()
+    );
+}
+
+/// Respond to a bare (non-TLS) probe on the FakeTLS port the way a real
+/// webserver fronting `domain` would respond to a plaintext HTTP request on
+/// its HTTPS port: redirect to the HTTPS site. Mirrors the Python reference
+/// implementation's plaintext-probe handling in `_read_client_init`.
+async fn send_masking_redirect(writer: &mut TcpWriter, domain: &str) {
+    if domain.is_empty() {
+        let _ = writer.shutdown().await;
+        return;
+    }
+    let body = format!(
+        "HTTP/1.1 301 Moved Permanently\r\n\
+         Location: https://{domain}/\r\n\
+         Content-Length: 0\r\n\
+         Connection: close\r\n\r\n"
+    );
+    let _ = writer.write_all(body.as_bytes()).await;
+    let _ = writer.shutdown().await;
 }
 
 // ─── Client handler ──────────────────────────────────────────────────────────
@@ -378,12 +550,13 @@ pub async fn handle_client_with_runtime(
     pool: Arc<WsPool>,
     runtime: Arc<Runtime>,
 ) {
-    let label = peer.to_string();
+    let mut label = peer.to_string();
     let _ = stream.set_nodelay(true);
 
     let secrets = config.secret_bytes_list();
     let dc_redirects = config.dc_redirects();
     let skip_tls = config.skip_tls_verify;
+    let keepalive_interval = config.ws_keepalive_interval();
 
     // ── Timeouts / cooldowns from config ─────────────────────────────────
     let ws_connect_timeout = Duration::from_secs(config.ws_connect_timeout);
@@ -400,6 +573,33 @@ pub async fn handle_client_with_runtime(
     // Split into independent read / write halves.
     let (mut reader, mut writer) = tokio::io::split(stream);
 
+    // ── Step 0: optional PROXY protocol v1 header ─────────────────────────
+    // When running behind nginx/haproxy with `proxy_protocol on`, every
+    // connection is prefixed with a `PROXY TCP4 src dst sport dport\r\n`
+    // line carrying the real client address. Consume it here so the rest of
+    // the handshake reads the actual MTProto/FakeTLS bytes.
+    if config.proxy_protocol {
+        match tokio::time::timeout(Duration::from_secs(10), read_proxy_protocol_line(&mut reader))
+            .await
+        {
+            Ok(Ok(Some(real_label))) => {
+                debug!("[{}] PROXY protocol: {}", label, real_label);
+                label = real_label;
+            }
+            Ok(Ok(None)) => {
+                debug!("[{}] expected PROXY protocol header, none found", label);
+            }
+            Ok(Err(_)) => {
+                debug!("[{}] disconnected during PROXY header", label);
+                return;
+            }
+            Err(_) => {
+                debug!("[{}] timeout reading PROXY header", label);
+                return;
+            }
+        }
+    }
+
     // ── Step 1: read the 64-byte MTProto obfuscation init ────────────────
     let inbound_faketls_domain = config.listen_faketls_domain();
     let (handshake_buf, faketls_pending) = match tokio::time::timeout(
@@ -414,7 +614,35 @@ pub async fn handle_client_with_runtime(
     )
     .await
     {
-        Ok(Some(result)) => result,
+        Ok(Some(InboundHandshake::Handshake(h, p))) => (h, p),
+        Ok(Some(InboundHandshake::Masquerade(initial))) => {
+            // The client presented something TLS-shaped but it didn't
+            // authenticate against any configured secret (wrong key,
+            // replayed/expired timestamp, or wrong SNI). Rather than
+            // dropping the connection — which an active prober could use to
+            // fingerprint this proxy — transparently relay it to the real
+            // masking domain so it looks exactly like a normal HTTPS
+            // session to that site.
+            let domain = inbound_faketls_domain.as_deref().unwrap_or("");
+            info!(
+                "[{}] FakeTLS verification failed -> masking to {}",
+                label, domain
+            );
+            masquerade_to_domain(&label, reader, writer, initial, domain, runtime.outbound())
+                .await;
+            return;
+        }
+        Ok(Some(InboundHandshake::PlaintextProbe)) => {
+            // A bare non-TLS request on the FakeTLS port — answer the way a
+            // real webserver fronting the masking domain would.
+            let domain = inbound_faketls_domain.as_deref().unwrap_or("");
+            debug!(
+                "[{}] plaintext probe on FakeTLS listener -> redirect to {}",
+                label, domain
+            );
+            send_masking_redirect(&mut writer, domain).await;
+            return;
+        }
         Ok(None) => return,
         Err(_) => {
             debug!("[{}] handshake timeout", label);
@@ -547,6 +775,7 @@ pub async fn handle_client_with_runtime(
                             proto,
                             dc: dc_id,
                             is_media,
+                            keepalive_interval,
                         },
                     )
                     .await;
@@ -605,6 +834,7 @@ pub async fn handle_client_with_runtime(
                             proto,
                             dc: dc_id,
                             is_media,
+                            keepalive_interval,
                         },
                     )
                     .await;
@@ -787,6 +1017,7 @@ pub async fn handle_client_with_runtime(
                         proto,
                         dc: dc_id,
                         is_media,
+                        keepalive_interval,
                     },
                 )
                 .await;
@@ -914,6 +1145,7 @@ pub async fn handle_client_with_runtime(
                                     proto,
                                     dc: dc_id,
                                     is_media,
+                                    keepalive_interval,
                                 },
                             )
                             .await;
@@ -970,6 +1202,7 @@ pub async fn handle_client_with_runtime(
                                     proto,
                                     dc: dc_id,
                                     is_media,
+                                    keepalive_interval,
                                 },
                             )
                             .await;
@@ -1144,6 +1377,7 @@ pub async fn handle_client_with_runtime(
             proto,
             dc: dc_id,
             is_media,
+            keepalive_interval,
         },
     )
     .await;
@@ -1166,6 +1400,7 @@ struct WsBridgeParams<'a> {
     proto: crate::crypto::ProtoTag,
     dc: u32,
     is_media: bool,
+    keepalive_interval: Option<Duration>,
 }
 
 async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeParams<'_>) {
@@ -1177,6 +1412,7 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
         proto,
         dc,
         is_media,
+        keepalive_interval,
     } = params;
 
     // Send the relay init packet to Telegram before bridging.
@@ -1213,8 +1449,36 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
             let mut buf = vec![0u8; 65536];
             let mut total = 0u64;
 
+            // Periodic WS PING frames keep the upstream connection alive
+            // through NATs/firewalls that silently drop idle TCP flows.
+            // Mirrors the Python reference implementation's `_ws_keepalive`
+            // task: the loop exits as soon as a PING send fails, so a dead
+            // upstream is detected promptly instead of lingering until the
+            // next client packet.
+            let mut keepalive_timer = keepalive_interval.map(tokio::time::interval);
+            if let Some(timer) = keepalive_timer.as_mut() {
+                // The first tick of a freshly created interval fires
+                // immediately; consume it so the first PING is sent after a
+                // full interval has elapsed, not right at connection start.
+                timer.tick().await;
+            }
+
             loop {
-                let n = match reader.read(&mut buf).await {
+                let read_result = if let Some(timer) = keepalive_timer.as_mut() {
+                    tokio::select! {
+                        result = reader.read(&mut buf) => result,
+                        _ = timer.tick() => {
+                            if ws_sink.send(Message::Ping(Vec::new())).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                } else {
+                    reader.read(&mut buf).await
+                };
+
+                let n = match read_result {
                     Ok(0) | Err(_) => break,
                     Ok(n) => n,
                 };
@@ -1819,19 +2083,61 @@ async fn read_inbound_handshake(
     writer: &mut TcpWriter,
     secrets: &[Vec<u8>],
     faketls_domain: Option<&str>,
-) -> Option<([u8; 64], Vec<u8>)> {
+) -> Option<InboundHandshake> {
     if let Some(domain) = faketls_domain {
         return accept_inbound_faketls(label, reader, writer, secrets, domain).await;
     }
 
     let mut handshake_buf = [0u8; 64];
     match reader.read_exact(&mut handshake_buf).await {
-        Ok(_) => Some((handshake_buf, Vec::new())),
+        Ok(_) => Some(InboundHandshake::Handshake(handshake_buf, Vec::new())),
         Err(e) => {
             debug!("[{}] read handshake: {}", label, e);
             None
         }
     }
+}
+
+/// Read a PROXY protocol v1 header line (`PROXY TCP4 src dst sport dport\r\n`)
+/// and return the parsed `src_ip:src_port` label.
+///
+/// - `Ok(Some(label))`: a well-formed `PROXY ` line was parsed.
+/// - `Ok(None)`: a line was read but it wasn't a `PROXY ` header — the
+///   caller keeps using the original peer address. This mirrors the Python
+///   reference implementation, which only logs a warning in this case
+///   rather than dropping the connection; `--proxy-protocol` is only meant
+///   to be enabled behind a trusted reverse proxy that always sends the
+///   header, so this leniency is intentional.
+/// - `Err(_)`: the socket closed or errored while reading the header.
+async fn read_proxy_protocol_line(reader: &mut TcpReader) -> std::io::Result<Option<String>> {
+    const MAX_LINE: usize = 256;
+    let mut line = Vec::with_capacity(64);
+    let mut byte = [0u8; 1];
+    loop {
+        reader.read_exact(&mut byte).await?;
+        if byte[0] == b'\n' {
+            break;
+        }
+        line.push(byte[0]);
+        if line.len() > MAX_LINE {
+            return Ok(None);
+        }
+    }
+
+    let text = String::from_utf8_lossy(&line);
+    let text = text.trim_end_matches('\r');
+    if !text.starts_with("PROXY ") {
+        return Ok(None);
+    }
+
+    // "PROXY" "TCP4"/"TCP6"/"UNKNOWN" src_ip dst_ip src_port dst_port
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    if parts.len() < 5 {
+        return Ok(None);
+    }
+    let src_ip = parts[2];
+    let src_port = parts[4];
+    Ok(Some(format!("{}:{}", src_ip, src_port)))
 }
 
 pub fn split_mtproto_init_and_pending(data: &[u8]) -> Option<([u8; 64], Vec<u8>)> {
