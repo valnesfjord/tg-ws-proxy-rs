@@ -723,6 +723,59 @@ pub async fn handle_client_with_runtime(
             }
         }
 
+        // ── Try domain fronting (SNI spoofing) as a last resort before the
+        // TCP fallback below. Direct TCP to Telegram's real IP is dead
+        // weight for anyone relying on CF/worker/upstream in the first
+        // place — they're almost certainly here because direct Telegram is
+        // blocked outright — whereas fronting has an actual chance of
+        // getting through SNI-based DPI, using the same fallback IP the TCP
+        // attempt below would otherwise use.
+        if let Some(domain) = runtime.fronting_domain() {
+            info!(
+                "[{}] DC{}{} {} → trying fronting (SNI {})",
+                label, dc_id, media_tag, reason, domain
+            );
+
+            let (front_opt, _all_redirects, _timed_out) = connect_ws_for_dc_with_outbound(
+                &fallback,
+                ws_dc,
+                is_media,
+                skip_tls,
+                ws_connect_timeout,
+                runtime.outbound(),
+                Some(domain),
+            )
+            .await;
+
+            if let Some(ws) = front_opt {
+                runtime.activate_fronting();
+                info!(
+                    "[{}] DC{}{} {} → fronting connected (SNI {})",
+                    label, dc_id, media_tag, reason, domain
+                );
+                bridge_ws(
+                    reader,
+                    writer,
+                    WsBridgeParams {
+                        label: &label,
+                        ws,
+                        relay_init,
+                        ciphers,
+                        proto,
+                        dc: dc_id,
+                        is_media,
+                    },
+                )
+                .await;
+                return;
+            } else {
+                warn!(
+                    "[{}] DC{}{} fronting fallback failed",
+                    label, dc_id, media_tag
+                );
+            }
+        }
+
         info!("[{}] {} → TCP fallback {}:443", label, reason, fallback);
 
         bridge_tcp(

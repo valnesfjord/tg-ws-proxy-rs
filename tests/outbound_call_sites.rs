@@ -259,6 +259,55 @@ async fn proxy_tcp_fallback_uses_outbound_proxy() {
     assert!(request.starts_with("CONNECT 149.154.167.51:443 HTTP/1.1"));
 }
 
+#[tokio::test]
+async fn proxy_tries_fronting_before_tcp_fallback_when_dc_ip_is_unconfigured() {
+    // Regression test for issue #81: fronting was only wired into the
+    // `--dc-ip`-configured branch, making it unreachable for the far more
+    // common case of relying solely on --cf-domain/--default-domains (which
+    // suppresses the built-in --dc-ip defaults, see Config::from_args).
+    // With no CF domain/worker/upstream proxy configured, WS trying to reach
+    // Telegram directly is expected to fail (no real DC connectivity in this
+    // test), so the flow should now attempt a fronted WS connect (SNI
+    // override) before falling through to the plain TCP fallback below it —
+    // both attempts open a fresh outbound TCP connection, so the rejecting
+    // proxy should see exactly 2 CONNECT requests instead of 1.
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests(2).await;
+    let config = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--secret",
+        "00112233445566778899aabbccddeeff",
+        "--fronting-domain",
+        "sprinthost.ru",
+        "--outbound-proxy",
+        &format!("http://{proxy_addr}"),
+        "--no-outbound-proxy",
+        "--no-proxy",
+        "",
+        "--handshake-timeout",
+        "2",
+        "--ws-connect-timeout",
+        "2",
+        "--tcp-fallback-timeout",
+        "2",
+    ])
+    .unwrap();
+
+    run_proxy_once(config).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected a fronting attempt followed by the TCP fallback, got {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.starts_with("CONNECT 149.154.167.51:443 HTTP/1.1")),
+        "both attempts should target the same fallback DC IP, got {requests:?}"
+    );
+}
+
 async fn rejecting_http_proxy() -> (std::net::SocketAddr, tokio::task::JoinHandle<String>) {
     let (addr, task) = rejecting_http_proxy_requests(1).await;
     let task = tokio::spawn(async move { await_proxy_requests(task).await.remove(0) });
@@ -352,7 +401,10 @@ async fn read_http_connect_request(stream: &mut TcpStream) -> String {
 async fn run_proxy_once(config: Config) {
     let secret = config.secret_bytes();
     let outbound = config.outbound_connector().unwrap();
-    let runtime = Arc::new(Runtime::new(outbound));
+    let runtime = Arc::new(Runtime::new(outbound).with_fronting(
+        config.fronting_domain.clone(),
+        Duration::from_secs(config.fronting_cooldown),
+    ));
     let pool = Arc::new(WsPool::with_runtime(
         0,
         Duration::from_secs(config.pool_max_age),

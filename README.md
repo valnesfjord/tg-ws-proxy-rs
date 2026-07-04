@@ -451,12 +451,20 @@ refills) for `--fronting-cooldown` seconds (default 1800 = 30 min), so the
 proxy doesn't keep re-probing the likely-still-blocked direct path on every
 new connection.
 
+Fronting is tried in two places: right after a direct WebSocket attempt times
+out (when `--dc-ip` is configured for that DC), and — since most setups rely
+on `--cf-domain`/`--default-domains` instead of `--dc-ip` — as a last resort
+after CF Worker/CF proxy/upstream proxy fallbacks are exhausted, before the
+proxy would otherwise fall through to a plain direct TCP connection (which is
+normally dead weight for anyone who needed a CF fallback in the first place,
+since direct Telegram connectivity is usually what's blocked for them).
+
 > **Note:** TLS certificate verification is unconditionally skipped on
 > connections using this fallback, regardless of
 > `--danger-accept-invalid-certs` — the real Telegram certificate can never
 > match a fronted SNI, so hostname verification would always fail. This is
-> inherent to the technique, not a bug, and only applies to the direct-WS
-> fallback path (not CF proxy/Worker connections).
+> inherent to the technique, not a bug, and only applies to fronted
+> connections (not CF proxy/Worker connections).
 
 ### Default domains
 
