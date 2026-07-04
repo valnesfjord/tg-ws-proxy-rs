@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use tungstenite::Message;
 
 use crate::config::Config;
@@ -178,6 +178,15 @@ impl WsPool {
     /// to a client, bounding the wait instead of trusting a passive check.
     /// See the module-level docs for why this matters.
     async fn is_alive(ws: &mut TgWsStream, timeout: Duration) -> bool {
+        if timeout.is_zero() {
+            // `--pool-liveness-timeout 0` opts out of the active probe for
+            // callers who'd rather not pay even a small per-hit RTT cost.
+            // Fall back to the pre-existing passive check: it only catches a
+            // connection that already sent a close/error frame, not a
+            // silently dead one — see the module docs.
+            return ws.next().now_or_never().is_none();
+        }
+
         if ws.send(Message::Ping(Vec::new())).await.is_err() {
             return false;
         }
@@ -420,6 +429,34 @@ mod tests {
         assert!(
             result.is_some(),
             "a connection that answers the ping should still be handed out"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn zero_liveness_timeout_skips_the_active_probe() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Server never sends anything — with the active probe this would be
+        // discarded, but a liveness_timeout of 0 opts back into the old
+        // passive-only check, which has nothing to detect here (no
+        // close/error frame was ever sent), so the entry is handed out as-is.
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let _ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let pool = make_pool(Duration::ZERO);
+        seed_entry(&pool, 2, false, connect_plain_ws(addr).await).await;
+
+        let result = pool.get(2, false, "203.0.113.10".to_string(), false).await;
+
+        assert!(
+            result.is_some(),
+            "pool-liveness-timeout=0 should skip the active probe entirely"
         );
 
         server.abort();

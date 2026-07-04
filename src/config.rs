@@ -368,6 +368,12 @@ pub struct Config {
     /// (commonly 15-30s). This bounds that to a short, predictable wait
     /// instead. Raise it if you see spurious pool discards on a
     /// high-latency path to your configured DC IPs.
+    ///
+    /// Set to `0` to disable the active probe and fall back to the old
+    /// passive check, which only catches a connection that already sent a
+    /// close/error frame (i.e. the silent-death case above goes undetected
+    /// again). Useful if the extra per-hit round trip is undesirable and you
+    /// don't hit the failure mode this exists for.
     #[arg(
         long = "pool-liveness-timeout",
         default_value = "1",
