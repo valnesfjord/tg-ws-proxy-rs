@@ -358,6 +358,23 @@ pub struct Config {
     #[arg(long = "pool-max-age", default_value = "55", env = "TG_POOL_MAX_AGE")]
     pub pool_max_age: u64,
 
+    /// Timeout in seconds for the active liveness probe (a WebSocket ping)
+    /// performed on a pooled connection before it is handed to a client.
+    ///
+    /// A pooled connection can go silently dead (e.g. a NAT/firewall mapping
+    /// expiring while the client machine was asleep) without either side
+    /// seeing a close — handing it out as-is would only surface the failure
+    /// once real traffic hits an OS-level TCP retransmission timeout
+    /// (commonly 15-30s). This bounds that to a short, predictable wait
+    /// instead. Raise it if you see spurious pool discards on a
+    /// high-latency path to your configured DC IPs.
+    #[arg(
+        long = "pool-liveness-timeout",
+        default_value = "1",
+        env = "TG_POOL_LIVENESS_TIMEOUT"
+    )]
+    pub pool_liveness_timeout: u64,
+
     /// Test configured Cloudflare proxy domains and upstream MTProto proxies
     /// for suitability, then exit.
     ///

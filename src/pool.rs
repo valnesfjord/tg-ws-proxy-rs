@@ -6,6 +6,19 @@
 //!
 //! The pool is keyed by `(dc_id, is_media)`.  Background refill tasks run
 //! after each pool hit to keep the bucket at `pool_size` connections.
+//!
+//! ## Active liveness check
+//!
+//! A pooled connection can go silently dead without either side ever seeing a
+//! FIN/RST — e.g. a NAT/firewall mapping between us and Telegram expiring
+//! while the *client* machine was asleep for a long stretch has nothing to do
+//! with our end of the socket, so it looks perfectly fine to a passive check.
+//! If such a connection were handed to a client, the first real write (the
+//! relay-init packet) would sit in the OS send buffer until a TCP
+//! retransmission timeout gives up — commonly 15-30s — before the caller
+//! finds out. `get()` instead sends a WS ping and bounds the wait for any
+//! response to `pool_liveness_timeout`, so a dead entry is caught and
+//! discarded quickly instead of stalling the client's request.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -15,12 +28,17 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use futures_util::{FutureExt, StreamExt};
+use futures_util::{SinkExt, StreamExt};
+use tungstenite::Message;
 
 use crate::config::Config;
 use crate::outbound::OutboundConnector;
 use crate::runtime::Runtime;
 use crate::ws_client::{TgWsStream, connect_ws_for_dc_with_outbound};
+
+/// Default bound on the active liveness probe when a pool is built via
+/// [`WsPool::new`] without an explicit timeout (see `with_runtime`).
+const DEFAULT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(1);
 
 struct PoolEntry {
     ws: TgWsStream,
@@ -35,6 +53,9 @@ pub struct WsPool {
     /// Maximum age for a pooled connection.  Connections older than this are
     /// discarded on next use rather than handed to a client.
     max_age: Duration,
+    /// Bound on the active liveness probe performed in `get()` before a
+    /// pooled connection is handed to a client. See the module docs.
+    liveness_timeout: Duration,
     runtime: Arc<Runtime>,
     idle: Mutex<PoolMap>,
     /// Tracks which (dc, is_media) buckets currently have a refill in flight.
@@ -71,19 +92,29 @@ impl WsPool {
     }
 
     pub fn with_runtime(pool_size: usize, max_age: Duration, runtime: Arc<Runtime>) -> Self {
+        Self::with_liveness_timeout(pool_size, max_age, DEFAULT_LIVENESS_TIMEOUT, runtime)
+    }
+
+    pub fn with_liveness_timeout(
+        pool_size: usize,
+        max_age: Duration,
+        liveness_timeout: Duration,
+        runtime: Arc<Runtime>,
+    ) -> Self {
         Self {
             pool_size,
             max_age,
+            liveness_timeout,
             runtime,
             idle: Mutex::new(HashMap::new()),
             refilling: StdMutex::new(HashSet::new()),
         }
     }
 
-    /// Take a pre-warmed connection from the pool, if available and fresh.
+    /// Take a pre-warmed connection from the pool, if available and live.
     ///
     /// Returns `Some(ws)` on a pool hit, `None` if the bucket is empty or
-    /// all entries were stale.  Schedules a background refill either way.
+    /// every entry was stale/dead.  Schedules a background refill either way.
     pub async fn get(
         self: &Arc<Self>,
         dc: u32,
@@ -92,39 +123,38 @@ impl WsPool {
         skip_tls_verify: bool,
     ) -> Option<TgWsStream> {
         let now = Instant::now();
-        let mut lock = self.idle.lock().await;
-        let bucket = lock.entry((dc, is_media)).or_default();
 
-        // Drain from the back (LIFO) so the freshest connections are used first.
-        while let Some(mut entry) = bucket.pop() {
+        loop {
+            // Pop one candidate at a time and release the lock before the
+            // (potentially slow) liveness check below, so a dead entry on one
+            // bucket doesn't stall `get()` calls for every other DC/media
+            // bucket, which all share this single mutex.
+            let mut entry = {
+                let mut lock = self.idle.lock().await;
+                match lock.entry((dc, is_media)).or_default().pop() {
+                    Some(entry) => entry,
+                    None => break,
+                }
+            };
+
             if now.saturating_duration_since(entry.created) > self.max_age {
                 // Entry is stale; drop it (close happens on drop via tungstenite).
                 continue;
             }
 
-            // Non-blocking liveness check: if the server has already closed the
-            // WebSocket (TCP FIN received), `next()` resolves immediately with
-            // `None` or an error.  Any message arriving on an idle pre-warmed
-            // connection (close, error, or unexpected data) is treated as a sign
-            // that the connection is in an invalid state and should be discarded.
-            if entry.ws.next().now_or_never().is_some() {
+            if !Self::is_alive(&mut entry.ws, self.liveness_timeout).await {
+                // Covers both an already-closed connection (the check returns
+                // near-instantly) and a silently dead one that never answers
+                // within `liveness_timeout` — see the module docs.
                 debug!(
-                    "pool: discarding stale DC{}{} connection",
+                    "pool: discarding dead DC{}{} connection",
                     dc,
                     if is_media { "m" } else { "" }
                 );
                 continue;
             }
 
-            let remaining = bucket.len();
-            drop(lock);
-
-            debug!(
-                "pool hit DC{}{} ({} left)",
-                dc,
-                if is_media { "m" } else { "" },
-                remaining
-            );
+            debug!("pool hit DC{}{}", dc, if is_media { "m" } else { "" });
 
             // Schedule a background task to refill the bucket.
             let pool = Arc::clone(self);
@@ -135,15 +165,30 @@ impl WsPool {
             return Some(entry.ws);
         }
 
-        // Bucket is empty (or fully stale).
-        drop(lock);
-
+        // Bucket is empty (or every entry was stale/dead).
         let pool = Arc::clone(self);
         tokio::spawn(async move {
             pool.refill(dc, is_media, target_ip, skip_tls_verify).await;
         });
 
         None
+    }
+
+    /// Actively verify a pooled connection is still usable before handing it
+    /// to a client, bounding the wait instead of trusting a passive check.
+    /// See the module-level docs for why this matters.
+    async fn is_alive(ws: &mut TgWsStream, timeout: Duration) -> bool {
+        if ws.send(Message::Ping(Vec::new())).await.is_err() {
+            return false;
+        }
+
+        // Any successfully received frame (a Pong, or anything else) proves
+        // the round trip to Telegram still works.  Timing out, an error, or
+        // a graceful close all mean the entry cannot be trusted.
+        matches!(
+            tokio::time::timeout(timeout, ws.next()).await,
+            Ok(Some(Ok(_)))
+        )
     }
 
     /// Warm up the pool for all configured DCs on startup.
@@ -275,5 +320,108 @@ impl WsPool {
             }
         }
         results
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::MaybeTlsStream;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    /// Connect a plain (non-TLS) `TgWsStream` to a local WS server, wrapped
+    /// in `MaybeTlsStream::Plain` so the type matches production pooled
+    /// entries without needing a real TLS handshake in tests.
+    async fn connect_plain_ws(addr: std::net::SocketAddr) -> TgWsStream {
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!("ws://{addr}/apiws").into_client_request().unwrap();
+        let (ws, _response) = tokio_tungstenite::client_async(request, MaybeTlsStream::Plain(tcp))
+            .await
+            .unwrap();
+        ws
+    }
+
+    fn make_pool(liveness_timeout: Duration) -> Arc<WsPool> {
+        Arc::new(WsPool::with_liveness_timeout(
+            1,
+            Duration::from_secs(60),
+            liveness_timeout,
+            Arc::new(Runtime::new(OutboundConnector::direct())),
+        ))
+    }
+
+    async fn seed_entry(pool: &Arc<WsPool>, dc: u32, is_media: bool, ws: TgWsStream) {
+        pool.idle
+            .lock()
+            .await
+            .entry((dc, is_media))
+            .or_default()
+            .push(PoolEntry {
+                ws,
+                created: Instant::now(),
+            });
+    }
+
+    #[tokio::test]
+    async fn get_discards_a_silently_dead_connection_within_the_liveness_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Server accepts the WS upgrade, then goes silent — never reads or
+        // writes again, simulating a connection that's dead from Telegram's
+        // side without ever sending a close frame.
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let _ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let pool = make_pool(Duration::from_millis(150));
+        seed_entry(&pool, 2, false, connect_plain_ws(addr).await).await;
+
+        let start = Instant::now();
+        let result = pool.get(2, false, "203.0.113.10".to_string(), false).await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_none(), "dead connection should be discarded");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "get() took {elapsed:?}, should bail out within the liveness timeout"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn get_returns_a_connection_that_answers_the_liveness_ping() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Server accepts the WS upgrade, reads the incoming ping, and
+        // explicitly replies with a Pong so the client-side liveness check
+        // sees a real flushed response rather than relying on tungstenite's
+        // internal auto-queued reply (which isn't flushed until the next
+        // write anyway).
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            if let Some(Ok(Message::Ping(payload))) = ws.next().await {
+                let _ = ws.send(Message::Pong(payload)).await;
+            }
+            std::future::pending::<()>().await;
+        });
+
+        let pool = make_pool(Duration::from_millis(500));
+        seed_entry(&pool, 2, false, connect_plain_ws(addr).await).await;
+
+        let result = pool.get(2, false, "203.0.113.10".to_string(), false).await;
+
+        assert!(
+            result.is_some(),
+            "a connection that answers the ping should still be handed out"
+        );
+
+        server.abort();
     }
 }

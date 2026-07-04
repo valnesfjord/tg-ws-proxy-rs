@@ -100,6 +100,7 @@ tg-ws-proxy [OPTIONS]
 | `--dc-ip <DC:IP>` | DC2 + DC4 | Target IP per DC (repeatable); omit when using `--cf-domain` to let CF proxy handle all DCs |
 | `--buf-kb <KB>` | `256` | Socket buffer size |
 | `--pool-size <N>` | `4` | Pre-warmed WS connections per DC |
+| `--pool-liveness-timeout <SECS>` | `1` | Bound on the active ping check before handing a pooled connection to a client — catches connections that silently died (e.g. a NAT mapping expiring during a long client idle period) instead of stalling on a TCP retransmission timeout |
 | `--cf-domain <DOMAIN>` | — | Cloudflare-proxied domain(s) for alternative WS routing, comma-separated (see [CF Proxy](#cloudflare-proxy)) |
 | `--cf-worker-domain <DOMAIN>` | — | Cloudflare Worker domain(s) for TCP-tunnel fallback, comma-separated/repeatable (see [Cloudflare Worker](#cloudflare-worker)) |
 | `--default-domains` | off | Fetch and use the built-in CF proxy domain list from GitHub (no Cloudflare setup needed, see [Default domains](#default-domains)) |
@@ -118,7 +119,7 @@ tg-ws-proxy [OPTIONS]
 | `--danger-accept-invalid-certs` | off | Skip TLS verification |
 
 Every flag has a matching environment variable (`TG_PORT`, `TG_HOST`,
-`TG_SECRET`, `TG_BUF_KB`, `TG_POOL_SIZE`, `TG_MAX_CONNECTIONS`, `TG_QUIET`,
+`TG_SECRET`, `TG_BUF_KB`, `TG_POOL_SIZE`, `TG_POOL_LIVENESS_TIMEOUT`, `TG_MAX_CONNECTIONS`, `TG_QUIET`,
 `TG_VERBOSE`, `TG_SKIP_TLS_VERIFY`, `TG_LINK_IP`, `TG_LISTEN_FAKETLS_DOMAIN`, `TG_MTPROTO_PROXY`,
 `TG_LOG_FILE`, `TG_CF_DOMAIN`, `TG_CF_WORKER_DOMAIN`, `TG_CF_PRIORITY`,
 `TG_CF_BALANCE`, `TG_DEFAULT_DOMAINS`, `TG_OUTBOUND_PROXY`, `TG_NO_OUTBOUND_PROXY`, `TG_NO_PROXY`,

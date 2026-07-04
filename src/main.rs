@@ -295,9 +295,10 @@ async fn main() {
     info!("{}", "=".repeat(60));
 
     // ── Connection pool warm-up ───────────────────────────────────────────
-    let pool = Arc::new(WsPool::with_runtime(
+    let pool = Arc::new(WsPool::with_liveness_timeout(
         config.pool_size,
         Duration::from_secs(config.pool_max_age),
+        Duration::from_secs(config.pool_liveness_timeout),
         Arc::clone(&runtime),
     ));
     {
