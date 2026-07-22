@@ -289,6 +289,10 @@ async fn proxy_tries_fronting_before_tcp_fallback_when_dc_ip_is_unconfigured() {
         "2",
         "--tcp-fallback-timeout",
         "2",
+        // Avoid leaking a fronting fail-cooldown into other tests sharing
+        // this binary's global cooldown state (see `run_proxy_once_for_dc`).
+        "--fronting-fail-cooldown",
+        "0",
     ])
     .unwrap();
 
@@ -305,6 +309,64 @@ async fn proxy_tries_fronting_before_tcp_fallback_when_dc_ip_is_unconfigured() {
             .iter()
             .all(|r| r.starts_with("CONNECT 149.154.167.51:443 HTTP/1.1")),
         "both attempts should target the same fallback DC IP, got {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn fronting_failure_is_not_retried_within_the_fail_cooldown() {
+    // Regression test: a network that blocks Telegram's DC IPs outright (not
+    // just by SNI) makes every fronting attempt fail the same way direct/CF
+    // do. Without a fail-cooldown, each new connection would retry fronting
+    // from scratch and pay a full --ws-connect-timeout for a doomed attempt
+    // on top of the already-doomed CF/TCP attempts — this is what happened
+    // in issue #81 after the fronting-in-CF-fallback change (#89) shipped
+    // without one. Uses DC 5 (unused by other tests in this file) since the
+    // fail-cooldown is tracked in a static shared across the whole test
+    // binary process.
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests(3).await;
+    let make_config = || {
+        Config::try_parse_from([
+            "tg-ws-proxy",
+            "--secret",
+            "00112233445566778899aabbccddeeff",
+            "--fronting-domain",
+            "sprinthost.ru",
+            "--fronting-fail-cooldown",
+            "120",
+            "--outbound-proxy",
+            &format!("http://{proxy_addr}"),
+            "--no-outbound-proxy",
+            "--no-proxy",
+            "",
+            "--handshake-timeout",
+            "2",
+            "--ws-connect-timeout",
+            "2",
+            "--tcp-fallback-timeout",
+            "2",
+        ])
+        .unwrap()
+    };
+
+    // First connection: fronting is attempted (and fails), setting the
+    // cooldown, then falls through to the TCP fallback — 2 CONNECTs.
+    run_proxy_once_for_dc(make_config(), 5).await;
+    // Second connection, moments later: fronting should be skipped because
+    // it's still in its fail-cooldown, going straight to TCP — 1 CONNECT.
+    run_proxy_once_for_dc(make_config(), 5).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    assert_eq!(
+        requests.len(),
+        3,
+        "expected fronting+TCP on the first connection but only TCP on the \
+         second (cooldown active), got {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.starts_with("CONNECT 149.154.171.5:443 HTTP/1.1")),
+        "all attempts should target DC5's fallback IP, got {requests:?}"
     );
 }
 
@@ -399,6 +461,13 @@ async fn read_http_connect_request(stream: &mut TcpStream) -> String {
 }
 
 async fn run_proxy_once(config: Config) {
+    run_proxy_once_for_dc(config, 2).await;
+}
+
+/// Same as [`run_proxy_once`], but lets the caller pick the DC so tests that
+/// touch DC-keyed global cooldown state (e.g. the fronting fail-cooldown)
+/// don't collide with other tests sharing the same test binary process.
+async fn run_proxy_once_for_dc(config: Config, dc: i16) {
     let secret = config.secret_bytes();
     let outbound = config.outbound_connector().unwrap();
     let runtime = Arc::new(Runtime::new(outbound).with_fronting(
@@ -422,7 +491,7 @@ async fn run_proxy_once(config: Config) {
     let proxy_task = tokio::spawn(handle_client_with_runtime(
         server, peer, config, pool, runtime,
     ));
-    let (handshake, _, _) = generate_client_handshake(&secret, 2, ProtoTag::PaddedIntermediate);
+    let (handshake, _, _) = generate_client_handshake(&secret, dc, ProtoTag::PaddedIntermediate);
     client.write_all(&handshake).await.unwrap();
     drop(client);
 

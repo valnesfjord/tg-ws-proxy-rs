@@ -353,6 +353,22 @@ pub struct Config {
     )]
     pub fronting_cooldown: u64,
 
+    /// Seconds to stop retrying the domain-fronting fallback after it fails.
+    ///
+    /// Fronting only helps against SNI-based DPI blocking — it does nothing
+    /// for a network that blocks Telegram's DC IPs outright (the fronted
+    /// attempt still has to open a real TCP connection to that IP, just with
+    /// a different SNI). Without this cooldown, every single connection on
+    /// such a network would retry fronting from scratch and pay a full
+    /// `--ws-connect-timeout` for a doomed attempt on top of the already
+    /// doomed direct/CF/TCP attempts, compounding delays instead of helping.
+    #[arg(
+        long = "fronting-fail-cooldown",
+        default_value = "60",
+        env = "TG_FRONTING_FAIL_COOLDOWN"
+    )]
+    pub fronting_fail_cooldown: u64,
+
     /// Maximum age of a pooled WebSocket connection in seconds.
     /// Connections older than this are discarded and re-established.
     #[arg(long = "pool-max-age", default_value = "55", env = "TG_POOL_MAX_AGE")]

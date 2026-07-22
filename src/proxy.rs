@@ -197,6 +197,38 @@ fn cf_worker_in_cooldown(worker_domain: &str) -> bool {
     false
 }
 
+// ─── Domain-fronting failure tracking ────────────────────────────────────────
+
+/// Per-DC cooldown for a *failed* fronting attempt — distinct from
+/// `Runtime`'s sticky "fronting is currently working" state. Without this,
+/// a network that blocks Telegram's DC IPs outright (not just by SNI) would
+/// retry a doomed fronting attempt on every single connection; see
+/// `Config::fronting_fail_cooldown`.
+static FRONTING_FAIL_UNTIL: StdMutex<Option<HashMap<(u32, bool), Instant>>> = StdMutex::new(None);
+
+fn set_fronting_fail_cooldown(dc: u32, is_media: bool, cooldown: Duration) {
+    let mut lock = FRONTING_FAIL_UNTIL.lock().unwrap();
+    lock.get_or_insert_with(HashMap::new)
+        .insert((dc, is_media), Instant::now() + cooldown);
+}
+
+fn clear_fronting_fail_cooldown(dc: u32, is_media: bool) {
+    let mut lock = FRONTING_FAIL_UNTIL.lock().unwrap();
+    if let Some(map) = lock.as_mut() {
+        map.remove(&(dc, is_media));
+    }
+}
+
+fn fronting_in_fail_cooldown(dc: u32, is_media: bool) -> bool {
+    let lock = FRONTING_FAIL_UNTIL.lock().unwrap();
+    if let Some(map) = lock.as_ref()
+        && let Some(&until) = map.get(&(dc, is_media))
+    {
+        return Instant::now() < until;
+    }
+    false
+}
+
 fn blacklist_ws(dc: u32, is_media: bool, cooldown: Duration) {
     // Instead of a permanent blacklist, apply a long cooldown so the proxy
     // can recover automatically if WS becomes available again (e.g. after a
@@ -396,6 +428,7 @@ pub async fn handle_client_with_runtime(
     let upstream_fail_cooldown = Duration::from_secs(config.upstream_fail_cooldown);
     let cf_connect_timeout = Duration::from_secs(config.cf_connect_timeout);
     let cf_fail_cooldown = Duration::from_secs(config.cf_fail_cooldown);
+    let fronting_fail_cooldown = Duration::from_secs(config.fronting_fail_cooldown);
 
     // Split into independent read / write halves.
     let (mut reader, mut writer) = tokio::io::split(stream);
@@ -731,48 +764,60 @@ pub async fn handle_client_with_runtime(
         // getting through SNI-based DPI, using the same fallback IP the TCP
         // attempt below would otherwise use.
         if let Some(domain) = runtime.fronting_domain() {
-            info!(
-                "[{}] DC{}{} {} → trying fronting (SNI {})",
-                label, dc_id, media_tag, reason, domain
-            );
-
-            let (front_opt, _all_redirects, _timed_out) = connect_ws_for_dc_with_outbound(
-                &fallback,
-                ws_dc,
-                is_media,
-                skip_tls,
-                ws_connect_timeout,
-                runtime.outbound(),
-                Some(domain),
-            )
-            .await;
-
-            if let Some(ws) = front_opt {
-                runtime.activate_fronting();
-                info!(
-                    "[{}] DC{}{} {} → fronting connected (SNI {})",
-                    label, dc_id, media_tag, reason, domain
-                );
-                bridge_ws(
-                    reader,
-                    writer,
-                    WsBridgeParams {
-                        label: &label,
-                        ws,
-                        relay_init,
-                        ciphers,
-                        proto,
-                        dc: dc_id,
-                        is_media,
-                    },
-                )
-                .await;
-                return;
-            } else {
-                warn!(
-                    "[{}] DC{}{} fronting fallback failed",
+            if fronting_in_fail_cooldown(dc_id, is_media) {
+                debug!(
+                    "[{}] DC{}{} fronting in cooldown, skipping straight to TCP fallback",
                     label, dc_id, media_tag
                 );
+            } else {
+                info!(
+                    "[{}] DC{}{} {} → trying fronting (SNI {})",
+                    label, dc_id, media_tag, reason, domain
+                );
+
+                let (front_opt, _all_redirects, _timed_out) = connect_ws_for_dc_with_outbound(
+                    &fallback,
+                    ws_dc,
+                    is_media,
+                    skip_tls,
+                    ws_connect_timeout,
+                    runtime.outbound(),
+                    Some(domain),
+                )
+                .await;
+
+                if let Some(ws) = front_opt {
+                    clear_fronting_fail_cooldown(dc_id, is_media);
+                    runtime.activate_fronting();
+                    info!(
+                        "[{}] DC{}{} {} → fronting connected (SNI {})",
+                        label, dc_id, media_tag, reason, domain
+                    );
+                    bridge_ws(
+                        reader,
+                        writer,
+                        WsBridgeParams {
+                            label: &label,
+                            ws,
+                            relay_init,
+                            ciphers,
+                            proto,
+                            dc: dc_id,
+                            is_media,
+                        },
+                    )
+                    .await;
+                    return;
+                } else {
+                    set_fronting_fail_cooldown(dc_id, is_media, fronting_fail_cooldown);
+                    warn!(
+                        "[{}] DC{}{} fronting fallback failed, cooldown {}s",
+                        label,
+                        dc_id,
+                        media_tag,
+                        fronting_fail_cooldown.as_secs()
+                    );
+                }
             }
         }
 
@@ -904,9 +949,13 @@ pub async fn handle_client_with_runtime(
                 );
             } else {
                 runtime.deactivate_fronting();
+                set_fronting_fail_cooldown(dc_id, is_media, fronting_fail_cooldown);
                 warn!(
-                    "[{}] DC{}{} fronting (sticky) failed, falling back",
-                    label, dc_id, media_tag
+                    "[{}] DC{}{} fronting (sticky) failed, falling back, cooldown {}s",
+                    label,
+                    dc_id,
+                    media_tag,
+                    fronting_fail_cooldown.as_secs()
                 );
             }
         } else if ws_opt.is_some() {
@@ -916,11 +965,17 @@ pub async fn handle_client_with_runtime(
                 "[{}] DC{}{} → WS connected via {}",
                 label, dc_id, media_tag, target_ip
             );
-        } else if timed_out && let Some(domain) = runtime.fronting_domain() {
+        } else if timed_out
+            && !fronting_in_fail_cooldown(dc_id, is_media)
+            && let Some(domain) = runtime.fronting_domain()
+        {
             // Reactive fronting: the normal (non-fronted) attempt above
             // timed out — a sign of SNI-based DPI blocking — so try once
             // more with the fronted SNI before falling back to cooldown +
-            // CF/upstream/TCP.
+            // CF/upstream/TCP. Skipped while a previous fronting attempt is
+            // in its own fail-cooldown (see `fronting_fail_cooldown` docs) —
+            // a network that blocks the DC IP outright would otherwise pay
+            // for this doomed attempt on every single connection.
             info!(
                 "[{}] DC{}{} WS timed out → trying fronting (SNI {})",
                 label, dc_id, media_tag, domain
@@ -938,15 +993,20 @@ pub async fn handle_client_with_runtime(
             .await;
 
             if front_opt.is_some() {
+                clear_fronting_fail_cooldown(dc_id, is_media);
                 runtime.activate_fronting();
                 info!(
                     "[{}] DC{}{} → fronting connected (SNI {})",
                     label, dc_id, media_tag, domain
                 );
             } else {
+                set_fronting_fail_cooldown(dc_id, is_media, fronting_fail_cooldown);
                 warn!(
-                    "[{}] DC{}{} fronting fallback failed",
-                    label, dc_id, media_tag
+                    "[{}] DC{}{} fronting fallback failed, cooldown {}s",
+                    label,
+                    dc_id,
+                    media_tag,
+                    fronting_fail_cooldown.as_secs()
                 );
             }
             ws_opt = front_opt;

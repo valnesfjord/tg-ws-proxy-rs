@@ -107,6 +107,7 @@ tg-ws-proxy [OPTIONS]
 | `--cf-balance` | off | Round-robin load balance across multiple `--cf-domain` and `--cf-worker-domain` values (see [CF Proxy](#cloudflare-proxy)) |
 | `--fronting-domain <DOMAIN>` | off | Domain-fronting fallback SNI, e.g. `sprinthost.ru` (see [Domain fronting](#domain-fronting)) |
 | `--fronting-cooldown <SECS>` | `1800` | How long the fronting fallback stays active after it last succeeded |
+| `--fronting-fail-cooldown <SECS>` | `60` | How long to stop retrying fronting after it fails (protects against networks that block Telegram's DC IPs outright, where fronting can never succeed) |
 | `--max-connections <N>` | auto | Max concurrent client connections (auto-computed from `ulimit -n`) |
 | `--mtproto-proxy <HOST:PORT:SECRET>` | — | Upstream MTProto proxy fallback (repeatable) |
 | `--outbound-proxy <URL>` | — | Proxy for all outgoing connections: `http://`, `socks5://`, or `socks5h://`; `https://` proxy URLs are not supported |
@@ -122,7 +123,7 @@ Every flag has a matching environment variable (`TG_PORT`, `TG_HOST`,
 `TG_VERBOSE`, `TG_SKIP_TLS_VERIFY`, `TG_LINK_IP`, `TG_LISTEN_FAKETLS_DOMAIN`, `TG_MTPROTO_PROXY`,
 `TG_LOG_FILE`, `TG_CF_DOMAIN`, `TG_CF_WORKER_DOMAIN`, `TG_CF_PRIORITY`,
 `TG_CF_BALANCE`, `TG_DEFAULT_DOMAINS`, `TG_OUTBOUND_PROXY`, `TG_NO_OUTBOUND_PROXY`, `TG_NO_PROXY`,
-`TG_FRONTING_DOMAIN`, `TG_FRONTING_COOLDOWN`).
+`TG_FRONTING_DOMAIN`, `TG_FRONTING_COOLDOWN`, `TG_FRONTING_FAIL_COOLDOWN`).
 When `TG_OUTBOUND_PROXY` is not set, standard `HTTPS_PROXY`, `ALL_PROXY`,
 `HTTP_PROXY` and `NO_PROXY` environment variables are also honored. `https://`
 proxy URLs are skipped when discovered from the standard environment if a later
@@ -458,6 +459,13 @@ after CF Worker/CF proxy/upstream proxy fallbacks are exhausted, before the
 proxy would otherwise fall through to a plain direct TCP connection (which is
 normally dead weight for anyone who needed a CF fallback in the first place,
 since direct Telegram connectivity is usually what's blocked for them).
+
+Fronting only helps against SNI-based DPI — it does nothing on a network
+that blocks Telegram's DC IPs outright, since the fronted attempt still has
+to open a real TCP connection to that IP. If a fronting attempt fails,
+`--fronting-fail-cooldown` seconds (default 60) pass before it's retried for
+that DC, so a network where fronting can never succeed doesn't pay for a
+doomed attempt on every single connection.
 
 > **Note:** TLS certificate verification is unconditionally skipped on
 > connections using this fallback, regardless of
