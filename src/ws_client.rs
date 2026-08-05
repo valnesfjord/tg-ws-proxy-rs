@@ -38,6 +38,7 @@ use tokio_tungstenite::{
 use tracing::{debug, warn};
 use tungstenite::Error as WsError;
 use tungstenite::Message;
+use tungstenite::protocol::WebSocketConfig;
 
 /// A live WebSocket connection to a Telegram DC.
 pub type TgWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -306,10 +307,45 @@ where
             .connect(server_name, tcp)
             .await
             .map_err(WsError::Io)?;
-        client_async_with_config(request, MaybeTlsStream::Rustls(tls_stream), None).await
+        client_async_with_config(
+            request,
+            MaybeTlsStream::Rustls(tls_stream),
+            Some(ws_config()),
+        )
+        .await
     } else {
         let connector = build_tls_connector(skip_tls_verify);
-        client_async_tls_with_config(request, tcp, None, Some(connector)).await
+        client_async_tls_with_config(request, tcp, Some(ws_config()), Some(connector)).await
+    }
+}
+
+/// Ceiling on a single WebSocket frame from Telegram, and on a message
+/// reassembled from them.
+///
+/// tungstenite defaults to 16 MiB and 64 MiB, and grows a per-connection input
+/// buffer to whatever it has actually seen — so the frame size is what a
+/// connection's memory settles at, and the default ceiling is far above
+/// anything Telegram sends. One MTProto packet arrives per message here, and
+/// the largest is a media part: `upload.getFile` caps a part at 1 MiB, so
+/// 4 MiB leaves generous headroom for transport framing while keeping a
+/// misbehaving or hostile upstream from parking megabytes per connection.
+const WS_MAX_FRAME: usize = 4 << 20;
+
+/// Bytes tungstenite may queue before it flushes to the socket.
+///
+/// Its default is 128 KiB, sized for callers that batch many small messages.
+/// Both bridge directions here `await` each send, so the queue never usefully
+/// exceeds one message — the smaller threshold just keeps a burst from
+/// growing the buffer and holding that capacity for the connection's life.
+const WS_WRITE_BUFFER: usize = 16 * 1024;
+
+/// Frame limits applied to every WebSocket this proxy opens.
+fn ws_config() -> WebSocketConfig {
+    WebSocketConfig {
+        write_buffer_size: WS_WRITE_BUFFER,
+        max_frame_size: Some(WS_MAX_FRAME),
+        max_message_size: Some(WS_MAX_FRAME),
+        ..WebSocketConfig::default()
     }
 }
 

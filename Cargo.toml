@@ -1,6 +1,6 @@
 [package]
 name = "tg-ws-proxy-rs"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2024"
 description = "Telegram MTProto WebSocket Bridge Proxy — Rust port of Flowseal/tg-ws-proxy"
 license = "MIT"
@@ -69,6 +69,7 @@ rustls-pki-types = "1"
 webpki-roots = "0.26"
 # Async TLS streams (transitive dep of tokio-tungstenite; used for HTTPS GET in default_domains)
 tokio-rustls = "0.26"
+dhat = { version = "0.3.3", optional = true }
 
 [dev-dependencies]
 rcgen = "0.12"
@@ -78,3 +79,9 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+[features]
+# Heap profiling build: swaps in dhat's allocator and shuts the accept loop
+# down after `TG_DHAT_SECS` (default 20) so the profile is written out.
+# See `examples/memtest.rs` for the load side.
+dhat = ["dep:dhat"]

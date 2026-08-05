@@ -53,7 +53,7 @@ use crate::runtime::Runtime;
 use crate::splitter::MsgSplitter;
 use crate::ws_client::{
     TgWsStream, WsAttempt, connect_cf_worker_ws_for_dc_with_outbound,
-    connect_cf_ws_for_dc_with_outbound, connect_ws_for_dc_with_outbound, media_tag, ws_send,
+    connect_cf_ws_for_dc_with_outbound, connect_ws_for_dc_with_outbound, media_tag,
 };
 
 type TcpReader = ReadHalf<TcpStream>;
@@ -491,68 +491,79 @@ pub async fn handle_client_with_runtime(
     let target_ip = config.dc_target_ip(dc_id).map(str::to_string);
 
     // ── Step 6: bridge whatever we ended up connected to ─────────────────
-    match select_upstream(&route, target_ip).await {
-        Some(Upstream::Ws { ws, framing }) => {
-            bridge_ws(
-                reader,
-                writer,
-                WsBridgeParams {
-                    label: &label,
-                    ws,
-                    framing,
-                    relay_init,
-                    ciphers,
-                    proto,
-                    dc: dc_id,
-                    is_media,
-                },
-            )
-            .await;
-        }
-        Some(Upstream::Mtproto(conn)) => {
-            let ConnectionCiphers {
-                clt_dec, clt_enc, ..
-            } = ciphers;
-
-            bridge_relay(
-                reader,
-                writer,
-                RelayParams {
-                    label: &label,
-                    rem_reader: conn.reader,
-                    rem_writer: conn.writer,
-                    ciphers: ConnectionCiphers {
-                        clt_dec,
-                        clt_enc,
-                        tg_enc: conn.enc,
-                        tg_dec: conn.dec,
+    // Boxed so the whole fallback ladder — every TLS handshake and WebSocket
+    // upgrade it can attempt — lives in a temporary allocation that is freed
+    // once a route is picked, instead of inflating the state machine that
+    // every connection then holds for its entire session.
+    // Boxed as one step: the bridge that runs for the rest of the session
+    // is then its own allocation, sized to the path actually taken, rather
+    // than every connection carrying a state machine as large as the
+    // widest branch plus the whole fallback ladder that chose it.
+    Box::pin(async {
+        match Box::pin(select_upstream(&route, target_ip)).await {
+            Some(Upstream::Ws { ws, framing }) => {
+                bridge_ws(
+                    reader,
+                    writer,
+                    WsBridgeParams {
+                        label: &label,
+                        ws,
+                        framing,
+                        relay_init,
+                        ciphers,
+                        proto,
+                        dc: dc_id,
+                        is_media,
                     },
-                    faketls: conn.faketls,
-                    dc: dc_id,
-                    is_media,
-                },
-            )
-            .await;
+                )
+                .await;
+            }
+            Some(Upstream::Mtproto(conn)) => {
+                let ConnectionCiphers {
+                    clt_dec, clt_enc, ..
+                } = ciphers;
+
+                bridge_relay(
+                    reader,
+                    writer,
+                    RelayParams {
+                        label: &label,
+                        rem_reader: conn.reader,
+                        rem_writer: conn.writer,
+                        ciphers: ConnectionCiphers {
+                            clt_dec,
+                            clt_enc,
+                            tg_enc: conn.enc,
+                            tg_dec: conn.dec,
+                        },
+                        faketls: conn.faketls,
+                        dc: dc_id,
+                        is_media,
+                    },
+                )
+                .await;
+            }
+            Some(Upstream::Tcp(dst)) => {
+                bridge_tcp(
+                    reader,
+                    writer,
+                    TcpBridgeParams {
+                        label: &label,
+                        dst: &dst,
+                        relay_init: &relay_init,
+                        ciphers,
+                        dc: dc_id,
+                        is_media,
+                        connect_timeout: route.timeouts.tcp_fallback,
+                        runtime: Arc::clone(&runtime),
+                    },
+                )
+                .await;
+            }
+            None => {}
         }
-        Some(Upstream::Tcp(dst)) => {
-            bridge_tcp(
-                reader,
-                writer,
-                TcpBridgeParams {
-                    label: &label,
-                    dst: &dst,
-                    relay_init: &relay_init,
-                    ciphers,
-                    dc: dc_id,
-                    is_media,
-                    connect_timeout: route.timeouts.tcp_fallback,
-                    runtime: Arc::clone(&runtime),
-                },
-            )
-            .await;
-        }
-        None => {}
-    }
+    })
+    .await;
 }
 
 // ─── Routing ─────────────────────────────────────────────────────────────────
@@ -1270,7 +1281,7 @@ struct WsBridgeParams<'a> {
 async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeParams<'_>) {
     let WsBridgeParams {
         label,
-        mut ws,
+        ws,
         framing,
         relay_init,
         ciphers,
@@ -1278,12 +1289,6 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
         dc,
         is_media,
     } = params;
-
-    // Send the relay init packet to Telegram before bridging.
-    if let Err(e) = ws_send(&mut ws, relay_init.to_vec()).await {
-        warn!("[{}] failed to send relay init: {}", label, e);
-        return;
-    }
 
     let ConnectionCiphers {
         mut clt_dec,
@@ -1302,8 +1307,19 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
 
     let upload = tokio::spawn({
         let counters = Arc::clone(&counters);
+        let label = label.to_string();
 
         async move {
+            // The relay init opens the conversation with Telegram, and it is
+            // sent from here rather than before the split so that the caller's
+            // state machine — the one allocation that lives as long as the
+            // session — never has to hold the WebSocket (and the TLS session
+            // inside it) across an await.
+            if let Err(e) = ws_sink.send(Message::Binary(relay_init.to_vec())).await {
+                warn!("[{}] failed to send relay init: {}", label, e);
+                return;
+            }
+
             let mut reader = reader;
             let mut buf = vec![0u8; CLIENT_READ_BUF_SIZE];
 
