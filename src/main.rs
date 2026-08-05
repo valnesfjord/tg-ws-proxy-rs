@@ -27,8 +27,15 @@ use tg_ws_proxy_rs::{
     check, config::Config, default_domains, pool::WsPool, proxy, runtime::Runtime,
 };
 
+#[cfg(feature = "dhat")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 #[tokio::main]
 async fn main() {
+    #[cfg(feature = "dhat")]
+    let _profiler = dhat::Profiler::new_heap();
+
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("failed to install rustls ring CryptoProvider");
@@ -281,6 +288,14 @@ async fn main() {
     const EMFILE: i32 = 24; // too many open files (per-process fd limit)
     const ENFILE: i32 = 23; // file table overflow (system-wide fd limit)
     let semaphore = Arc::new(Semaphore::new(max_connections));
+    #[cfg(feature = "dhat")]
+    let profile_deadline = tokio::time::Instant::now()
+        + Duration::from_secs(
+            std::env::var("TG_DHAT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20),
+        );
     loop {
         // Block here when we are already at the connection limit.  Pending
         // TCP connections queue in the kernel backlog until capacity frees up.
@@ -289,7 +304,15 @@ async fn main() {
             .await
             .expect("semaphore closed unexpectedly");
 
-        match listener.accept().await {
+        #[cfg(feature = "dhat")]
+        let accepted = tokio::select! {
+            result = listener.accept() => result,
+            _ = tokio::time::sleep_until(profile_deadline) => break,
+        };
+        #[cfg(not(feature = "dhat"))]
+        let accepted = listener.accept().await;
+
+        match accepted {
             Ok((stream, peer_addr)) => {
                 let cfg = Arc::clone(&config);
                 let pool = pool.clone();
