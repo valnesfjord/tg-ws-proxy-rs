@@ -1,11 +1,15 @@
 //! Throwaway memory harness: fake Telegram WebSocket upstream + CONNECT proxy
 //! + N clients pulling media-sized frames through the proxy.
 //!
-//! `cargo run --release --example memtest -- <proxy-port> <clients> <frames> <frame-kib>`
+//! `cargo run --release --example memtest -- <proxy-addr> <clients> <frames> <frame-kib>`
 //!
-//! Point the proxy under test at this harness with:
-//!   --outbound-proxy http://127.0.0.1:<connect-port> --danger-accept-invalid-certs
-//!   --cf-domain fake.local --pool-size 0
+//! `proxy-addr` is where the proxy under test listens — `127.0.0.1:1443` for a
+//! local run, or `192.168.1.1:25565` to drive one on a router from a machine
+//! that has a Rust toolchain. Everything here binds `0.0.0.0`, so the proxy
+//! can reach it across the LAN:
+//!
+//!   --outbound-proxy http://<this-machine>:<connect-port>
+//!   --danger-accept-invalid-certs --cf-domain fake.local
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,7 +29,7 @@ async fn main() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let args: Vec<String> = std::env::args().collect();
-    let proxy_port: u16 = args[1].parse().unwrap();
+    let proxy_addr = args[1].clone();
     let clients: usize = args[2].parse().unwrap();
     let frames: usize = args[3].parse().unwrap();
     let frame_kib: usize = args[4].parse().unwrap();
@@ -41,8 +45,9 @@ async fn main() {
             .unwrap(),
     ));
 
-    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream_addr = upstream.local_addr().unwrap();
+    let upstream = TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    let upstream_addr = format!("127.0.0.1:{}", upstream_port);
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = upstream.accept().await else {
@@ -80,13 +85,14 @@ async fn main() {
     });
 
     // ── CONNECT proxy: tunnels every target to the fake upstream ───────────
-    let connect = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let connect = TcpListener::bind("0.0.0.0:0").await.unwrap();
     let connect_addr = connect.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
             let Ok((mut inbound, _)) = connect.accept().await else {
                 break;
             };
+            let upstream_addr = upstream_addr.clone();
             tokio::spawn(async move {
                 let mut buf = [0u8; 1024];
                 let mut seen = 0;
@@ -102,7 +108,7 @@ async fn main() {
                 if inbound.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.is_err() {
                     return;
                 }
-                let Ok(outbound) = TcpStream::connect(upstream_addr).await else {
+                let Ok(outbound) = TcpStream::connect(upstream_addr.as_str()).await else {
                     return;
                 };
                 let (mut ri, mut wi) = inbound.split();
@@ -119,7 +125,7 @@ async fn main() {
         }
     });
 
-    println!("CONNECT proxy on 127.0.0.1:{}", connect_addr.port());
+    println!("CONNECT proxy listening on port {}", connect_addr.port());
     println!("start the proxy under test now; clients connect in 10s");
     tokio::time::sleep(Duration::from_secs(10)).await;
 
@@ -127,7 +133,7 @@ async fn main() {
     let secret = hex::decode("0ea7201141bf2763a7dee49ba68eeb4c").unwrap();
     let mut held = Vec::new();
     for _ in 0..clients {
-        let Ok(mut stream) = TcpStream::connect(("127.0.0.1", proxy_port)).await else {
+        let Ok(mut stream) = TcpStream::connect(proxy_addr.as_str()).await else {
             continue;
         };
         let (handshake, _, _) = generate_client_handshake(&secret, 2, ProtoTag::PaddedIntermediate);
