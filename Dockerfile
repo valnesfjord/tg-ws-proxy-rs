@@ -15,6 +15,7 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=target-${TARGETPLATFORM},target=/app/target \
     mkdir src && \
     printf 'fn main() {}\n' > src/main.rs && \
+    printf '// lib\n' > src/lib.rs && \
     cargo build --release --locked && \
     rm -rf src
 

@@ -2,3 +2,18 @@
 /dist
 /openwrt/files/tg-ws-proxy
 .DS_Store
+
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/build-logic/build/
+android/build-logic/.gradle/
+android/build-logic/.kotlin/
+android/local.properties
+android/app/src/main/jniLibs/
+android/.idea/
+android/.kotlin/
+android/keystore.properties
+*.iml
+android/captures/

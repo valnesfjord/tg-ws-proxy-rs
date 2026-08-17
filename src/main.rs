@@ -10,22 +10,13 @@
 //! Telegram Desktop → MTProto (TCP 1443) → tg-ws-proxy-rs → WS (TLS 443) → Telegram DC
 //! ```
 //!
-//! See [`proxy`] for the connection handling logic and [`crypto`] for the
-//! MTProto obfuscation details.
+//! See [`tg_ws_proxy_rs::proxy`] for the connection handling logic and
+//! [`tg_ws_proxy_rs::crypto`] for the MTProto obfuscation details.
 
 use std::io::IsTerminal as _;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
 
-use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
-use tracing::{error, info, warn};
-
-use tg_ws_proxy_rs::limits::{auto_max_connections, soft_nofile_limit};
-use tg_ws_proxy_rs::{
-    check, config::Config, default_domains, pool::WsPool, proxy, runtime::Runtime,
-};
+use tg_ws_proxy_rs::config::Config;
+use tg_ws_proxy_rs::server::{self, RunError};
 
 #[tokio::main]
 async fn main() {
@@ -33,20 +24,21 @@ async fn main() {
         .install_default()
         .expect("failed to install rustls ring CryptoProvider");
 
-    let mut config = Config::from_args();
-    let outbound = match config.outbound_connector() {
-        Ok(outbound) => outbound,
-        Err(e) => {
+    let config = Config::from_args();
+    init_logging(&config);
+
+    match server::run(config, std::future::pending()).await {
+        Ok(()) => {}
+        Err(RunError::CheckFailed) => std::process::exit(1),
+        Err(RunError::InvalidOutbound(e)) => {
             eprintln!("invalid outbound proxy config: {e}");
             std::process::exit(2);
         }
-    };
-    let runtime = Arc::new(Runtime::new(outbound).with_fronting(
-        config.fronting_domain.clone(),
-        Duration::from_secs(config.fronting_cooldown),
-    ));
+        Err(e) => panic!("{e}"),
+    }
+}
 
-    // ── Logging ──────────────────────────────────────────────────────────
+fn init_logging(config: &Config) {
     let log_level = if config.quiet {
         "off"
     } else if config.verbose {
@@ -80,240 +72,5 @@ async fn main() {
             .with_env_filter(env_filter)
             .with_ansi(use_ansi)
             .init();
-    }
-
-    // ── Default CF domain list (--default-domains) ────────────────────────
-    // Fetch the obfuscated domain list from GitHub, deobfuscate it, and
-    // append the resulting domains to any that were supplied with --cf-domain.
-    // Done once here so both --check mode and the normal server path share
-    // the same fetched list.
-    if config.default_domains {
-        info!("Fetching default CF proxy domain list from GitHub…");
-        let fetched =
-            default_domains::fetch_default_domains_with_outbound(runtime.outbound()).await;
-        info!("  Got {} default CF domain(s)", fetched.len());
-        config.cf_domains.extend(fetched);
-    }
-
-    // ── Connectivity check mode (--check) ────────────────────────────────
-    // Run probes for every configured CF domain and MTProto proxy, print the
-    // results, then exit.  This lets the user verify their configuration
-    // before starting the proxy server.
-    if config.check {
-        let all_ok = check::run_check_with_outbound(&config, runtime.outbound()).await;
-        std::process::exit(if all_ok { 0 } else { 1 });
-    }
-
-    // ── Bind the server socket ────────────────────────────────────────────
-    let bind_host = config.bind_host();
-    let addr: SocketAddr = format!("{}:{}", bind_host, config.port)
-        .parse()
-        .expect("invalid listen address");
-
-    let listener = TcpListener::bind(addr)
-        .await
-        .unwrap_or_else(|e| panic!("cannot bind {}: {}", addr, e));
-
-    // ── FD budget & effective max_connections ────────────────────────────
-    // Each active connection uses 2 FDs: the accepted client socket and the
-    // outbound connection to Telegram (WS or TCP fallback).  The pool adds
-    // pool_size × dc_buckets × 2 FDs (idle + one in-flight refill per bucket).
-    // Auto-compute a safe default when the user has not set --max-connections,
-    // so the proxy stays within the process's soft file-descriptor limit.
-    let fd_limit = soft_nofile_limit();
-    let dc_redirects = config.dc_redirects();
-    let dc_buckets = dc_redirects.len() * 2; // non-media + media per DC
-    let max_connections = match config.max_connections {
-        Some(n) => {
-            let safe = auto_max_connections(fd_limit, config.pool_size, dc_buckets);
-            if n > safe {
-                warn!(
-                    "max-connections={} may exceed the safe limit for this system's \
-                     FD budget (fd-limit={}, recommended ≤{}). \
-                     Consider raising `ulimit -n` or reducing --max-connections.",
-                    n, fd_limit, safe
-                );
-            }
-            n
-        }
-        None => auto_max_connections(fd_limit, config.pool_size, dc_buckets),
-    };
-
-    // ── Print startup banner ──────────────────────────────────────────────
-    let secret = config.primary_secret();
-
-    let link_host = config.link_host();
-    let tg_link = format!(
-        "tg://proxy?server={}&port={}&secret={}",
-        link_host,
-        config.port,
-        config.link_secret()
-    );
-
-    info!("{}", "=".repeat(60));
-    info!(
-        "  Telegram MTProto WS Bridge Proxy  (tg-ws-proxy-rs v{})",
-        env!("CARGO_PKG_VERSION")
-    );
-    info!("  Listening on   {}:{}", bind_host, config.port);
-    info!("  Secret:        {}", secret);
-    if let Some(domain) = config.listen_faketls_domain() {
-        info!("  Inbound mode:   FakeTLS ee (SNI: {})", domain);
-    } else {
-        info!("  Inbound mode:   padded MTProto dd");
-    }
-    info!("  Target DC IPs:");
-    let mut dcs: Vec<_> = dc_redirects.iter().collect();
-    dcs.sort_by_key(|(k, _)| *k);
-    for (dc, ip) in &dcs {
-        info!("    DC{}: {}", dc, ip);
-    }
-
-    if config.skip_tls_verify {
-        info!("  ⚠  TLS certificate verification DISABLED");
-    }
-
-    if !config.cf_domains.is_empty() {
-        info!("  Cloudflare proxy domain(s):");
-        for d in &config.cf_domains {
-            info!("    {} (kws{{N}}.{} subdomains)", d, d);
-        }
-        if config.cf_priority {
-            info!("    ⚡ CF priority mode: CF proxy is tried BEFORE direct WS");
-        }
-        if config.cf_balance && config.cf_domains.len() > 1 {
-            info!("    ⚖  CF balance mode: connections are round-robin'd across domains");
-        }
-    }
-
-    let cf_worker_domains = config.cf_worker_domains();
-    if !cf_worker_domains.is_empty() {
-        info!("  Cloudflare Worker domain(s):");
-        for domain in cf_worker_domains {
-            info!("    {}", domain);
-        }
-    }
-
-    if !config.mtproto_proxies.is_empty() {
-        info!("  Upstream MTProto proxies (WS fallback):");
-        for p in &config.mtproto_proxies {
-            info!("    {}:{}", p.host, p.port);
-        }
-    }
-
-    if let Some(summary) = runtime.outbound().summary() {
-        info!("  Outbound proxy: {}", summary);
-    }
-
-    if let Some(domain) = runtime.fronting_domain() {
-        if dc_redirects.is_empty() {
-            warn!(
-                "  ⚠  --fronting-domain {} has no effect: no --dc-ip is configured. \
-                 Fronting only applies to a direct connection to a DC's real IP \
-                 (matching upstream tg-ws-proxy) — it is never used for CF proxy, \
-                 CF Worker, or upstream MTProto proxy connections.",
-                domain
-            );
-        } else {
-            info!(
-                "  Domain fronting: enabled (SNI {}, sticky for {}s after success)",
-                domain, config.fronting_cooldown
-            );
-        }
-    }
-
-    info!(
-        "  Max connections: {} (fd-limit: {})",
-        max_connections, fd_limit
-    );
-    info!("{}", "=".repeat(60));
-    info!("  Telegram proxy link (use this on all devices):");
-    info!("    {}", tg_link);
-    if config.secrets.len() > 1 {
-        info!("  Additional per-user proxy links:");
-        for secret in &config.secrets[1..] {
-            let link_secret = config.link_secret_for(secret);
-            info!(
-                "    tg://proxy?server={}&port={}&secret={}",
-                link_host, config.port, link_secret
-            );
-        }
-    }
-
-    if link_host != bind_host {
-        info!(
-            "  ℹ  Link uses auto-detected IP {}. \
-             Use --link-ip <IP> to override.",
-            link_host
-        );
-    } else if matches!(bind_host.as_str(), "127.0.0.1" | "::1") {
-        warn!(
-            "  ⚠  Link shows {} — only the local machine can use this link. \
-             Run with --host 0.0.0.0 (or --link-ip <router-LAN-IP>) \
-             so other devices on the network can connect.",
-            bind_host
-        );
-    }
-    info!("{}", "=".repeat(60));
-
-    // ── Connection pool warm-up ───────────────────────────────────────────
-    let pool = Arc::new(WsPool::with_runtime(
-        config.pool_size,
-        Duration::from_secs(config.pool_max_age),
-        Arc::clone(&runtime),
-    ));
-    // Shared for the rest of the process: every connection reads the same
-    // settings, so they are behind one `Arc` instead of a per-connection clone.
-    let config = Arc::new(config);
-    {
-        let pool_clone = pool.clone();
-        let config_clone = Arc::clone(&config);
-        tokio::spawn(async move {
-            pool_clone.warmup(&config_clone).await;
-        });
-    }
-
-    // ── Accept loop ───────────────────────────────────────────────────────
-    // Acquire a permit before each accept() to cap concurrent connections.
-    // This prevents EMFILE (too many open files) by keeping file-descriptor
-    // usage bounded: at most `max_connections` client sockets plus the pool
-    // connections can be open simultaneously.
-    const EMFILE: i32 = 24; // too many open files (per-process fd limit)
-    const ENFILE: i32 = 23; // file table overflow (system-wide fd limit)
-    let semaphore = Arc::new(Semaphore::new(max_connections));
-    loop {
-        // Block here when we are already at the connection limit.  Pending
-        // TCP connections queue in the kernel backlog until capacity frees up.
-        let permit = Arc::clone(&semaphore)
-            .acquire_owned()
-            .await
-            .expect("semaphore closed unexpectedly");
-
-        match listener.accept().await {
-            Ok((stream, peer_addr)) => {
-                let cfg = Arc::clone(&config);
-                let pool = pool.clone();
-                let runtime = Arc::clone(&runtime);
-                tokio::spawn(async move {
-                    // Hold the permit for the lifetime of this connection so
-                    // it is released (and the slot freed) when the task ends.
-                    let _permit = permit;
-                    proxy::handle_client_with_runtime(stream, peer_addr, cfg, pool, runtime).await;
-                });
-            }
-            Err(e) => {
-                // EMFILE / ENFILE: the process has run out of file descriptors
-                // (e.g. from pool connections).  Back off longer to let
-                // existing connections close, and log at warn-level to avoid
-                // flooding the log with repeated identical messages.
-                if matches!(e.raw_os_error(), Some(EMFILE) | Some(ENFILE)) {
-                    warn!("accept error: {} — backing off to allow FDs to free", e);
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                } else {
-                    error!("accept error: {}", e);
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            }
-        }
     }
 }

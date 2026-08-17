@@ -411,3 +411,60 @@ fn version_flag_prints_the_crate_version() {
         );
     }
 }
+
+#[test]
+fn try_from_cli_line_accepts_the_termux_flags() {
+    let cfg = Config::try_from_cli_line(
+        "--default-domains --host 127.0.0.1 --port 9050 --dc-ip 4:149.154.167.220 --link-ip 127.0.0.1",
+    )
+    .unwrap();
+
+    assert!(cfg.default_domains);
+    assert_eq!(cfg.host.as_deref(), Some("127.0.0.1"));
+    assert_eq!(cfg.port, 9050);
+    assert_eq!(cfg.link_ip.as_deref(), Some("127.0.0.1"));
+    assert_eq!(cfg.dc_ip, vec![(4, "149.154.167.220".to_string())]);
+}
+
+#[test]
+fn try_from_cli_line_strips_a_leading_binary_name() {
+    let cfg = Config::try_from_cli_line("./tg-ws --port 9050").unwrap();
+    assert_eq!(cfg.port, 9050);
+}
+
+#[test]
+fn try_from_cli_line_keeps_quoted_values() {
+    let cfg = Config::try_from_cli_line("--host '127.0.0.1' --port \"9050\"").unwrap();
+    assert_eq!(cfg.host.as_deref(), Some("127.0.0.1"));
+    assert_eq!(cfg.port, 9050);
+}
+
+#[test]
+fn try_from_cli_line_rejects_unclosed_quotes() {
+    let err = Config::try_from_cli_line("--host '127.0.0.1").unwrap_err();
+    assert!(err.contains("unclosed quote"), "{err}");
+}
+
+#[test]
+fn split_cli_args_handles_backslash_escapes() {
+    let tokens = tg_ws_proxy_rs::config::split_cli_args(r#"--secret a\ b"#).unwrap();
+    assert_eq!(tokens, vec!["--secret", "a b"]);
+}
+
+#[test]
+fn split_cli_args_keeps_empty_quoted_tokens() {
+    let tokens = tg_ws_proxy_rs::config::split_cli_args(r#"--secret "" --port 9050"#).unwrap();
+    assert_eq!(tokens, vec!["--secret", "", "--port", "9050"]);
+}
+
+#[test]
+fn split_cli_args_keeps_empty_quoted_single_tokens() {
+    let tokens = tg_ws_proxy_rs::config::split_cli_args("''").unwrap();
+    assert_eq!(tokens, vec![""]);
+}
+
+#[test]
+fn split_cli_args_rejects_trailing_backslash() {
+    let err = tg_ws_proxy_rs::config::split_cli_args(r"--secret abc\").unwrap_err();
+    assert!(err.contains("trailing backslash"), "{err}");
+}

@@ -56,6 +56,12 @@ cargo build --release
 The binary lands in `target/release/tg-ws-proxy`. Cross-compiling for OpenWrt
 (MIPS/ARM/ARM64) is covered in [docs/Building.md](docs/Building.md).
 
+### Android
+
+A Jetpack Compose app in `android/` runs the same core as a library: paste the
+CLI flags, start/stop, open the `tg://proxy` link. See
+[docs/Android.md](docs/Android.md).
+
 ### OpenWrt
 
 Raw release binaries, LuCI packages and a one-line installer are available. See

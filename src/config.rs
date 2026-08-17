@@ -497,10 +497,84 @@ pub struct Config {
     pub no_proxy: Option<String>,
 }
 
+/// Split a shell-style argument line into tokens.
+///
+/// Understands single and double quotes and backslash escapes outside single
+/// quotes.  Used by the Android embedder (and anything else that has a text
+/// field rather than a real argv) so the same flags the binary accepts can
+/// be typed as one string.
+pub fn split_cli_args(line: &str) -> Result<Vec<String>, String> {
+    let mut args = Vec::new();
+    let mut cur = String::new();
+    let mut started = false;
+    let mut chars = line.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                started = true;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                started = true;
+            }
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if started {
+                    args.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            '\\' if !in_single => {
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                    started = true;
+                } else {
+                    return Err("trailing backslash in argument list".into());
+                }
+            }
+            other => {
+                cur.push(other);
+                started = true;
+            }
+        }
+    }
+
+    if in_single || in_double {
+        return Err("unclosed quote in argument list".into());
+    }
+    if started {
+        args.push(cur);
+    }
+    Ok(args)
+}
+
 impl Config {
     /// Parse configuration from CLI arguments.
     pub fn from_args() -> Self {
         Self::parse().with_defaults()
+    }
+
+    /// Parse a single command-line string the same way the binary parses argv.
+    ///
+    /// A leading token that does not start with `-` is treated as the program
+    /// name (so `./tg-ws --port 9050` works).  Otherwise `tg-ws-proxy` is
+    /// prepended as argv0.
+    pub fn try_from_cli_line(line: &str) -> Result<Self, String> {
+        let tokens = split_cli_args(line.trim())?;
+        let args = match tokens.first() {
+            Some(first) if !first.starts_with('-') => tokens,
+            _ => {
+                let mut args = vec!["tg-ws-proxy".to_string()];
+                args.extend(tokens);
+                args
+            }
+        };
+        Self::try_parse_from(args)
+            .map(Self::with_defaults)
+            .map_err(|e| e.render().to_string())
     }
 
     /// Fill in the values that can only be defaulted after parsing.

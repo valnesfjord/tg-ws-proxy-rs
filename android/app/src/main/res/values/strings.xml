@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">TG WS Proxy Rust</string>
+    <string name="args_label">Command-line arguments</string>
+    <string name="start">Start</string>
+    <string name="stop">Stop</string>
+    <string name="status_running">Running</string>
+    <string name="status_stopped">Stopped</string>
+    <string name="status_starting">Starting…</string>
+    <string name="open_telegram_link">Open Telegram link</string>
+    <string name="log_label">Log</string>
+    <string name="notification_channel">Proxy</string>
+    <string name="telegram_missing">Telegram is not installed</string>
+    <string name="view_on_github">View on GitHub</string>
+</resources>

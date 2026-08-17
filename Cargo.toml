@@ -1,6 +1,6 @@
 [package]
 name = "tg-ws-proxy-rs"
-version = "2.2.4"
+version = "2.3.0"
 edition = "2024"
 description = "Telegram MTProto WebSocket Bridge Proxy — Rust port of Flowseal/tg-ws-proxy"
 license = "MIT"
@@ -11,9 +11,15 @@ documentation = "https://docs.rs/tg-ws-proxy-rs"
 keywords = ["telegram", "mtproto", "websocket", "proxy", "rust"]
 categories = ["network-programming", "command-line-utilities"]
 
+[lib]
+crate-type = ["lib", "cdylib"]
+
 [[bin]]
 name = "tg-ws-proxy"
 path = "src/main.rs"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { version = "0.22", default-features = false }
 
 [dependencies]
 # Async runtime
