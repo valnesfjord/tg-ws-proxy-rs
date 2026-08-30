@@ -10,6 +10,13 @@ android {
     defaultConfig {
         applicationId = "io.github.valnesfjord.tgwsproxyrs"
     }
+
+    dependenciesInfo {
+        // Disables dependency metadata when building APKs.
+        includeInApk = false
+        // Disables dependency metadata when building Android App Bundles.
+        includeInBundle = false
+    }
 }
 
 dependencies {
