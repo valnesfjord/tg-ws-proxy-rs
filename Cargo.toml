@@ -1,6 +1,6 @@
 [package]
 name = "tg-ws-proxy-rs"
-version = "2.3.3"
+version = "2.3.4"
 edition = "2024"
 description = "Telegram MTProto WebSocket Bridge Proxy — Rust port of Flowseal/tg-ws-proxy"
 license = "MIT"
