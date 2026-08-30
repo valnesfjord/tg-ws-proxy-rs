@@ -1,6 +1,6 @@
 [package]
 name = "tg-ws-proxy-rs"
-version = "2.3.3"
+version = "2.3.4"
 edition = "2024"
 description = "Telegram MTProto WebSocket Bridge Proxy — Rust port of Flowseal/tg-ws-proxy"
 license = "MIT"
@@ -13,7 +13,7 @@ categories = ["network-programming", "command-line-utilities"]
 
 [package.metadata.android]
 # This must match (MAJOR * 10000 + MINOR * 100 + PATCH) * 10.
-version_code = 203030
+version_code = 203040
 
 # The JNI shim is a separate crate because `crate-type` is a per-package
 # setting: a `["lib", "cdylib"]` root made every desktop and Docker
