@@ -100,10 +100,14 @@ pub async fn run_with_listen(
     let outbound = config
         .outbound_connector()
         .map_err(RunError::InvalidOutbound)?;
-    let runtime = Arc::new(Runtime::new(outbound).with_fronting(
-        config.fronting_domain.clone(),
-        Duration::from_secs(config.fronting_cooldown),
-    ));
+    let runtime = Arc::new(
+        Runtime::new(outbound)
+            .with_cf_ips(config.cf_ips.clone())
+            .with_fronting(
+                config.fronting_domain.clone(),
+                Duration::from_secs(config.fronting_cooldown),
+            ),
+    );
 
     tokio::pin!(shutdown);
 
@@ -231,6 +235,24 @@ pub async fn run_with_listen(
         info!("  Cloudflare Worker domain(s):");
         for domain in cf_worker_domains {
             info!("    {}", domain);
+        }
+    }
+
+    if !config.cf_ips.is_empty() {
+        info!(
+            "  Cloudflare preferred IP(s): {}",
+            config
+                .cf_ips
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        if config.cf_domains.is_empty() && cf_worker_domains.is_empty() {
+            warn!(
+                "  ⚠  --cf-ip has no effect: no --cf-domain, --default-domains, \
+                 or --cf-worker-domain route is configured"
+            );
         }
     }
 

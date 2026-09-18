@@ -305,6 +305,29 @@ pub struct Config {
     #[arg(long = "cf-balance", env = "TG_CF_BALANCE")]
     pub cf_balance: bool,
 
+    /// Preferred Cloudflare edge IP(s) for the CF proxy and CF Worker tiers
+    /// (IPv4 or IPv6).
+    ///
+    /// When set, those tiers dial the next of these addresses instead of
+    /// resolving the `kws{N}` / Worker record — skipping whatever edge
+    /// DNS/anycast would have assigned. TLS SNI and HTTP `Host` still use the
+    /// real record, so certificates and routing inside Cloudflare are
+    /// unchanged. Multiple IPs are round-robined across dials (inline connects
+    /// and pool refills alike); typically fed from a latency scan of
+    /// Cloudflare's ranges for networks where the assigned edge is slow or
+    /// blocked.
+    ///
+    /// Applies to `--cf-domain`/`--default-domains` and `--cf-worker-domain`
+    /// connections only — never to direct-WS (`--dc-ip`), upstream MTProto
+    /// proxies, or the TCP fallback.
+    #[arg(
+        long = "cf-ip",
+        value_name = "IP",
+        value_delimiter = ',',
+        env = "TG_CF_IP"
+    )]
+    pub cf_ips: Vec<std::net::IpAddr>,
+
     // ── Timeout / cooldown knobs ─────────────────────────────────────────
     /// WebSocket connection timeout in seconds (normal path).
     #[arg(

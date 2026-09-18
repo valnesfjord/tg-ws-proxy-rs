@@ -53,6 +53,17 @@ tg-ws-proxy --cf-worker-domain random-symbols-1234.username.workers.dev --check
 кода Worker'а, ещё до того как его `connect()` до датацентра отработает, поэтому
 успешный апгрейд сам по себе ничего не доказывает.
 
+### Предпочитаемые IP Cloudflare (`--cf-ip`)
+
+Если домены `workers.dev` или назначенный Cloudflare anycast-IP работают медленно или блокируются, можно передать проверенные IPv4/IPv6-адреса Cloudflare через `--cf-ip`:
+
+```bash
+tg-ws-proxy --cf-worker-domain random-symbols-1234.username.workers.dev \
+  --cf-ip 104.16.1.1,104.17.2.2,2606:4700::1
+```
+
+DNS для подключения к Worker'у использоваться не будет; прокси последовательно переберёт указанные IP-адреса, сохраняя домен Worker'а в TLS SNI и заголовке `Host`.
+
 ### Код Worker'а
 ```javascript
 import { connect } from "cloudflare:sockets";

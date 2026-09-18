@@ -80,6 +80,17 @@ fn fallback_ip_is_known_for_every_built_in_dc() {
 }
 
 #[test]
+fn preferred_cf_ips_are_handed_through() {
+    let ips = vec![
+        "203.0.113.10".parse().unwrap(),
+        "2001:db8::10".parse().unwrap(),
+    ];
+    let runtime = Runtime::new(OutboundConnector::direct()).with_cf_ips(ips.clone());
+
+    assert_eq!(runtime.cf_ips(), ips);
+}
+
+#[test]
 fn the_configured_outbound_connector_is_handed_through() {
     // What `summary()` renders is covered by tests/outbound.rs; here we only
     // care that Runtime hands back the connector it was built with.

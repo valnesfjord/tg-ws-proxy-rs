@@ -192,6 +192,7 @@ tg-ws-proxy [OPTIONS]
 | `--default-domains` | off | Fetch and use the built-in CF proxy domain list from GitHub (no Cloudflare setup needed) |
 | `--cf-priority` | off | Try the CF tiers (Worker, then CF proxy) **before** direct WS for all DCs |
 | `--cf-balance` | off | Round-robin load balance across multiple `--cf-domain` and `--cf-worker-domain` values |
+| `--cf-ip <IP>` | DNS | Preferred Cloudflare edge IPv4/IPv6 addresses for CF proxy and Worker connections (comma-separated/repeatable); tries every address, never DNS-falls back |
 | `--ip-fail-cooldown <SECS>` | `3600` | How long to skip the direct WS path for a `--dc-ip` address whose TCP connect timed out, when a Cloudflare/upstream fallback is configured |
 | `--fronting-domain <DOMAIN>` | off | Domain-fronting fallback SNI, e.g. `sprinthost.ru` |
 | `--fronting-cooldown <SECS>` | `1800` | How long the fronting fallback stays active after it last succeeded |

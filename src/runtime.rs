@@ -5,6 +5,7 @@
 //! stateless pass-throughs to `config`, kept as methods so call sites can take
 //! everything they need from one place.
 
+use std::net::IpAddr;
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 
@@ -16,6 +17,9 @@ const DEFAULT_FRONTING_COOLDOWN: Duration = Duration::from_secs(1800);
 
 pub struct Runtime {
     outbound: OutboundConnector,
+    /// Preferred Cloudflare edges from `--cf-ip`. Empty means DNS picks the
+    /// anycast edge as usual.
+    cf_ips: Vec<IpAddr>,
     /// Domain-fronting SNI, when enabled via `--fronting-domain`. `None` means
     /// the fallback is disabled entirely (the default).
     fronting_domain: Option<String>,
@@ -31,10 +35,17 @@ impl Runtime {
     pub fn new(outbound: OutboundConnector) -> Self {
         Self {
             outbound,
+            cf_ips: Vec::new(),
             fronting_domain: None,
             fronting_cooldown: DEFAULT_FRONTING_COOLDOWN,
             fronting_until: StdMutex::new(None),
         }
+    }
+
+    /// Configure preferred Cloudflare edges (`--cf-ip`).
+    pub fn with_cf_ips(mut self, ips: Vec<IpAddr>) -> Self {
+        self.cf_ips = ips;
+        self
     }
 
     /// Configure the domain-fronting fallback. `domain: None` keeps it disabled.
@@ -46,6 +57,10 @@ impl Runtime {
 
     pub fn outbound(&self) -> &OutboundConnector {
         &self.outbound
+    }
+
+    pub fn cf_ips(&self) -> &[IpAddr] {
+        &self.cf_ips
     }
 
     pub fn websocket_dc(&self, dc: u32) -> u32 {

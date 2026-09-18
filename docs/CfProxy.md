@@ -110,6 +110,24 @@ the direct-WS timeout before reaching the Worker.
 tg-ws-proxy --dc-ip 2:149.154.167.220 --cf-domain yourdomain.com --cf-priority
 ```
 
+### Preferred Cloudflare IPs
+
+`--cf-ip` bypasses Cloudflare DNS/anycast selection for both regular CF proxy
+and CF Worker connections. Supply one or more tested Cloudflare edge IPv4 or
+IPv6 addresses; each connection rotates the first candidate and then tries the
+whole list before failing:
+
+```sh
+tg-ws-proxy --cf-domain yourdomain.com \
+  --cf-ip 104.16.1.1,104.17.2.2,2606:4700::1
+```
+
+The hostname is still used for TLS SNI and HTTP `Host`, so certificate
+verification and routing to `kwsN.yourdomain.com` remain correct. The IP list
+is global because it selects a Cloudflare edge, not a Telegram DC. While set,
+CF connections never fall back to DNS; remove `--cf-ip` to restore normal
+DNS/anycast selection.
+
 ## Verifying your configuration with `--check`
 
 Before starting the proxy server, you can verify that your CF domain(s) and
@@ -148,4 +166,3 @@ Common causes:
 
 The check exits with status code `0` if all probes pass, or `1` if any fail,
 making it suitable for use in scripts or watchdog setups.
-

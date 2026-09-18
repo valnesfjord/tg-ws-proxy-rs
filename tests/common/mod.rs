@@ -272,10 +272,14 @@ pub async fn run_proxy_once_for_dc(config: Config, dc: i16) {
 /// (e.g. the inbound FakeTLS camouflage) drive the client side themselves.
 pub async fn start_proxy_connection(config: Config) -> (TcpStream, JoinHandle<()>) {
     let outbound = config.outbound_connector().unwrap();
-    let runtime = Arc::new(Runtime::new(outbound).with_fronting(
-        config.fronting_domain.clone(),
-        Duration::from_secs(config.fronting_cooldown),
-    ));
+    let runtime = Arc::new(
+        Runtime::new(outbound)
+            .with_cf_ips(config.cf_ips.clone())
+            .with_fronting(
+                config.fronting_domain.clone(),
+                Duration::from_secs(config.fronting_cooldown),
+            ),
+    );
     let pool = Arc::new(WsPool::with_runtime(
         0,
         Duration::from_secs(config.pool_max_age),

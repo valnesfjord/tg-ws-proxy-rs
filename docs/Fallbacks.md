@@ -59,6 +59,35 @@ Every connection retries every configured CF domain fresh — a failure isn't
 remembered across connections (matching upstream tg-ws-proxy), so one flaky
 domain can never block the others, or the whole DC, from being tried.
 
+### `--cf-ip` — preferred Cloudflare edges
+
+Cloudflare normally resolves each `kws{N}` / Worker hostname to an anycast
+edge selected by DNS. On networks where that assigned edge is slow or blocked,
+`--cf-ip` can pin both Cloudflare tiers to one or more tested edge addresses:
+
+```bash
+# IPv4 and IPv6; comma-separated or repeat the flag
+tg-ws-proxy --cf-domain example.net \
+  --cf-ip 104.16.1.1,104.17.2.2,2606:4700::1
+
+# The same preferred edges also apply to Workers
+tg-ws-proxy --cf-worker-domain worker.example.dev \
+  --cf-ip 104.16.1.1 --cf-ip 2606:4700::1
+```
+
+The list is global, not per DC: these addresses select the **Cloudflare edge**,
+not the Telegram backend. The original hostname remains the TLS SNI and HTTP
+`Host`, so its certificate and Cloudflare routing still select the correct
+`kws{N}` record or Worker. Each logical connection rotates which IP gets first
+chance, then tries every configured address before declaring that hostname
+failed. While the list is set, CF connections never fall back to DNS; remove
+`--cf-ip` to restore normal DNS/anycast selection.
+
+This affects only the CF proxy and CF Worker tiers. Direct WS (`--dc-ip`),
+upstream MTProto proxies, and raw TCP fallback keep their existing targets.
+When `--outbound-proxy` is also set, its CONNECT/SOCKS destination is the
+selected CF IP rather than the hostname; SNI/Host remain unchanged.
+
 ### `--cf-balance` — round-robin load balancing
 
 When multiple `--cf-domain` values are given, connections normally always start
