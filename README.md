@@ -71,7 +71,7 @@ The binary lands in `target/release/tg-ws-proxy`. Cross-compiling for OpenWrt
 
 A Jetpack Compose app in `android/` runs the same core as a library: paste the
 CLI flags, start/stop, open the `tg://proxy` link. Install the APK from the
-[Releases](../../releases) page, or build it from source — see
+[Releases](../../releases) page or [F-Droid](https://f-droid.org/packages/io.github.valnesfjord.tgwsproxyrs), or build it from source — see
 [docs/Android.md](docs/Android.md).
 
 ### OpenWrt
