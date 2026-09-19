@@ -1,5 +1,5 @@
 use clap::Parser;
-use tg_ws_proxy_rs::config::Config;
+use tg_ws_proxy_rs::config::{Config, UpstreamTier};
 
 #[test]
 fn ee_secret_supplies_inbound_faketls_domain_and_key() {
@@ -421,6 +421,223 @@ fn timeout_and_cooldown_defaults_match_the_documented_values() {
     assert_eq!(cfg.pool_size, 4);
     assert_eq!(cfg.pool_max_age, 55);
     assert_eq!(cfg.port, 1443);
+}
+
+#[test]
+fn pinned_upstreams_parse_per_traffic_class() {
+    let cfg = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--pinned-upstream",
+        "cfworker,cfproxy",
+        "--pinned-media-upstream",
+        "tcp",
+    ])
+    .unwrap();
+
+    assert_eq!(
+        cfg.pinned_upstreams,
+        [UpstreamTier::Cfworker, UpstreamTier::Cfproxy]
+    );
+    assert_eq!(cfg.pinned_media_upstreams, [UpstreamTier::Tcp]);
+    assert_eq!(
+        cfg.forced_upstreams(false),
+        Some(&[UpstreamTier::Cfworker, UpstreamTier::Cfproxy][..])
+    );
+    assert_eq!(cfg.forced_upstreams(true), Some(&[UpstreamTier::Tcp][..]));
+}
+
+#[test]
+fn pinned_upstreams_default_to_the_builtin_ladder() {
+    let cfg = Config::try_parse_from(["tg-ws-proxy"]).unwrap();
+
+    assert!(cfg.forced_upstreams(false).is_none());
+    assert!(cfg.forced_upstreams(true).is_none());
+}
+
+#[test]
+fn media_inherits_the_non_media_pin_when_not_pinned_itself() {
+    let cfg = Config::try_parse_from(["tg-ws-proxy", "--pinned-upstream", "cfproxy,tcp"]).unwrap();
+
+    assert_eq!(
+        cfg.forced_upstreams(false),
+        Some(&[UpstreamTier::Cfproxy, UpstreamTier::Tcp][..])
+    );
+    // Without its own pin, media must not silently fall back to the default
+    // ladder — that would undo the egress decision the operator made.
+    assert_eq!(
+        cfg.forced_upstreams(true),
+        Some(&[UpstreamTier::Cfproxy, UpstreamTier::Tcp][..])
+    );
+}
+
+#[test]
+fn a_media_pin_overrides_the_inherited_one() {
+    let cfg = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--pinned-upstream",
+        "cfproxy,tcp",
+        "--pinned-media-upstream",
+        "ws",
+    ])
+    .unwrap();
+
+    assert_eq!(cfg.forced_upstreams(true), Some(&[UpstreamTier::Ws][..]));
+    assert_eq!(
+        cfg.forced_upstreams(false),
+        Some(&[UpstreamTier::Cfproxy, UpstreamTier::Tcp][..])
+    );
+}
+
+#[test]
+fn legacy_cf_priority_expands_into_a_pin() {
+    // --cf-priority is undocumented sugar kept for deployed configs.  Only
+    // the tiers actually configured make it into the expansion — the legacy
+    // flag was always a no-op for a missing tier, and pinning one would make
+    // startup refuse instead.  An explicit pin is never overridden.
+    let full = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--cf-priority",
+        "--cf-worker-domain",
+        "w.example.dev",
+        "--cf-domain",
+        "cf.example.net",
+        "--mtproto-proxy",
+        "u.example:443:00112233445566778899aabbccddeeff",
+    ])
+    .unwrap()
+    .with_defaults();
+
+    let expected = [
+        UpstreamTier::Cfworker,
+        UpstreamTier::Cfproxy,
+        UpstreamTier::Ws,
+        UpstreamTier::Mtproto,
+        UpstreamTier::Tcp,
+    ];
+    assert_eq!(full.forced_upstreams(false), Some(&expected[..]));
+    assert_eq!(full.forced_upstreams(true), Some(&expected[..]));
+
+    // The most common legacy combo: CF proxy only, no Worker / upstream.
+    let cf_only = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--cf-priority",
+        "--cf-domain",
+        "cf.example.net",
+    ])
+    .unwrap()
+    .with_defaults();
+    assert_eq!(
+        cf_only.forced_upstreams(false),
+        Some(&[UpstreamTier::Cfproxy, UpstreamTier::Ws, UpstreamTier::Tcp][..])
+    );
+
+    // Nothing CF configured at all: the flag used to be a plain no-op, so the
+    // expansion must not name a tier startup would reject.
+    let bare = Config::try_parse_from(["tg-ws-proxy", "--cf-priority"])
+        .unwrap()
+        .with_defaults();
+    assert_eq!(
+        bare.forced_upstreams(false),
+        Some(&[UpstreamTier::Ws, UpstreamTier::Tcp][..])
+    );
+    assert!(bare.validate_pinned_upstreams().is_ok());
+
+    // --default-domains alone still earns the cfproxy slot (the list arrives
+    // with the startup fetch).
+    let fetched = Config::try_parse_from(["tg-ws-proxy", "--cf-priority", "--default-domains"])
+        .unwrap()
+        .with_defaults();
+    assert_eq!(
+        fetched.forced_upstreams(false),
+        Some(&[UpstreamTier::Cfproxy, UpstreamTier::Ws, UpstreamTier::Tcp][..])
+    );
+
+    let explicit = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--cf-priority",
+        "--pinned-upstream",
+        "tcp",
+        "--pinned-media-upstream",
+        "ws",
+    ])
+    .unwrap()
+    .with_defaults();
+    assert_eq!(
+        explicit.forced_upstreams(false),
+        Some(&[UpstreamTier::Tcp][..])
+    );
+    assert_eq!(
+        explicit.forced_upstreams(true),
+        Some(&[UpstreamTier::Ws][..])
+    );
+}
+
+#[test]
+fn pinned_upstreams_reject_unknown_tier_names() {
+    let cfg = Config::try_parse_from(["tg-ws-proxy", "--pinned-media-upstream", "bogus"]);
+
+    assert!(cfg.is_err());
+}
+
+#[test]
+fn pinned_upstream_validation_rejects_unconfigured_tiers() {
+    // cfworker / cfproxy / mtproto pinned with nothing behind them must be
+    // refused; each tier becomes valid once its own flag is present.
+    let cases = [
+        (
+            "--pinned-upstream",
+            "cfworker",
+            "--cf-worker-domain",
+            "w.example.dev",
+        ),
+        (
+            "--pinned-upstream",
+            "cfproxy",
+            "--cf-domain",
+            "cf.example.net",
+        ),
+        (
+            "--pinned-media-upstream",
+            "mtproto",
+            "--mtproto-proxy",
+            "u.example:443:00112233445566778899aabbccddeeff",
+        ),
+    ];
+    for (pin_flag, tier, _config_flag, config_value) in cases {
+        let broken = Config::try_parse_from(["tg-ws-proxy", pin_flag, tier])
+            .unwrap()
+            .with_defaults();
+        assert!(
+            broken.validate_pinned_upstreams().is_err(),
+            "{tier} pin without its config must be rejected"
+        );
+
+        let fixed =
+            Config::try_parse_from(["tg-ws-proxy", pin_flag, tier, _config_flag, config_value])
+                .unwrap()
+                .with_defaults();
+        assert!(
+            fixed.validate_pinned_upstreams().is_ok(),
+            "{tier} pin with its config must be accepted"
+        );
+    }
+}
+
+#[test]
+fn pinned_upstream_validation_exempts_ws_and_tcp() {
+    // Whether ws is usable depends on the per-DC --dc-ip target, and tcp
+    // always has the built-in fallback IP — neither can be judged at startup.
+    let cfg = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--pinned-upstream",
+        "ws",
+        "--pinned-media-upstream",
+        "tcp",
+    ])
+    .unwrap()
+    .with_defaults();
+
+    assert!(cfg.validate_pinned_upstreams().is_ok());
 }
 
 #[test]

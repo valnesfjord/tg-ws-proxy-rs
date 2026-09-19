@@ -14,7 +14,7 @@ use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 use crate::check;
-use crate::config::Config;
+use crate::config::{Config, UpstreamTier};
 use crate::default_domains;
 use crate::limits::{auto_max_connections, soft_nofile_limit};
 use crate::pool::WsPool;
@@ -26,6 +26,9 @@ use crate::runtime::Runtime;
 pub enum RunError {
     /// `--outbound-proxy` / `NO_PROXY` could not be parsed.
     InvalidOutbound(String),
+    /// A pinned upstream tier (`--pinned-upstream` / `--pinned-media-upstream`)
+    /// names a tier nothing configures.
+    InvalidPin(String),
     /// `{host}:{port}` is not a valid socket address.
     InvalidListenAddress(String),
     /// The listen socket could not be bound.
@@ -41,6 +44,7 @@ impl std::fmt::Display for RunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidOutbound(e) => write!(f, "invalid outbound proxy config: {e}"),
+            Self::InvalidPin(e) => write!(f, "invalid pinned upstream config: {e}"),
             Self::InvalidListenAddress(addr) => write!(f, "invalid listen address: {addr}"),
             Self::Bind { addr, source } => write!(f, "cannot bind {addr}: {source}"),
             Self::CheckFailed => write!(f, "connectivity check failed"),
@@ -121,6 +125,32 @@ pub async fn run_with_listen(
         };
         info!("  Got {} default CF domain(s)", fetched.len());
         config.cf_domains.extend(fetched);
+    }
+
+    // ── Pinned upstream sanity ───────────────────────────────────────────
+    // After the domain fetch (so a cfproxy pin plus --default-domains is
+    // judged on the fetched list) and before anything binds: a class pinned
+    // to an unconfigured tier would drop every connection at runtime.
+    config
+        .validate_pinned_upstreams()
+        .map_err(RunError::InvalidPin)?;
+    for (flag, tiers) in [
+        ("--pinned-upstream", &config.pinned_upstreams),
+        ("--pinned-media-upstream", &config.pinned_media_upstreams),
+    ] {
+        if let Some(pos) = tiers.iter().position(|t| *t == UpstreamTier::Tcp)
+            && pos + 1 != tiers.len()
+        {
+            warn!(
+                "{flag}: tcp is a terminal tier — everything listed after it \
+                 ({}) is never reached",
+                tiers[pos + 1..]
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
     }
 
     // ── Connectivity check mode (--check) ────────────────────────────────
@@ -215,9 +245,6 @@ pub async fn run_with_listen(
         for d in &config.cf_domains {
             info!("    {} (kws{{N}}.{} subdomains)", d, d);
         }
-        if config.cf_priority {
-            info!("    ⚡ CF priority mode: CF proxy is tried BEFORE direct WS");
-        }
         if config.cf_balance && config.cf_domains.len() > 1 {
             info!("    ⚖  CF balance mode: connections are round-robin'd across domains");
         }
@@ -228,6 +255,25 @@ pub async fn run_with_listen(
         info!("  Cloudflare Worker domain(s):");
         for domain in cf_worker_domains {
             info!("    {}", domain);
+        }
+    }
+
+    if !config.pinned_upstreams.is_empty() || !config.pinned_media_upstreams.is_empty() {
+        info!("  Pinned upstream order (default ladder is used for the rest):");
+        let names = |tiers: &[UpstreamTier]| {
+            tiers
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        if !config.pinned_upstreams.is_empty() {
+            info!("    non-media: {}", names(&config.pinned_upstreams));
+        }
+        if !config.pinned_media_upstreams.is_empty() {
+            info!("    media: {}", names(&config.pinned_media_upstreams));
+        } else if !config.pinned_upstreams.is_empty() {
+            info!("    media: inherits non-media pin above");
         }
     }
 

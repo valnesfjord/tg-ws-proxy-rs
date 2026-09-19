@@ -41,7 +41,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use tungstenite::Message;
 
-use crate::config::{Config, MtProtoProxy};
+use crate::config::{Config, MtProtoProxy, UpstreamTier};
 use crate::crypto::{
     AesCtr256, ConnectionCiphers, ProtoTag, build_connection_ciphers, generate_client_handshake,
     generate_relay_init, parse_handshake,
@@ -679,6 +679,13 @@ struct Route<'a> {
 /// Without it the direct WebSocket path is skipped entirely and the Python
 /// reference's order is used (Worker, CF proxy, upstream proxies, then TCP).
 async fn select_upstream(route: &Route<'_>, target_ip: Option<&str>) -> Option<Upstream> {
+    // ── Pinned per-class ladder (--pinned-upstream / --pinned-media-upstream)
+    // Replaces the default priority order wholesale, including --cf-priority:
+    // the user asked for exactly these tiers in exactly this order.
+    if let Some(tiers) = route.config.forced_upstreams(route.is_media) {
+        return route.pinned_ladder(tiers, target_ip).await;
+    }
+
     let Some(target_ip) = target_ip else {
         // Every log line already carries the DC, so the reason only has to say
         // what is missing.
@@ -693,18 +700,11 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<&str>) -> Option<U
 
         return Some(
             route
-                .fallback_chain(fallback, reason, false)
+                .fallback_chain(fallback, reason)
                 .await
                 .unwrap_or_else(|| route.tcp_fallback(fallback, reason)),
         );
     };
-
-    // ── CF priority — try both CF tiers before direct WS if enabled ──────
-    if route.config.cf_priority
-        && let Some(upstream) = route.cf_tiers(target_ip, "cf-priority").await
-    {
-        return Some(upstream);
-    }
 
     // ── An IP that just timed out is stepped over ────────────────────────
     // A DPI-blocked DC IP does not come back within one connection's
@@ -726,10 +726,7 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<&str>) -> Option<U
         // raw-TCP path for the rest of the cooldown.  That is what makes the
         // cooldown self-healing — a direct connect is the only thing that
         // clears it, so something has to keep asking.
-        if let Some(upstream) = route
-            .fallback_chain(target_ip, reason, route.config.cf_priority)
-            .await
-        {
+        if let Some(upstream) = route.fallback_chain(target_ip, reason).await {
             return Some(upstream);
         }
 
@@ -740,36 +737,11 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<&str>) -> Option<U
     }
 
     // ── Pool first, then a fresh WebSocket connect ───────────────────────
-    let pooled = route
-        .pool
-        .get(
-            route.dc,
-            route.is_media,
-            target_ip,
-            route.config.skip_tls_verify,
-            !IP_FAIL.active(target_ip),
-        )
-        .await;
-    if let Some(ws) = pooled {
-        info!(
-            "[{}] DC{}{} → pool hit via {}",
-            route.label, route.dc, route.media, target_ip
-        );
-        return Some(Upstream::Ws {
-            ws,
-            framing: WsFraming::Packets,
-        });
-    }
-
-    if let Some(ws) = route.direct_ws(target_ip).await {
-        return Some(Upstream::Ws {
-            ws,
-            framing: WsFraming::Packets,
-        });
+    if let Some(upstream) = route.direct_ws_tier(target_ip).await {
+        return Some(upstream);
     }
 
     // WS failed (and is now in cooldown) — walk the rest of the ladder.
-    // `--cf-priority` already tried both CF tiers above, so skip them here.
     let reason = "WS failed";
     if ip_cooling {
         // The re-probe above was the last thing left to try: every other tier
@@ -780,24 +752,163 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<&str>) -> Option<U
 
     Some(
         route
-            .fallback_chain(target_ip, reason, route.config.cf_priority)
+            .fallback_chain(target_ip, reason)
             .await
             .unwrap_or_else(|| route.tcp_last_resort(target_ip, reason)),
     )
 }
 
 impl Route<'_> {
+    /// The direct-WebSocket rung shared by both ladders: pool first, then a
+    /// fresh connect (fronted from the first attempt when configured).
+    async fn direct_ws_tier(&self, target_ip: &str) -> Option<Upstream> {
+        let pooled = self
+            .pool
+            .get(
+                self.dc,
+                self.is_media,
+                target_ip,
+                self.config.skip_tls_verify,
+                !IP_FAIL.active(target_ip),
+            )
+            .await;
+        if let Some(ws) = pooled {
+            info!(
+                "[{}] DC{}{} → pool hit via {}",
+                self.label, self.dc, self.media, target_ip
+            );
+            return Some(Upstream::Ws {
+                ws,
+                framing: WsFraming::Packets,
+            });
+        }
+
+        self.direct_ws(target_ip).await.map(|ws| Upstream::Ws {
+            ws,
+            framing: WsFraming::Packets,
+        })
+    }
+
+    /// Walk the user-pinned tier order (`--pinned-upstream` /
+    /// `--pinned-media-upstream`) instead of the default ladder.
+    ///
+    /// Each tier runs with the same pool, cooldown and fronting behavior it
+    /// has in the default ladder; the first tier that produces a connection
+    /// wins.  A tier that is not configured — or not reachable, like `ws` for
+    /// a DC without a `--dc-ip` target — is skipped with a log line, so the
+    /// user can see the pin referring to nothing.  When every listed tier
+    /// fails, the connection is dropped: pinning is opt-in, so tiers the user
+    /// left out are not quietly re-added as fallbacks.
+    ///
+    /// The one departure from the default cooldown behavior is on the last
+    /// tier that can still connect: the Worker and upstream-MTProto rungs
+    /// dial through their cooldown there instead of skipping.  In the default
+    /// ladder a cooldown only buys a faster step to the next rung, and the
+    /// terminal TCP rung always attempts; a pin has no next rung, so
+    /// respecting the skip would turn one transient failure into a
+    /// cooldown-length outage with nothing left to clear it.
+    async fn pinned_ladder(
+        &self,
+        tiers: &[UpstreamTier],
+        target_ip: Option<&str>,
+    ) -> Option<Upstream> {
+        for (index, tier) in tiers.iter().enumerate() {
+            let last_resort = !self.tier_attemptable_after(tiers, index + 1, target_ip);
+            match tier {
+                UpstreamTier::Ws => {
+                    let Some(target_ip) = target_ip else {
+                        warn!(
+                            "[{}] DC{}{} pinned ws tier has no --dc-ip target, skipping",
+                            self.label, self.dc, self.media
+                        );
+                        continue;
+                    };
+                    if let Some(upstream) = self.direct_ws_tier(target_ip).await {
+                        return Some(upstream);
+                    }
+                }
+                UpstreamTier::Cfworker => {
+                    let Some(dst) = self.runtime.fallback_ip(self.dc).or(target_ip) else {
+                        warn!(
+                            "[{}] DC{}{} pinned cfworker tier has no destination IP, skipping",
+                            self.label, self.dc, self.media
+                        );
+                        continue;
+                    };
+                    if let Some(ws) = self.cf_worker(dst, "pinned", last_resort).await {
+                        return Some(Upstream::Ws {
+                            ws,
+                            framing: WsFraming::Tunnel,
+                        });
+                    }
+                }
+                UpstreamTier::Cfproxy => {
+                    if let Some(ws) = self.cf_proxy("pinned").await {
+                        return Some(Upstream::Ws {
+                            ws,
+                            framing: WsFraming::Packets,
+                        });
+                    }
+                }
+                UpstreamTier::Mtproto => {
+                    if let Some(conn) = self.upstream_proxies("pinned", last_resort).await {
+                        return Some(Upstream::Mtproto(conn));
+                    }
+                }
+                UpstreamTier::Tcp => {
+                    let Some(dst) = self.runtime.fallback_ip(self.dc).or(target_ip) else {
+                        warn!(
+                            "[{}] DC{}{} pinned tcp tier has no fallback IP, skipping",
+                            self.label, self.dc, self.media
+                        );
+                        continue;
+                    };
+                    return Some(self.tcp_fallback(dst, "pinned"));
+                }
+            }
+        }
+
+        warn!(
+            "[{}] DC{}{} every pinned upstream failed",
+            self.label, self.dc, self.media
+        );
+        None
+    }
+
+    /// Whether any pinned tier after `from` can produce a connection at all.
+    ///
+    /// Mirrors the rungs' own skip conditions: `ws` needs a `--dc-ip` target,
+    /// the Cloudflare and upstream rungs need their configuration, `tcp`
+    /// needs any destination. This is what tells the cooldown-gated rungs
+    /// whether they are the ladder's last resort.
+    fn tier_attemptable_after(
+        &self,
+        tiers: &[UpstreamTier],
+        from: usize,
+        target_ip: Option<&str>,
+    ) -> bool {
+        tiers[from..].iter().any(|tier| match tier {
+            UpstreamTier::Ws => target_ip.is_some(),
+            UpstreamTier::Cfworker => !self.config.cf_worker_domains().is_empty(),
+            UpstreamTier::Cfproxy => !self.config.cf_domains.is_empty(),
+            UpstreamTier::Mtproto => !self.config.mtproto_proxies.is_empty(),
+            UpstreamTier::Tcp => target_ip.is_some() || self.runtime.fallback_ip(self.dc).is_some(),
+        })
+    }
+
     /// The Cloudflare Worker → Cloudflare proxy → upstream MTProto ladder,
     /// shared by both entry points into the fallback chain.
     ///
     /// `dst` is the Telegram DC IP the Worker should open its TCP tunnel to.
     /// Returns `None` when every configured tier failed or was skipped.
-    async fn fallback_chain(&self, dst: &str, reason: &str, skip_cf: bool) -> Option<Upstream> {
-        if !skip_cf && let Some(upstream) = self.cf_tiers(dst, reason).await {
+    async fn fallback_chain(&self, dst: &str, reason: &str) -> Option<Upstream> {
+        if let Some(upstream) = self.cf_tiers(dst, reason).await {
             return Some(upstream);
         }
 
-        self.upstream_proxies(reason).await.map(Upstream::Mtproto)
+        self.upstream_proxies(reason, false)
+            .await
+            .map(Upstream::Mtproto)
     }
 
     /// Both Cloudflare tiers in upstream's order: Worker tunnel first, then
@@ -808,7 +919,7 @@ impl Route<'_> {
     /// `--cf-priority` entirely and pay the full direct-WS timeout on every
     /// connection before reaching its only working path.
     async fn cf_tiers(&self, dst: &str, reason: &str) -> Option<Upstream> {
-        if let Some(ws) = self.cf_worker(dst, reason).await {
+        if let Some(ws) = self.cf_worker(dst, reason, false).await {
             return Some(Upstream::Ws {
                 ws,
                 framing: WsFraming::Tunnel,
@@ -873,7 +984,10 @@ impl Route<'_> {
     }
 
     /// Try every configured Cloudflare Worker tunnel in `--cf-balance` order.
-    async fn cf_worker(&self, dst: &str, reason: &str) -> Option<TgWsStream> {
+    /// `force` dials through the per-domain failure cooldown — the pinned
+    /// ladder's last resort, where a skip would drop the connection rather
+    /// than reach a next rung.  The default ladder always passes `false`.
+    async fn cf_worker(&self, dst: &str, reason: &str, force: bool) -> Option<TgWsStream> {
         let worker_domains = self.config.cf_worker_domains();
         if worker_domains.is_empty() {
             return None;
@@ -906,7 +1020,7 @@ impl Route<'_> {
         );
 
         for worker_domain in domain_order(worker_domains, first_worker) {
-            if CF_WORKER_FAIL.active(worker_domain) {
+            if !force && CF_WORKER_FAIL.active(worker_domain) {
                 debug!(
                     "[{}] DC{}{} CF Worker {} in cooldown, skipping",
                     self.label, self.dc, self.media, worker_domain
@@ -1043,10 +1157,12 @@ impl Route<'_> {
     }
 
     /// Try each configured upstream MTProto proxy in order.
-    async fn upstream_proxies(&self, reason: &str) -> Option<UpstreamConnection> {
+    ///
+    /// `force` dials through the failure cooldown — see [`Self::cf_worker`].
+    async fn upstream_proxies(&self, reason: &str, force: bool) -> Option<UpstreamConnection> {
         for upstream in &self.config.mtproto_proxies {
             let key = upstream_key(&upstream.host, upstream.port);
-            if UPSTREAM_FAIL.active(key.as_str()) {
+            if !force && UPSTREAM_FAIL.active(key.as_str()) {
                 debug!("[{}] upstream {} in cooldown, skipping", self.label, key);
                 continue;
             }

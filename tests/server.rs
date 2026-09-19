@@ -71,6 +71,32 @@ async fn run_binds_then_stops_on_shutdown() {
 }
 
 #[tokio::test]
+async fn run_refuses_to_start_on_a_pinned_but_unconfigured_tier() {
+    // Pinning a class to a tier nothing configures would drop every one of
+    // its connections at runtime; startup is the place to say so.
+    let config = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--quiet",
+        "--pinned-media-upstream",
+        "cfproxy",
+    ])
+    .unwrap()
+    .with_defaults();
+
+    let err = server::run(config, std::future::pending())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, server::RunError::InvalidPin(_)),
+        "expected InvalidPin, got {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn port_zero_reports_the_real_bound_port_in_the_link() {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let (listen_tx, listen_rx) = tokio::sync::oneshot::channel();

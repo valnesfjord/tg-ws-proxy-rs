@@ -190,7 +190,7 @@ tg-ws-proxy [OPTIONS]
 | `--cf-domain <DOMAIN>` | — | Cloudflare-proxied domain(s) for alternative WS routing, comma-separated |
 | `--cf-worker-domain <DOMAIN>` | — | Cloudflare Worker domain(s) for TCP-tunnel fallback, comma-separated/repeatable |
 | `--default-domains` | off | Fetch and use the built-in CF proxy domain list from GitHub (no Cloudflare setup needed) |
-| `--cf-priority` | off | Try the CF tiers (Worker, then CF proxy) **before** direct WS for all DCs |
+| `--pinned-upstream <TIERS>` / `--pinned-media-upstream <TIERS>` | default ladder | Pin the upstream tier order (`ws,cfworker,cfproxy,mtproto,tcp`, try-order); the media flag overrides the base one for media connections, which otherwise inherit it (see [docs/Fallbacks.md](docs/Fallbacks.md#pinning-the-tier-order-per-traffic-class)) |
 | `--cf-balance` | off | Round-robin load balance across multiple `--cf-domain` and `--cf-worker-domain` values |
 | `--ip-fail-cooldown <SECS>` | `3600` | How long to skip the direct WS path for a `--dc-ip` address whose TCP connect timed out, when a Cloudflare/upstream fallback is configured |
 | `--fronting-domain <DOMAIN>` | off | Always present this domain as the TLS SNI for direct WS connections (fronting), e.g. `sprinthost.ru`; needs `--dc-ip` |
@@ -236,8 +236,8 @@ tg-ws-proxy --port 9050 --dc-ip 1:149.154.175.205 --dc-ip 2:149.154.167.220
 # Use default CF domains from GitHub — no Cloudflare setup required
 tg-ws-proxy --default-domains
 
-# Default domains + CF priority (try CF first, fall back to direct WS)
-tg-ws-proxy --default-domains --cf-priority
+# Default domains + CF-first pin (try CF first, fall back to direct WS)
+tg-ws-proxy --default-domains --pinned-upstream cfworker,cfproxy,ws,mtproto,tcp
 
 # Your own Cloudflare-proxied domain
 tg-ws-proxy --cf-domain yourdomain.com

@@ -27,7 +27,7 @@ use tracing::{debug, warn};
 
 use futures_util::{FutureExt, StreamExt, stream};
 
-use crate::config::Config;
+use crate::config::{Config, UpstreamTier};
 use crate::outbound::OutboundConnector;
 use crate::runtime::Runtime;
 use crate::ws_client::{
@@ -318,10 +318,21 @@ impl WsPool {
         let skip_tls = config.skip_tls_verify;
         let pool_size = self.pool_size;
 
+        // A class pinned away from the ws tier never draws from its pool
+        // bucket, so pre-warming it only dials into a path no client will
+        // use.
+        let pinned_off_ws = |is_media: bool| {
+            config
+                .forced_upstreams(is_media)
+                .is_some_and(|tiers| !tiers.contains(&UpstreamTier::Ws))
+        };
+        let (skip_non_media, skip_media) = (pinned_off_ws(false), pinned_off_ws(true));
+
         let jobs = dc_redirects.into_iter().flat_map(|(dc, ip)| {
-            [false, true]
-                .into_iter()
-                .map(move |is_media| (dc, ip.clone(), is_media))
+            [false, true].into_iter().filter_map(move |is_media| {
+                let skip = if is_media { skip_media } else { skip_non_media };
+                (!skip).then(|| (dc, ip.clone(), is_media))
+            })
         });
         let mut batches = stream::iter(jobs)
             .map(|(dc, ip, is_media)| async move {

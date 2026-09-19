@@ -11,12 +11,68 @@ direct WS to the DC              ← default
   ↓ direct TCP :443              ← last resort
 ```
 
-`--cf-priority` flips the first two groups: the Cloudflare tiers (Worker first,
-then CF proxy) are tried **before** direct WebSocket for all DCs. Domain
-fronting is a modifier on the direct-WS tier rather than a tier of its own.
+Domain fronting is a modifier on the direct-WS tier rather than a tier of its
+own; the whole order can also be [pinned per traffic class](#pinning-the-tier-order-per-traffic-class).
 
 A small pool of pre-connected WebSocket connections is kept per DC
 (`--pool-size`) so later clients skip the handshake latency.
+
+## Pinning the tier order per traffic class
+
+Every client handshake says whether it wants a **media DC** (negative DC index)
+— where Telegram clients already put photo/video/file transfers — or not.
+`--pinned-upstream` pins the tier order for both classes as a comma-separated
+list tried in the order given; `--pinned-media-upstream` overrides it for media
+connections only:
+
+| Name | Tier |
+|---|---|
+| `ws` | direct WebSocket (needs a `--dc-ip` target for the DC) |
+| `cfworker` | Cloudflare Worker tunnel (`--cf-worker-domain`) |
+| `cfproxy` | Cloudflare proxy (`--cf-domain` / `--default-domains`) |
+| `mtproto` | upstream MTProto proxy (`--mtproto-proxy`) |
+| `tcp` | raw TCP :443 to the DC |
+
+```bash
+# Media transfers over raw TCP only; everything else keeps the default ladder
+tg-ws-proxy --pinned-media-upstream tcp
+
+# Control traffic pinned to upstream MTProto proxies, media to the CF proxy
+tg-ws-proxy --pinned-upstream mtproto --pinned-media-upstream cf
+
+# Both classes over Tor via a SOCKS outbound proxy — the pins only pick tiers,
+# the outbound proxy applies to every tier alike
+tg-ws-proxy --outbound-proxy socks5h://127.0.0.1:9050 \
+            --pinned-upstream tcp --pinned-media-upstream ws
+```
+
+Pin semantics:
+
+- The listed order **is** the fallback chain: a tier that fails (connect
+  error, cooldown) hands over to the next tier listed, with the same pool,
+  cooldown and fronting behavior each tier has in the default ladder.
+  Unpinned classes keep the default order above.
+- A pin naming `cfworker`, `cfproxy` or `mtproto` with nothing configured
+  behind it refuses to start (`--cf-worker-domain` / `--cf-domain` /
+  `--default-domains` / `--mtproto-proxy`), because that class would
+  otherwise drop every connection at runtime. `ws` is judged per connection
+  instead — it is skipped with a log line for a DC without a `--dc-ip`
+  target, since availability differs per DC.
+- When every listed tier fails, the connection is **dropped** — the tiers
+  left out are not quietly re-added as fallbacks. That is deliberate: if you
+  pinned media to raw TCP so bulk transfers leave from a particular egress,
+  silently rerouting them through Cloudflare on a bad day would undo the
+  reason for the pin. List more tiers (or `tcp` last) if you want fallback
+  breadth instead.
+- `tcp` is terminal: the raw-TCP upstream is chosen without probing (the
+  connect happens in the bridge), so anything listed after it is never
+  reached — startup warns about a pin that does this.
+- Pool warm-up is skipped for a class pinned without `ws`, since its bucket
+  can never be used.
+
+Note the split is by *connection*, not by individual packet: the proxy cannot
+see inside the MTProto session, so "media" means "a connection to a media DC",
+which is where Telegram clients put bulk transfers anyway.
 
 ## Cloudflare Proxy
 
@@ -37,8 +93,9 @@ tg-ws-proxy --cf-domain primary.net,backup.com --cf-balance
 # CF-only mode: omit --dc-ip so CF proxy handles all DCs
 tg-ws-proxy --cf-domain yourdomain.com
 
-# CF priority: try the CF tiers before direct WS, with WS as fallback
-tg-ws-proxy --dc-ip 2:149.154.167.220 --cf-domain yourdomain.com --cf-priority
+# CF-first: pin the CF tiers in front of the default ladder
+tg-ws-proxy --dc-ip 2:149.154.167.220 --cf-domain yourdomain.com \
+            --pinned-upstream cfworker,cfproxy,ws,mtproto,tcp
 
 # Or via environment variable
 TG_CF_DOMAIN=yourdomain.com tg-ws-proxy
@@ -74,11 +131,12 @@ tg-ws-proxy --cf-domain d1.example.com,d2.example.com,d3.example.com --cf-balanc
 
 The remaining domains still serve as ordered fallbacks if the primary one
 fails, so resilience is unchanged. Has no effect when only one CF domain is
-configured. Can be combined with `--cf-priority`:
+configured. Can be combined with a CF-first pin:
 
 ```bash
 # Round-robin CF load balancing, tried before direct WS
-tg-ws-proxy --cf-domain d1.example.com,d2.example.com --cf-balance --cf-priority
+tg-ws-proxy --cf-domain d1.example.com,d2.example.com --cf-balance \
+            --pinned-upstream cfworker,cfproxy,ws,mtproto,tcp
 ```
 
 ### One-time domain setup
@@ -153,8 +211,8 @@ the upstream repository:
 # No Cloudflare account or DNS setup required
 tg-ws-proxy --default-domains
 
-# Enable CF priority so CF path is tried first
-tg-ws-proxy --default-domains --cf-priority
+# Enable a CF-first pin so the CF path is tried first
+tg-ws-proxy --default-domains --pinned-upstream cfworker,cfproxy,ws,mtproto,tcp
 
 # Combine with your own domain (yours gets highest priority)
 tg-ws-proxy --cf-domain yourdomain.com --default-domains
