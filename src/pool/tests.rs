@@ -48,6 +48,7 @@ async fn a_cloudflare_prefetch_burst_spawns_one_refill_task() {
             domain: "worker.example".to_string(),
             skip_tls_verify: false,
             connect_timeout: Duration::from_secs(1),
+            disable_tls: false,
         });
     }
 

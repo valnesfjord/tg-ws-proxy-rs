@@ -59,6 +59,23 @@ Every connection retries every configured CF domain fresh — a failure isn't
 remembered across connections (matching upstream tg-ws-proxy), so one flaky
 domain can never block the others, or the whole DC, from being tried.
 
+### `--cf-disable-tls` — plaintext Cloudflare transport
+
+If a TLS-intercepting middlebox breaks the WebSocket upgrade to Cloudflare,
+`--cf-disable-tls` makes both Cloudflare tiers use `ws://` on port 80 instead of
+`wss://` on port 443:
+
+```bash
+tg-ws-proxy --cf-domain yourdomain.com --cf-disable-tls
+# Equivalent environment variable:
+TG_CF_DISABLE_TLS=true tg-ws-proxy --cf-domain yourdomain.com
+```
+
+This does not affect direct WebSocket connections to Telegram, which always use
+TLS. MTProto payloads retain their own transport encryption, but plaintext HTTP
+exposes the Cloudflare hostname and traffic metadata. Prefer the default TLS
+mode unless the network requires this workaround.
+
 ### `--cf-balance` — round-robin load balancing
 
 When multiple `--cf-domain` values are given, connections normally always start
@@ -122,6 +139,8 @@ falls back to the remaining Workers if the first one fails.
 ```bash
 tg-ws-proxy --cf-worker-domain w1.user.workers.dev,w2.user.workers.dev --cf-balance
 ```
+
+`--cf-disable-tls` also applies to Worker connections.
 
 Or via environment variable:
 

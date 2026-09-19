@@ -76,6 +76,11 @@ default domain can stop working at any time.
    tg-ws-proxy
    ```
 
+   If TLS interception prevents `wss://` from connecting, add
+   `--cf-disable-tls` (or `TG_CF_DISABLE_TLS=true`) to use plaintext `ws://` on
+   port 80 for Cloudflare connections. This exposes the HTTP hostname and
+   traffic metadata, so keep the default TLS mode unless required.
+
 ## How it works
 
 When `--cf-domain` is configured the proxy:
@@ -86,6 +91,8 @@ When `--cf-domain` is configured the proxy:
    DNS resolves to Cloudflare's anycast IP.
    Cloudflare terminates TLS and forwards the WebSocket traffic as plain HTTP
    to the origin (Flexible SSL mode) — which is Telegram's actual DC server.
+   With `--cf-disable-tls`, the client-to-Cloudflare leg instead uses port 80
+   without TLS.
 3. If the CF proxy also fails, falls back to upstream MTProto proxies (if
    configured) and finally direct TCP.
 
@@ -148,4 +155,3 @@ Common causes:
 
 The check exits with status code `0` if all probes pass, or `1` if any fail,
 making it suitable for use in scripts or watchdog setups.
-

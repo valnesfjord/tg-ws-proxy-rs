@@ -61,6 +61,27 @@ pub async fn rejecting_http_proxy() -> (SocketAddr, JoinHandle<String>) {
     (proxy_addr, proxy_task)
 }
 
+/// Accept one HTTP CONNECT tunnel, capture the first tunneled HTTP request,
+/// then reject the WebSocket upgrade.
+pub async fn capturing_http_tunnel() -> (SocketAddr, JoinHandle<(String, String)>) {
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let proxy_task = tokio::spawn(async move {
+        let (mut inbound, _) = proxy.accept().await.unwrap();
+        let connect = read_http_connect_request(&mut inbound).await;
+        inbound.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
+        let request = read_http_connect_request(&mut inbound).await;
+        inbound
+            .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+
+        (connect, request)
+    });
+
+    (proxy_addr, proxy_task)
+}
+
 /// Same as [`rejecting_http_proxy`], but reports *every* `CONNECT` a fallback
 /// chain made, so a test can assert on the full shape of the chain.
 ///

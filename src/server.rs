@@ -231,6 +231,10 @@ pub async fn run_with_listen(
         }
     }
 
+    if config.cf_disable_tls && (!config.cf_domains.is_empty() || !cf_worker_domains.is_empty()) {
+        info!("  Cloudflare transport: plaintext ws:// on port 80");
+    }
+
     if !config.mtproto_proxies.is_empty() {
         info!("  Upstream MTProto proxies (WS fallback):");
         for p in &config.mtproto_proxies {

@@ -305,6 +305,20 @@ pub struct Config {
     #[arg(long = "cf-balance", env = "TG_CF_BALANCE")]
     pub cf_balance: bool,
 
+    /// Upgrade Cloudflare proxy and Worker connections over plaintext
+    /// `ws://` (port 80) instead of `wss://` (port 443).
+    ///
+    /// Useful when a TLS-MITM middlebox breaks the WebSocket upgrade to
+    /// Cloudflare but plain HTTP passes, or against a Cloudflare zone whose
+    /// SSL mode serves HTTP on port 80. The MTProto traffic inside is still
+    /// end-to-end encrypted by its own AES-CTR layer, so this exposes
+    /// transport metadata (SNI-less HTTP Host) rather than message content.
+    ///
+    /// Applies to the `cfproxy` and `cfworker` tiers only — the direct
+    /// WebSocket path to Telegram always uses TLS.
+    #[arg(long = "cf-disable-tls", env = "TG_CF_DISABLE_TLS")]
+    pub cf_disable_tls: bool,
+
     // ── Timeout / cooldown knobs ─────────────────────────────────────────
     /// WebSocket connection timeout in seconds (normal path).
     #[arg(

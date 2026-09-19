@@ -92,6 +92,15 @@ fn cf_worker_domains_accept_multiple_values_and_normalize() {
 }
 
 #[test]
+fn cf_disable_tls_is_opt_in() {
+    let default = Config::try_parse_from(["tg-ws-proxy"]).unwrap();
+    let plaintext = Config::try_parse_from(["tg-ws-proxy", "--cf-disable-tls"]).unwrap();
+
+    assert!(!default.cf_disable_tls);
+    assert!(plaintext.cf_disable_tls);
+}
+
+#[test]
 fn default_host_binds_and_links_to_the_same_address() {
     // Regression test for https://github.com/valnesfjord/tg-ws-proxy-rs/issues/82:
     // without --host, the listener must bind to whatever address link_host()

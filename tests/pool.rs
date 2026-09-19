@@ -107,6 +107,7 @@ fn worker_target(domain: &str) -> CfTarget {
         domain: domain.to_string(),
         skip_tls_verify: false,
         connect_timeout: Duration::from_secs(2),
+        disable_tls: false,
     }
 }
 
@@ -137,7 +138,9 @@ async fn cf_prefetch_reopens_the_worker_through_the_outbound_connector() {
         OutboundConnector::from_config(Some(&format!("http://{proxy_addr}")), None, false).unwrap();
     let pool = pool_with_outbound(1, outbound);
 
-    pool.cf_prefetch(worker_target("worker-prefetch.example.dev"));
+    let mut target = worker_target("worker-prefetch.example.dev");
+    target.disable_tls = true;
+    pool.cf_prefetch(target);
 
     let requests = await_proxy_requests(proxy_task).await;
     assert_eq!(
@@ -146,7 +149,7 @@ async fn cf_prefetch_reopens_the_worker_through_the_outbound_connector() {
         "a prefetch opens exactly one spare tunnel: {requests:?}"
     );
     assert!(
-        requests[0].starts_with("CONNECT worker-prefetch.example.dev:443 HTTP/1.1"),
+        requests[0].starts_with("CONNECT worker-prefetch.example.dev:80 HTTP/1.1"),
         "unexpected prefetch target: {requests:?}"
     );
 }

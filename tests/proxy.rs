@@ -172,7 +172,7 @@ async fn cf_proxy_is_retried_fresh_on_every_connection_no_cooldown() {
 }
 
 #[tokio::test]
-async fn cf_worker_is_tried_before_the_cf_proxy() {
+async fn cf_tiers_use_plaintext_without_changing_the_tcp_fallback() {
     // The Python fallback order for a DC without --dc-ip is Worker, then CF
     // proxy, then TCP: 1 + 2 + 1 = 4 CONNECTs.
     let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
@@ -183,6 +183,7 @@ async fn cf_worker_is_tried_before_the_cf_proxy() {
             "worker.example.dev",
             "--cf-domain",
             "example.net",
+            "--cf-disable-tls",
         ],
     );
 
@@ -192,9 +193,9 @@ async fn cf_worker_is_tried_before_the_cf_proxy() {
     assert_eq!(
         connect_targets(&requests),
         [
-            "worker.example.dev:443",
-            "kws2.example.net:443",
-            "kws2-1.example.net:443",
+            "worker.example.dev:80",
+            "kws2.example.net:80",
+            "kws2-1.example.net:80",
             "149.154.167.51:443",
         ]
     );

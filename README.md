@@ -192,6 +192,7 @@ tg-ws-proxy [OPTIONS]
 | `--default-domains` | off | Fetch and use the built-in CF proxy domain list from GitHub (no Cloudflare setup needed) |
 | `--cf-priority` | off | Try the CF tiers (Worker, then CF proxy) **before** direct WS for all DCs |
 | `--cf-balance` | off | Round-robin load balance across multiple `--cf-domain` and `--cf-worker-domain` values |
+| `--cf-disable-tls` | off | Use plaintext `ws://` on port 80 for CF proxy and Worker connections; direct Telegram WS remains TLS |
 | `--ip-fail-cooldown <SECS>` | `3600` | How long to skip the direct WS path for a `--dc-ip` address whose TCP connect timed out, when a Cloudflare/upstream fallback is configured |
 | `--fronting-domain <DOMAIN>` | off | Always present this domain as the TLS SNI for direct WS connections (fronting), e.g. `sprinthost.ru`; needs `--dc-ip` |
 | `--max-connections <N>` | auto | Max concurrent client connections (auto-computed from `ulimit -n`) |
@@ -247,6 +248,9 @@ tg-ws-proxy --cf-domain proxy.net,example.com --cf-balance
 
 # Free workers.dev TCP tunnel fallback
 tg-ws-proxy --cf-worker-domain random-symbols-1234.username.workers.dev
+
+# Use plaintext WebSocket to Cloudflare when TLS interception breaks WSS
+tg-ws-proxy --cf-domain yourdomain.com --cf-disable-tls
 
 # Upstream MTProto proxy fallback
 tg-ws-proxy --mtproto-proxy proxy.example.com:443:ddabcdef1234567890abcdef1234567890

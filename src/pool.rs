@@ -31,8 +31,8 @@ use crate::config::Config;
 use crate::outbound::OutboundConnector;
 use crate::runtime::Runtime;
 use crate::ws_client::{
-    TgWsStream, connect_cf_record_with_outbound, connect_cf_worker_ws_for_dc_with_outbound,
-    connect_ws_for_dc_with_outbound, media_tag,
+    TgWsStream, connect_cf_record_with_outbound_mode,
+    connect_cf_worker_ws_for_dc_with_outbound_mode, connect_ws_for_dc_with_outbound, media_tag,
 };
 
 /// Idle Cloudflare connections kept per `(tier, dc, is_media)`.
@@ -84,6 +84,8 @@ struct CfEntry {
     dst: String,
     skip_tls_verify: bool,
     connect_timeout: Duration,
+    /// `--cf-disable-tls`, kept for the replacement dial.
+    disable_tls: bool,
 }
 
 /// Everything a background Cloudflare refill needs to reopen one connection.
@@ -98,6 +100,8 @@ pub struct CfTarget {
     pub domain: String,
     pub skip_tls_verify: bool,
     pub connect_timeout: Duration,
+    /// `--cf-disable-tls`: reopen the spare over plaintext `ws://` :80.
+    pub disable_tls: bool,
 }
 
 impl CfTarget {
@@ -280,6 +284,7 @@ impl WsPool {
                 domain: entry.domain.clone(),
                 skip_tls_verify: entry.skip_tls_verify,
                 connect_timeout: entry.connect_timeout,
+                disable_tls: entry.disable_tls,
             });
 
             return Some((entry.ws, entry.domain));
@@ -454,6 +459,7 @@ impl WsPool {
                 dst: target.dst,
                 skip_tls_verify: target.skip_tls_verify,
                 connect_timeout: target.connect_timeout,
+                disable_tls: target.disable_tls,
             });
         }
     }
@@ -467,7 +473,7 @@ impl WsPool {
     async fn cf_connect_one(&self, target: &CfTarget) -> Option<TgWsStream> {
         match target.tier {
             CfTier::Worker => {
-                connect_cf_worker_ws_for_dc_with_outbound(
+                connect_cf_worker_ws_for_dc_with_outbound_mode(
                     &target.domain,
                     &target.dst,
                     target.dc,
@@ -475,15 +481,17 @@ impl WsPool {
                     target.skip_tls_verify,
                     target.connect_timeout,
                     self.runtime.outbound(),
+                    target.disable_tls,
                 )
                 .await
             }
             CfTier::Proxy => {
-                connect_cf_record_with_outbound(
+                connect_cf_record_with_outbound_mode(
                     &target.domain,
                     target.skip_tls_verify,
                     target.connect_timeout,
                     self.runtime.outbound(),
+                    target.disable_tls,
                 )
                 .await
             }

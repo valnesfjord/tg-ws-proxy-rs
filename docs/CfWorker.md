@@ -41,6 +41,12 @@ workers.dev
 TG_CF_WORKER_DOMAIN=random-symbols-1234.username.workers.dev
 ```
 
+Если TLS-перехват в сети ломает `wss://`, добавьте `--cf-disable-tls` или
+`TG_CF_DISABLE_TLS=true`. Соединение до Cloudflare Worker будет идти через
+обычный `ws://` на порту 80. Это раскрывает HTTP Host и метаданные трафика,
+поэтому оставляйте TLS включённым, если обход не требуется. Прямое соединение
+с Telegram этот параметр не меняет.
+
 Проверить Worker перед запуском прокси:
 
 ```bash

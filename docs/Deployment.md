@@ -120,6 +120,7 @@ TG_CF_DOMAIN=yourdomain.com
 TG_CF_WORKER_DOMAIN=random-symbols-1234.username.workers.dev
 TG_CF_PRIORITY=false
 TG_CF_BALANCE=false
+TG_CF_DISABLE_TLS=false
 TG_DEFAULT_DOMAINS=false
 TG_CHECK=false
 TG_FRONTING_DOMAIN=sprinthost.ru
