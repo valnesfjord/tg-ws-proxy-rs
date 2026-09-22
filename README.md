@@ -79,6 +79,12 @@ CLI flags, start/stop, open the `tg://proxy` link. Install the APK from the
 Raw release binaries, LuCI packages and a one-line installer are available. See
 [OpenWrt installation](#openwrt-installation) below.
 
+### Entware
+
+Keenetic and other routers running Entware at `/opt` take the same release
+binary, without the LuCI package. See
+[Entware installation](#entware-installation) below.
+
 ### Telegram Desktop setup
 
 1. **Settings → Advanced → Connection type → Use custom proxy**
@@ -170,6 +176,63 @@ firewall port automatically.
 
 For UCI examples, firewall guidance and rollback details, see the full
 [OpenWrt guide](docs/OpenWrtPackage.md).
+
+## Entware installation
+
+Keenetic and other routers that run [Entware](https://entware.net/) at `/opt`
+take the same static musl release binary as OpenWrt, without the LuCI package:
+there is no LuCI, no UCI and no procd on Entware, so the integration is one
+Entware init script and one config file. The installer tells the platforms apart
+by their own markers — `/etc/openwrt_release` on OpenWrt, `/opt/etc/opkg.conf`
+elsewhere — so the one-liner below is the same one to run on either.
+
+### Requirements
+
+- Entware installed at `/opt` and started at boot, which is the standard Keenetic
+  setup: `rc.unslung` under `/opt/etc/init.d` is what starts it.
+- Root SSH access and a supported musl target, i.e. `opkg print-architecture`
+  answering one of the Entware names `aarch64-3.10`, `armv7-3.2`, `mips-3.4`,
+  `mipsel-3.4` or `x64-3.2` (the Keenetic feeds suffix theirs with `_kn`).
+  Entware's ARMv7 feeds are soft-float builds reported as `armv7-3.2`, and the
+  release binary is hard-float: a core without VFP is refused by the run check
+  rather than by its name. ARMv5 (`armv5-3.2`) and the 32-bit x86 feed have no
+  matching release binary and are refused rather than installed and crashed.
+
+### Quick install (one-liner)
+
+Run over SSH **on the router**:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/valnesfjord/tg-ws-proxy-rs/main/install.sh | sh
+```
+
+`wget -qO- … | sh` is the one to use where BusyBox `wget` has TLS compiled in —
+without it the fetch answers `not an http or ftp url`. The installer itself
+tries either downloader for what it fetches.
+
+Re-run it to upgrade. On a box that already runs the Go port (`tg-ws-proxy`) on
+the same port, the installer stops it and clears its init script's executable
+bit, leaving that build's files and configuration where they are; a failed
+install puts the bit back.
+
+### Configure and operate
+
+```sh
+/opt/etc/init.d/S99tg-ws-proxy-rs start|stop|restart|status
+```
+
+Settings live in `/opt/etc/tg-ws-proxy-rs/config.conf` and the MTProto secret in
+`secret.conf` beside it, both `0600`; an existing secret and port survive an
+upgrade. `LINK_IP` is written from the bridge address the installer finds, so
+the `tg://` link it prints is one the LAN can dial — the binary's own detection
+reports a tunnel address on a router that has one. `status` prints that link,
+and the log is `/opt/var/log/tg-ws-proxy-rs.log`, with the previous run kept as
+`.log.1` (a run over 1 MiB is kept as its last 64 KiB). The executable bit on
+the init script is what enables the proxy at boot: `chmod -x` disables it
+without deleting anything.
+
+The listener is not exposed to the WAN. That is a firewall decision here exactly
+as it is on OpenWrt.
 
 ## Usage
 

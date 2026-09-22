@@ -99,6 +99,56 @@ chmod +x /etc/init.d/tg-ws-proxy-rs
 /etc/init.d/tg-ws-proxy-rs start
 ```
 
+### Entware (Keenetic and other /opt routers)
+
+Entware gets the same static musl binary and nothing else: there is no LuCI to
+install into and no UCI to write, so the integration is one init script under
+`/opt/etc/init.d` plus a config file, and the release's LuCI package is not
+fetched at all. The installer detects the platform from `/opt/etc/opkg.conf`, so
+the one-liner is the same one the OpenWrt section gives.
+
+What it does on Entware:
+
+- Reads the architecture from `opkg print-architecture` — the name Entware was
+  installed from (`mipsel-3.4_kn`, `aarch64-3.10`, `x64-3.2`, …) — and maps it
+  onto the matching musl release binary. `--arch` overrides the detection. A name
+  with no release target is refused (ARMv5, 32-bit x86). Entware's ARMv7 feeds
+  are soft-float builds reported as `armv7-3.2`, which map to `musleabihf`: a
+  core without VFP is caught by the run check, not by the name.
+- Downloads the archive and checks it against the release's `SHA256SUMS`, which
+  is fetched from github.com even when `GH_MIRROR` serves the payload, and then
+  *runs* it. Entware ships no `jsonfilter`, so the release API — and the digest
+  that comes with it — is not available here: the manifest travels the same
+  channel as the payload, which is why the run check is the gate that matters. A
+  beta is therefore installed with `--channel beta --tag vX.Y.Z-beta.N`, the tag
+  being what names a prerelease without the API.
+- Writes `/opt/etc/tg-ws-proxy-rs/config.conf` and `secret.conf` (both `0600`).
+  An existing secret is kept — it is what every device on the LAN is paired
+  with — and so is an existing config, including its port.
+- Sets `LINK_IP` to the bridge address found on `br0`/`br-lan` instead of
+  leaving it to the binary's own detection, which on a router with a tunnel
+  reports that tunnel's address (`100.90.x.x`) and yields a `tg://` link no
+  phone can dial.
+- Installs `/opt/etc/init.d/S99tg-ws-proxy-rs`, which `rc.unslung` sources at
+  boot; the executable bit is the on/off switch.
+- Stops another `tg-ws-proxy` (the Go port) when it holds the port,
+  and clears that init script's executable bit while leaving its files and
+  configuration in place. A failed install puts the bit back — the same
+  treatment the OpenWrt path gives the 2.2.3 integration it supersedes.
+
+Operate it with the script itself:
+
+```bash
+/opt/etc/init.d/S99tg-ws-proxy-rs start|stop|restart|status
+```
+
+`status` prints the `tg://` link read back out of `/opt/var/log/tg-ws-proxy-rs.log`
+(the previous run is kept beside it as `.log.1`, capped at its last 64 KiB when
+a run went over 1 MiB). Backups land in
+`/opt/var/tg-ws-proxy-backups/install-<stamp>`, three kept. Every flag in the
+[next section](#configuration-via-environment) has its `TG_*` equivalent, and
+those are the names `config.conf` sets.
+
 ## Configuration via environment
 
 Every CLI flag has a matching `TG_*` variable, which is usually the easier way
