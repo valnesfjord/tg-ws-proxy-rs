@@ -51,12 +51,15 @@ for these Rust targets:
 
 - `aarch64-unknown-linux-musl`;
 - `armv7-unknown-linux-musleabihf`;
+- `armv7-unknown-linux-musleabi` — soft-float, for the ARMv7 cores OpenWrt
+  builds without an FPU: `arm_cortex-a9` (bcm53xx) and `arm_cortex-a7`. The
+  `musleabihf` binary dies with `SIGILL` there;
 - `mips-unknown-linux-musl`;
 - `mipsel-unknown-linux-musl`;
 - `x86_64-unknown-linux-musl`.
 
 It additionally contains one LuCI APK, one LuCI IPK and a shared `SHA256SUMS`
-covering all ten Linux archives and both LuCI packages. There are no core APKs,
+covering all twelve Linux archives and both LuCI packages. There are no core APKs,
 core IPKs, per-router optimization wrappers or package feeds.
 
 ## Install or upgrade
