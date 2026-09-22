@@ -5,10 +5,11 @@
 //! That makes Docker / systemd deployments trivial without a config file.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::net::UdpSocket;
 use std::sync::OnceLock;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use crate::crypto;
 use crate::outbound::OutboundConnector;
@@ -123,6 +124,34 @@ fn parse_mtproto_proxy(s: &str) -> Result<MtProtoProxy, String> {
         secret_key,
         faketls_hostname,
     })
+}
+
+// ─── Upstream tier pinning ────────────────────────────────────────────────────
+
+/// One rung of the fallback ladder, as nameable from the CLI.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
+pub enum UpstreamTier {
+    /// Direct WebSocket to the DC's `--dc-ip` target (pool, fresh connect;
+    /// fronted from the first attempt when `--fronting-domain` is set).
+    Ws,
+    /// Cloudflare Worker TCP tunnel (`--cf-worker-domain`).
+    Cfworker,
+    /// Cloudflare-proxied WebSocket (`--cf-domain` / `--default-domains`).
+    Cfproxy,
+    /// Upstream MTProto proxy (`--mtproto-proxy`).
+    Mtproto,
+    /// Raw TCP :443 to the DC.
+    Tcp,
+}
+
+impl fmt::Display for UpstreamTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(
+            self.to_possible_value()
+                .expect("no skipped variants")
+                .get_name(),
+        )
+    }
 }
 
 // ─── CLI / env-var configuration ─────────────────────────────────────────────
@@ -285,13 +314,14 @@ pub struct Config {
     )]
     pub cf_worker_domains: Vec<String>,
 
-    /// Prioritise the Cloudflare tiers over direct WebSocket connections for
-    /// all DCs (even those with `--dc-ip` configured).
+    /// Legacy: try the Cloudflare tiers before direct WebSocket.
     ///
-    /// When set, the proxy tries the Cloudflare Worker tunnel and then the
-    /// Cloudflare proxy first; if both fail, it falls back to the normal WS
-    /// path, then upstream MTProto proxies, then direct TCP.
-    #[arg(long = "cf-priority", env = "TG_CF_PRIORITY")]
+    /// Kept working — and hidden from the docs — only for already-deployed
+    /// configs (LuCI UCI `cf_priority`, `install.sh` systemd units with
+    /// `TG_CF_PRIORITY`, existing command lines). It is sugar for
+    /// `--pinned-upstream cfworker,cfproxy,ws,mtproto,tcp`; new configs
+    /// should use the pin directly.
+    #[arg(long = "cf-priority", env = "TG_CF_PRIORITY", hide = true)]
     pub cf_priority: bool,
 
     /// Evenly distribute connections across multiple Cloudflare proxy domains.
@@ -304,6 +334,54 @@ pub struct Config {
     /// Has no effect when only one CF domain is configured.
     #[arg(long = "cf-balance", env = "TG_CF_BALANCE")]
     pub cf_balance: bool,
+
+    /// Upgrade Cloudflare proxy and Worker connections over plaintext
+    /// `ws://` (port 80) instead of `wss://` (port 443).
+    ///
+    /// Useful when a TLS-MITM middlebox breaks the WebSocket upgrade to
+    /// Cloudflare but plain HTTP passes, or against a Cloudflare zone whose
+    /// SSL mode serves HTTP on port 80. The MTProto traffic inside is still
+    /// end-to-end encrypted by its own AES-CTR layer, so this exposes
+    /// transport metadata (SNI-less HTTP Host) rather than message content.
+    ///
+    /// Applies to the `cfproxy` and `cfworker` tiers only — the direct
+    /// WebSocket path to Telegram always uses TLS.
+    #[arg(long = "cf-disable-tls", env = "TG_CF_DISABLE_TLS")]
+    pub cf_disable_tls: bool,
+
+    /// Pin the upstream tier order for non-media connections.
+    ///
+    /// Comma-separated tier names tried in the order given: `ws` (direct
+    /// WebSocket; needs a `--dc-ip` target for the DC), `cfworker` (Cloudflare
+    /// Worker tunnel), `cfproxy` (Cloudflare proxy), `mtproto` (upstream
+    /// MTProto proxy), `tcp` (raw TCP :443).  Tiers left out are never tried
+    /// for this class, and a class whose every listed tier fails is dropped
+    /// rather than falling through to the default ladder.  Unset → the
+    /// default priority order (see docs/Fallbacks.md).
+    #[arg(
+        long = "pinned-upstream",
+        value_name = "TIERS",
+        value_enum,
+        value_delimiter = ',',
+        env = "TG_PINNED_UPSTREAM"
+    )]
+    pub pinned_upstreams: Vec<UpstreamTier>,
+
+    /// Pin the upstream tier order for media connections — the ones whose
+    /// MTProto handshake asks for a media DC (negative DC index), where
+    /// Telegram clients already put photo/video/file transfers.
+    ///
+    /// Same tier names and semantics as `--pinned-upstream`; overrides it for
+    /// this class only. Without it, media connections inherit
+    /// `--pinned-upstream`.
+    #[arg(
+        long = "pinned-media-upstream",
+        value_name = "TIERS",
+        value_enum,
+        value_delimiter = ',',
+        env = "TG_PINNED_MEDIA_UPSTREAM"
+    )]
+    pub pinned_media_upstreams: Vec<UpstreamTier>,
 
     // ── Timeout / cooldown knobs ─────────────────────────────────────────
     /// WebSocket connection timeout in seconds (normal path).
@@ -411,54 +489,55 @@ pub struct Config {
     )]
     pub cf_fail_cooldown: u64,
 
-    /// Domain to present as the TLS SNI for the domain-fronting fallback,
-    /// used when direct WebSocket connects to a DC keep timing out (a sign
-    /// of SNI-based DPI blocking). The real DC IP and `Host` are still used —
+    /// Domain to always present as the TLS SNI for direct WebSocket
+    /// connections to a DC IP. The real DC IP and `Host` are still used —
     /// only the SNI is swapped for this unrelated, presumably-unblocked
     /// domain, e.g. `sprinthost.ru` (the value upstream tg-ws-proxy uses).
+    ///
+    /// When set, fronting is unconditional: the very first ClientHello
+    /// already carries the fronted SNI. A reactive, "front only after the
+    /// direct SNI times out" switch leaks the real `telegram.org` SNI first,
+    /// which networks that RST it on sight never let through (#111).
     ///
     /// **Only takes effect when `--dc-ip` is configured for that DC** — by
     /// design, matching upstream tg-ws-proxy exactly: fronting only ever
     /// applies to a direct connection to Telegram's real DC IP, never to the
     /// CF proxy/Worker/upstream-proxy paths. If you rely solely on
     /// `--cf-domain`/`--default-domains` (no `--dc-ip`), this flag has no
-    /// effect — upstream's own troubleshooting guidance for a network where
-    /// Telegram's IPs are blocked outright (where fronting can't help, since
-    /// it still needs a real TCP connection to that IP) is to leave
-    /// `--dc-ip` unset entirely so this path is never attempted.
+    /// effect.
     ///
     /// Disabled unless set. TLS certificate verification is unconditionally
-    /// skipped on connections using this fallback: the real Telegram
-    /// certificate can never match a fronted SNI, so hostname verification
-    /// would always fail — this is inherent to the technique, not a bug.
-    ///
-    /// Once a fronted connection succeeds, the fallback stays active for
-    /// `--fronting-cooldown` seconds so new connections (including
-    /// background pool refills) keep using it.
+    /// skipped on fronted connections: the real Telegram certificate can
+    /// never match a fronted SNI, so hostname verification would always fail
+    /// — this is inherent to the technique, not a bug.
     #[arg(long = "fronting-domain", env = "TG_FRONTING_DOMAIN")]
     pub fronting_domain: Option<String>,
 
-    /// Seconds to keep the domain-fronting fallback active after it last
-    /// succeeded, before returning to normal direct WebSocket attempts.
+    /// Legacy: the sticky window that kept fronting active after a success.
+    ///
+    /// Fronting is now unconditional while `--fronting-domain` is set, so
+    /// there is no window to size. Kept parseable — and hidden — only for
+    /// already-deployed configs (LuCI UCI options, systemd units with
+    /// `TG_FRONTING_COOLDOWN`); the value is ignored.
     #[arg(
         long = "fronting-cooldown",
         default_value = "1800",
-        env = "TG_FRONTING_COOLDOWN"
+        env = "TG_FRONTING_COOLDOWN",
+        hide = true
     )]
     pub fronting_cooldown: u64,
 
-    /// Seconds to stop retrying the domain-fronting fallback after it fails.
+    /// Legacy: the cooldown after a failed fronting attempt.
     ///
-    /// Fronting only helps against SNI-based DPI blocking — it does nothing
-    /// for a network that blocks Telegram's DC IPs outright (the fronted
-    /// attempt still has to open a real TCP connection to that IP). Without
-    /// this cooldown, every connection to that DC would retry fronting from
-    /// scratch and pay a full `--ws-connect-timeout` for a doomed attempt on
-    /// top of the already doomed direct/CF/upstream/TCP attempts.
+    /// Fronting is now unconditional while `--fronting-domain` is set, so a
+    /// failed fronted connect is just a failed direct-WS attempt like any
+    /// other. Kept parseable — and hidden — only for already-deployed
+    /// configs; the value is ignored.
     #[arg(
         long = "fronting-fail-cooldown",
         default_value = "60",
-        env = "TG_FRONTING_FAIL_COOLDOWN"
+        env = "TG_FRONTING_FAIL_COOLDOWN",
+        hide = true
     )]
     pub fronting_fail_cooldown: u64,
 
@@ -649,6 +728,36 @@ impl Config {
                 .collect();
         }
 
+        // Legacy --cf-priority, expanded here so the routing path only ever
+        // sees a pin.  Only the tiers actually configured make it into the
+        // expansion — the legacy flag was always a no-op for a missing tier,
+        // and pinning one would make startup refuse instead.  Each class keeps
+        // an explicit pin of its own; cf_priority never overrides one.
+        if self.cf_priority {
+            let mut legacy = Vec::new();
+            if !self.cf_worker_domains.is_empty() {
+                legacy.push(UpstreamTier::Cfworker);
+            }
+            // --default-domains can still supply the list after its fetch, so
+            // the proxy tier is kept on that promise alone and skipped at
+            // runtime if the fetch comes back empty.
+            if !self.cf_domains.is_empty() || self.default_domains {
+                legacy.push(UpstreamTier::Cfproxy);
+            }
+            legacy.push(UpstreamTier::Ws);
+            if !self.mtproto_proxies.is_empty() {
+                legacy.push(UpstreamTier::Mtproto);
+            }
+            legacy.push(UpstreamTier::Tcp);
+
+            if self.pinned_upstreams.is_empty() {
+                self.pinned_upstreams = legacy.clone();
+            }
+            if self.pinned_media_upstreams.is_empty() {
+                self.pinned_media_upstreams = legacy;
+            }
+        }
+
         self
     }
 
@@ -728,6 +837,55 @@ impl Config {
     /// Map of DC ID → target IP from `--dc-ip` flags.
     pub fn dc_redirects(&self) -> HashMap<u32, String> {
         self.dc_ip.iter().cloned().collect()
+    }
+
+    /// The user-pinned tier order for one traffic class, if any.
+    ///
+    /// `None` means "use the default priority ladder". Media connections are
+    /// the ones whose handshake carries a negative DC index; everything else
+    /// counts as non-media. A media class without its own pin inherits the
+    /// non-media one — `--pinned-media-upstream` exists to override, not to
+    /// opt media out of an egress decision the operator already made.
+    pub fn forced_upstreams(&self, is_media: bool) -> Option<&[UpstreamTier]> {
+        if is_media && !self.pinned_media_upstreams.is_empty() {
+            Some(&self.pinned_media_upstreams)
+        } else if !self.pinned_upstreams.is_empty() {
+            Some(&self.pinned_upstreams)
+        } else {
+            None
+        }
+    }
+
+    /// Refuse to start when a pinned tier has nothing configured behind it.
+    ///
+    /// A class pinned to an unconfigured tier would have every connection
+    /// dropped at runtime, which is indistinguishable from a broken proxy —
+    /// better to fail while the operator is still watching.  `ws` is exempt:
+    /// whether it is usable depends on the per-DC `--dc-ip` target, checked
+    /// per connection with a log line instead.  `cfproxy` is checked against
+    /// the domain list *after* `--default-domains` has been fetched, so this
+    /// belongs in the server startup path, not at parse time.
+    pub fn validate_pinned_upstreams(&self) -> Result<(), String> {
+        for (flag, tiers) in [
+            ("--pinned-upstream", &self.pinned_upstreams),
+            ("--pinned-media-upstream", &self.pinned_media_upstreams),
+        ] {
+            for tier in tiers {
+                let unconfigured = match tier {
+                    UpstreamTier::Cfworker => self.cf_worker_domains.is_empty(),
+                    UpstreamTier::Cfproxy => self.cf_domains.is_empty(),
+                    UpstreamTier::Mtproto => self.mtproto_proxies.is_empty(),
+                    UpstreamTier::Ws | UpstreamTier::Tcp => false,
+                };
+                if unconfigured {
+                    return Err(format!(
+                        "{flag} pins the {tier} tier but nothing configures it \
+                         (--cf-worker-domain / --cf-domain / --mtproto-proxy)"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The `--dc-ip` override for a single DC.

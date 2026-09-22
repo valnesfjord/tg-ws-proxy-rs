@@ -2,9 +2,10 @@ use std::time::Duration;
 
 use tg_ws_proxy_rs::outbound::OutboundConnector;
 use tg_ws_proxy_rs::ws_client::{
-    WsConnectResult, cf_worker_path, cf_ws_domains, connect_cf_worker_ws_for_dc_with_outbound,
-    connect_cf_ws_for_dc_with_outbound, connect_ws_for_dc_with_outbound, connect_ws_with_outbound,
-    ws_domains,
+    WsConnectResult, cf_worker_path, cf_ws_domains, connect_cf_record_with_outbound_mode,
+    connect_cf_worker_ws_for_dc_with_outbound, connect_cf_worker_ws_for_dc_with_outbound_mode,
+    connect_cf_ws_for_dc_with_outbound, connect_cf_ws_for_dc_with_outbound_mode,
+    connect_ws_for_dc_with_outbound, connect_ws_with_outbound, ws_domains,
 };
 
 mod common;
@@ -158,6 +159,54 @@ async fn cloudflare_ws_connector_uses_outbound_proxy() {
 }
 
 #[tokio::test]
+async fn cloudflare_ws_connector_uses_port_80_when_tls_is_disabled() {
+    let (proxy_addr, proxy_task) = rejecting_http_proxy().await;
+    let outbound =
+        OutboundConnector::from_config(Some(&format!("http://{proxy_addr}")), None, false).unwrap();
+
+    let (ws, _record, _all_redirects) = connect_cf_ws_for_dc_with_outbound_mode(
+        2,
+        &["example.net".to_string()],
+        false,
+        false,
+        PROBE_TIMEOUT,
+        &outbound,
+        true,
+    )
+    .await;
+
+    assert!(ws.is_none());
+    let request = await_proxy_request(proxy_task).await;
+    assert!(request.starts_with("CONNECT kws2.example.net:80 HTTP/1.1"));
+}
+
+#[tokio::test]
+async fn disabled_cf_tls_sends_a_plaintext_websocket_upgrade() {
+    let (proxy_addr, proxy_task) = common::capturing_http_tunnel().await;
+    let outbound =
+        OutboundConnector::from_config(Some(&format!("http://{proxy_addr}")), None, false).unwrap();
+
+    let ws = connect_cf_record_with_outbound_mode(
+        "kws2.example.net",
+        false,
+        PROBE_TIMEOUT,
+        &outbound,
+        true,
+    )
+    .await;
+
+    assert!(ws.is_none());
+    let (connect, upgrade) = proxy_task.await.unwrap();
+    assert!(connect.starts_with("CONNECT kws2.example.net:80 HTTP/1.1"));
+    assert!(upgrade.starts_with("GET /apiws HTTP/1.1"));
+    assert!(
+        upgrade
+            .to_ascii_lowercase()
+            .contains("host: kws2.example.net")
+    );
+}
+
+#[tokio::test]
 async fn cloudflare_ws_connector_tries_every_record_of_every_domain() {
     // Two CF domains × the kwsN / kwsN-1 record pair = four attempts before
     // the caller is told the whole CF tier failed.
@@ -212,4 +261,27 @@ async fn cloudflare_worker_connector_uses_outbound_proxy() {
     assert!(ws.is_none());
     let request = await_proxy_request(proxy_task).await;
     assert!(request.starts_with("CONNECT worker.example.dev:443 HTTP/1.1"));
+}
+
+#[tokio::test]
+async fn cloudflare_worker_connector_uses_port_80_when_tls_is_disabled() {
+    let (proxy_addr, proxy_task) = rejecting_http_proxy().await;
+    let outbound =
+        OutboundConnector::from_config(Some(&format!("http://{proxy_addr}")), None, false).unwrap();
+
+    let ws = connect_cf_worker_ws_for_dc_with_outbound_mode(
+        "worker.example.dev",
+        "149.154.167.51",
+        2,
+        false,
+        false,
+        PROBE_TIMEOUT,
+        &outbound,
+        true,
+    )
+    .await;
+
+    assert!(ws.is_none());
+    let request = await_proxy_request(proxy_task).await;
+    assert!(request.starts_with("CONNECT worker.example.dev:80 HTTP/1.1"));
 }

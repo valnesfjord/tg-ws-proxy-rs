@@ -27,12 +27,12 @@ use tracing::{debug, warn};
 
 use futures_util::{FutureExt, StreamExt, stream};
 
-use crate::config::Config;
+use crate::config::{Config, UpstreamTier};
 use crate::outbound::OutboundConnector;
 use crate::runtime::Runtime;
 use crate::ws_client::{
-    TgWsStream, connect_cf_record_with_outbound, connect_cf_worker_ws_for_dc_with_outbound,
-    connect_ws_for_dc_with_outbound, media_tag,
+    TgWsStream, connect_cf_record_with_outbound_mode,
+    connect_cf_worker_ws_for_dc_with_outbound_mode, connect_ws_for_dc_with_outbound, media_tag,
 };
 
 /// Idle Cloudflare connections kept per `(tier, dc, is_media)`.
@@ -84,6 +84,8 @@ struct CfEntry {
     dst: String,
     skip_tls_verify: bool,
     connect_timeout: Duration,
+    /// `--cf-disable-tls`, kept for the replacement dial.
+    disable_tls: bool,
 }
 
 /// Everything a background Cloudflare refill needs to reopen one connection.
@@ -98,6 +100,8 @@ pub struct CfTarget {
     pub domain: String,
     pub skip_tls_verify: bool,
     pub connect_timeout: Duration,
+    /// `--cf-disable-tls`: reopen the spare over plaintext `ws://` :80.
+    pub disable_tls: bool,
 }
 
 impl CfTarget {
@@ -280,6 +284,7 @@ impl WsPool {
                 domain: entry.domain.clone(),
                 skip_tls_verify: entry.skip_tls_verify,
                 connect_timeout: entry.connect_timeout,
+                disable_tls: entry.disable_tls,
             });
 
             return Some((entry.ws, entry.domain));
@@ -318,10 +323,21 @@ impl WsPool {
         let skip_tls = config.skip_tls_verify;
         let pool_size = self.pool_size;
 
+        // A class pinned away from the ws tier never draws from its pool
+        // bucket, so pre-warming it only dials into a path no client will
+        // use.
+        let pinned_off_ws = |is_media: bool| {
+            config
+                .forced_upstreams(is_media)
+                .is_some_and(|tiers| !tiers.contains(&UpstreamTier::Ws))
+        };
+        let (skip_non_media, skip_media) = (pinned_off_ws(false), pinned_off_ws(true));
+
         let jobs = dc_redirects.into_iter().flat_map(|(dc, ip)| {
-            [false, true]
-                .into_iter()
-                .map(move |is_media| (dc, ip.clone(), is_media))
+            [false, true].into_iter().filter_map(move |is_media| {
+                let skip = if is_media { skip_media } else { skip_non_media };
+                (!skip).then(|| (dc, ip.clone(), is_media))
+            })
         });
         let mut batches = stream::iter(jobs)
             .map(|(dc, ip, is_media)| async move {
@@ -454,6 +470,7 @@ impl WsPool {
                 dst: target.dst,
                 skip_tls_verify: target.skip_tls_verify,
                 connect_timeout: target.connect_timeout,
+                disable_tls: target.disable_tls,
             });
         }
     }
@@ -467,7 +484,7 @@ impl WsPool {
     async fn cf_connect_one(&self, target: &CfTarget) -> Option<TgWsStream> {
         match target.tier {
             CfTier::Worker => {
-                connect_cf_worker_ws_for_dc_with_outbound(
+                connect_cf_worker_ws_for_dc_with_outbound_mode(
                     &target.domain,
                     &target.dst,
                     target.dc,
@@ -475,15 +492,17 @@ impl WsPool {
                     target.skip_tls_verify,
                     target.connect_timeout,
                     self.runtime.outbound(),
+                    target.disable_tls,
                 )
                 .await
             }
             CfTier::Proxy => {
-                connect_cf_record_with_outbound(
+                connect_cf_record_with_outbound_mode(
                     &target.domain,
                     target.skip_tls_verify,
                     target.connect_timeout,
                     self.runtime.outbound(),
+                    target.disable_tls,
                 )
                 .await
             }
@@ -501,15 +520,10 @@ impl WsPool {
         let mut results = Vec::new();
         // Limit pool fill timeout to avoid blocking for too long.
         let timeout = Duration::from_secs(8);
-        // While the domain-fronting fallback is in its sticky window, warm the
-        // pool with fronted connections too — otherwise a pool hit would hand
-        // a client a connection that never had to front in the first place,
-        // defeating the point of staying "sticky".
-        let fronting_domain = self
-            .runtime
-            .fronting_active()
-            .then(|| self.runtime.fronting_domain())
-            .flatten();
+        // Warm the pool fronted when --fronting-domain is set: a pooled
+        // connection dialed with the real SNI would leak it to the network
+        // the operator asked to hide it from (#111).
+        let fronting_domain = self.runtime.fronting_domain();
 
         let mut attempts = stream::iter(0..count)
             .map(|_| {

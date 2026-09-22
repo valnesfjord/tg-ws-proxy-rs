@@ -12,11 +12,13 @@ use clap::Parser;
 use tg_ws_proxy_rs::check::run_check;
 use tg_ws_proxy_rs::config::{Config, default_dc_ips, default_dc_overrides};
 use tg_ws_proxy_rs::default_domains::fetch_default_domains;
+use tg_ws_proxy_rs::outbound::OutboundConnector;
 use tg_ws_proxy_rs::pool::WsPool;
 use tg_ws_proxy_rs::proxy::handle_client;
 use tg_ws_proxy_rs::ws_client::{
-    TgWsStream, WsConnectResult, connect_cf_worker_ws_for_dc, connect_cf_ws_for_dc, connect_ws,
-    connect_ws_for_dc,
+    TgWsStream, WsConnectResult, connect_cf_worker_ws_for_dc,
+    connect_cf_worker_ws_for_dc_with_outbound, connect_cf_ws_for_dc,
+    connect_cf_ws_for_dc_with_outbound, connect_ws, connect_ws_for_dc, connect_ws_with_outbound,
 };
 use tokio::net::{TcpListener, TcpStream};
 
@@ -38,6 +40,31 @@ fn old_ws_client_public_signatures_still_compile() {
         false,
         false,
         Duration::from_millis(1),
+    );
+}
+
+#[test]
+fn old_outbound_ws_client_public_signatures_still_compile() {
+    let outbound = OutboundConnector::direct();
+    let timeout = Duration::from_millis(1);
+    let _connect = connect_ws_with_outbound(
+        "127.0.0.1",
+        "kws2.web.telegram.org",
+        false,
+        timeout,
+        &outbound,
+        None,
+    );
+    let cf_domains = ["example.net".to_string()];
+    let _cf = connect_cf_ws_for_dc_with_outbound(2, &cf_domains, false, false, timeout, &outbound);
+    let _worker = connect_cf_worker_ws_for_dc_with_outbound(
+        "worker.example.dev",
+        "149.154.167.51",
+        2,
+        false,
+        false,
+        timeout,
+        &outbound,
     );
 }
 

@@ -37,7 +37,8 @@ use crate::crypto::{self, ProtoTag, generate_client_handshake};
 use crate::faketls;
 use crate::outbound::OutboundConnector;
 use crate::ws_client::{
-    connect_cf_worker_ws_for_dc_with_outbound, connect_cf_ws_for_dc_with_outbound, ws_recv, ws_send,
+    connect_cf_worker_ws_for_dc_with_outbound_mode, connect_cf_ws_for_dc_with_outbound_mode,
+    ws_recv, ws_send,
 };
 
 // ─── Probe result ─────────────────────────────────────────────────────────────
@@ -79,15 +80,17 @@ async fn probe_cf_domain(
     skip_tls: bool,
     timeout: Duration,
     outbound: &OutboundConnector,
+    disable_tls: bool,
 ) -> ProbeStatus {
     let start = Instant::now();
-    let (ws, _record, _all_redirects) = connect_cf_ws_for_dc_with_outbound(
+    let (ws, _record, _all_redirects) = connect_cf_ws_for_dc_with_outbound_mode(
         2,
         &[domain.to_string()],
         false,
         skip_tls,
         timeout,
         outbound,
+        disable_tls,
     )
     .await;
     if ws.is_some() {
@@ -122,14 +125,22 @@ async fn probe_cf_worker(
     skip_tls: bool,
     timeout: Duration,
     outbound: &OutboundConnector,
+    disable_tls: bool,
 ) -> ProbeStatus {
     let Some(dst) = default_dc_ip(2) else {
         return ProbeStatus::Fail("DC 2 default IP is missing".to_string());
     };
 
     let start = Instant::now();
-    let ws = connect_cf_worker_ws_for_dc_with_outbound(
-        domain, dst, 2, false, skip_tls, timeout, outbound,
+    let ws = connect_cf_worker_ws_for_dc_with_outbound_mode(
+        domain,
+        dst,
+        2,
+        false,
+        skip_tls,
+        timeout,
+        outbound,
+        disable_tls,
     )
     .await;
     let Some(mut ws) = ws else {
@@ -295,7 +306,14 @@ pub async fn run_check_with_outbound(config: &Config, outbound: &OutboundConnect
             // Flush so the user sees the label before the potentially slow probe.
             let _ = std::io::Write::flush(&mut std::io::stdout());
 
-            let status = probe_cf_domain(domain, skip_tls, cf_timeout, outbound).await;
+            let status = probe_cf_domain(
+                domain,
+                skip_tls,
+                cf_timeout,
+                outbound,
+                config.cf_disable_tls,
+            )
+            .await;
             println!("[{}]  {}", status.marker(), status.detail());
 
             if !status.is_ok() {
@@ -312,7 +330,14 @@ pub async fn run_check_with_outbound(config: &Config, outbound: &OutboundConnect
             print!("  {:40}  ... ", domain);
             let _ = std::io::Write::flush(&mut std::io::stdout());
 
-            let status = probe_cf_worker(domain, skip_tls, cf_timeout, outbound).await;
+            let status = probe_cf_worker(
+                domain,
+                skip_tls,
+                cf_timeout,
+                outbound,
+                config.cf_disable_tls,
+            )
+            .await;
             println!("[{}]  {}", status.marker(), status.detail());
 
             if !status.is_ok() {

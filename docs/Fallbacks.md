@@ -11,12 +11,68 @@ direct WS to the DC              ← default
   ↓ direct TCP :443              ← last resort
 ```
 
-`--cf-priority` flips the first two groups: the Cloudflare tiers (Worker first,
-then CF proxy) are tried **before** direct WebSocket for all DCs. Domain
-fronting is a modifier on the direct-WS tier rather than a tier of its own.
+Domain fronting is a modifier on the direct-WS tier rather than a tier of its
+own; the whole order can also be [pinned per traffic class](#pinning-the-tier-order-per-traffic-class).
 
 A small pool of pre-connected WebSocket connections is kept per DC
 (`--pool-size`) so later clients skip the handshake latency.
+
+## Pinning the tier order per traffic class
+
+Every client handshake says whether it wants a **media DC** (negative DC index)
+— where Telegram clients already put photo/video/file transfers — or not.
+`--pinned-upstream` pins the tier order for both classes as a comma-separated
+list tried in the order given; `--pinned-media-upstream` overrides it for media
+connections only:
+
+| Name | Tier |
+|---|---|
+| `ws` | direct WebSocket (needs a `--dc-ip` target for the DC) |
+| `cfworker` | Cloudflare Worker tunnel (`--cf-worker-domain`) |
+| `cfproxy` | Cloudflare proxy (`--cf-domain` / `--default-domains`) |
+| `mtproto` | upstream MTProto proxy (`--mtproto-proxy`) |
+| `tcp` | raw TCP :443 to the DC |
+
+```bash
+# Media transfers over raw TCP only; everything else keeps the default ladder
+tg-ws-proxy --pinned-media-upstream tcp
+
+# Control traffic pinned to upstream MTProto proxies, media to the CF proxy
+tg-ws-proxy --pinned-upstream mtproto --pinned-media-upstream cf
+
+# Both classes over Tor via a SOCKS outbound proxy — the pins only pick tiers,
+# the outbound proxy applies to every tier alike
+tg-ws-proxy --outbound-proxy socks5h://127.0.0.1:9050 \
+            --pinned-upstream tcp --pinned-media-upstream ws
+```
+
+Pin semantics:
+
+- The listed order **is** the fallback chain: a tier that fails (connect
+  error, cooldown) hands over to the next tier listed, with the same pool,
+  cooldown and fronting behavior each tier has in the default ladder.
+  Unpinned classes keep the default order above.
+- A pin naming `cfworker`, `cfproxy` or `mtproto` with nothing configured
+  behind it refuses to start (`--cf-worker-domain` / `--cf-domain` /
+  `--default-domains` / `--mtproto-proxy`), because that class would
+  otherwise drop every connection at runtime. `ws` is judged per connection
+  instead — it is skipped with a log line for a DC without a `--dc-ip`
+  target, since availability differs per DC.
+- When every listed tier fails, the connection is **dropped** — the tiers
+  left out are not quietly re-added as fallbacks. That is deliberate: if you
+  pinned media to raw TCP so bulk transfers leave from a particular egress,
+  silently rerouting them through Cloudflare on a bad day would undo the
+  reason for the pin. List more tiers (or `tcp` last) if you want fallback
+  breadth instead.
+- `tcp` is terminal: the raw-TCP upstream is chosen without probing (the
+  connect happens in the bridge), so anything listed after it is never
+  reached — startup warns about a pin that does this.
+- Pool warm-up is skipped for a class pinned without `ws`, since its bucket
+  can never be used.
+
+Note the split is by *connection*, not by individual packet: the proxy cannot
+see inside the MTProto session, so "media" means "a connection to a media DC",
+which is where Telegram clients put bulk transfers anyway.
 
 ## Cloudflare Proxy
 
@@ -37,8 +93,9 @@ tg-ws-proxy --cf-domain primary.net,backup.com --cf-balance
 # CF-only mode: omit --dc-ip so CF proxy handles all DCs
 tg-ws-proxy --cf-domain yourdomain.com
 
-# CF priority: try the CF tiers before direct WS, with WS as fallback
-tg-ws-proxy --dc-ip 2:149.154.167.220 --cf-domain yourdomain.com --cf-priority
+# CF-first: pin the CF tiers in front of the default ladder
+tg-ws-proxy --dc-ip 2:149.154.167.220 --cf-domain yourdomain.com \
+            --pinned-upstream cfworker,cfproxy,ws,mtproto,tcp
 
 # Or via environment variable
 TG_CF_DOMAIN=yourdomain.com tg-ws-proxy
@@ -59,6 +116,23 @@ Every connection retries every configured CF domain fresh — a failure isn't
 remembered across connections (matching upstream tg-ws-proxy), so one flaky
 domain can never block the others, or the whole DC, from being tried.
 
+### `--cf-disable-tls` — plaintext Cloudflare transport
+
+If a TLS-intercepting middlebox breaks the WebSocket upgrade to Cloudflare,
+`--cf-disable-tls` makes both Cloudflare tiers use `ws://` on port 80 instead of
+`wss://` on port 443:
+
+```bash
+tg-ws-proxy --cf-domain yourdomain.com --cf-disable-tls
+# Equivalent environment variable:
+TG_CF_DISABLE_TLS=true tg-ws-proxy --cf-domain yourdomain.com
+```
+
+This does not affect direct WebSocket connections to Telegram, which always use
+TLS. MTProto payloads retain their own transport encryption, but plaintext HTTP
+exposes the Cloudflare hostname and traffic metadata. Prefer the default TLS
+mode unless the network requires this workaround.
+
 ### `--cf-balance` — round-robin load balancing
 
 When multiple `--cf-domain` values are given, connections normally always start
@@ -74,11 +148,12 @@ tg-ws-proxy --cf-domain d1.example.com,d2.example.com,d3.example.com --cf-balanc
 
 The remaining domains still serve as ordered fallbacks if the primary one
 fails, so resilience is unchanged. Has no effect when only one CF domain is
-configured. Can be combined with `--cf-priority`:
+configured. Can be combined with a CF-first pin:
 
 ```bash
 # Round-robin CF load balancing, tried before direct WS
-tg-ws-proxy --cf-domain d1.example.com,d2.example.com --cf-balance --cf-priority
+tg-ws-proxy --cf-domain d1.example.com,d2.example.com --cf-balance \
+            --pinned-upstream cfworker,cfproxy,ws,mtproto,tcp
 ```
 
 ### One-time domain setup
@@ -123,6 +198,8 @@ falls back to the remaining Workers if the first one fails.
 tg-ws-proxy --cf-worker-domain w1.user.workers.dev,w2.user.workers.dev --cf-balance
 ```
 
+`--cf-disable-tls` also applies to Worker connections.
+
 Or via environment variable:
 
 ```bash
@@ -153,8 +230,8 @@ the upstream repository:
 # No Cloudflare account or DNS setup required
 tg-ws-proxy --default-domains
 
-# Enable CF priority so CF path is tried first
-tg-ws-proxy --default-domains --cf-priority
+# Enable a CF-first pin so the CF path is tried first
+tg-ws-proxy --default-domains --pinned-upstream cfworker,cfproxy,ws,mtproto,tcp
 
 # Combine with your own domain (yours gets highest priority)
 tg-ws-proxy --cf-domain yourdomain.com --default-domains
@@ -182,12 +259,11 @@ it will still start normally.
 
 ## Domain fronting
 
-If direct WebSocket connections to Telegram keep timing out — a common sign of
-SNI-based DPI blocking — the proxy can fall back to **domain fronting**:
-presenting an unrelated, presumably-unblocked domain as the TLS SNI while still
-connecting to the real Telegram DC IP and using the real DC domain as the HTTP
-`Host`. DPI that filters by SNI sees the fronted name; the actual
-(TLS-encrypted) request still reaches Telegram normally.
+On networks where SNI-based DPI blocks Telegram, **domain fronting** presents
+an unrelated, presumably-unblocked domain as the TLS SNI while still connecting
+to the real Telegram DC IP and using the real DC domain as the HTTP `Host`.
+DPI that filters by SNI sees the fronted name; the actual (TLS-encrypted)
+request still reaches Telegram normally.
 
 ```bash
 tg-ws-proxy --dc-ip 2:149.154.167.220 --fronting-domain sprinthost.ru
@@ -203,21 +279,20 @@ for a network that blocks Telegram's IPs outright (where fronting can't help
 either, since it still needs a real TCP connection to that IP) is to leave
 `--dc-ip` unset entirely.
 
-Disabled unless `--fronting-domain` is set. Once a fronted connection succeeds,
-the fallback stays active (including for background connection-pool refills)
-for `--fronting-cooldown` seconds (default 1800 = 30 min), so the proxy doesn't
-keep re-probing the likely-still-blocked direct path on every new connection. If
-a fronting attempt fails, `--fronting-fail-cooldown` seconds (default 60) pass
-before it's retried for that DC — otherwise a network where fronting can never
-succeed (e.g. the DC IP itself is blocked) would pay for a doomed attempt on
-every single connection.
+Disabled unless `--fronting-domain` is set. When set, fronting is
+**unconditional**: every direct-WebSocket attempt — including pool pre-connects
+— starts with the fronted SNI. An earlier version fronted reactively (real SNI
+first, fronted retry after a timeout), which never worked on networks that
+RST the real `telegram.org` SNI on sight: the leak happened before the retry
+could help (#111). If a fronted attempt fails, it counts as a normal direct-WS
+failure (`--ws-fail-cooldown`) and the ladder moves on.
 
 > **Note:** TLS certificate verification is unconditionally skipped on
-> connections using this fallback, regardless of
-> `--danger-accept-invalid-certs` — the real Telegram certificate can never
-> match a fronted SNI, so hostname verification would always fail. This is
-> inherent to the technique, not a bug, and only applies to the direct-WS
-> fallback path (not CF proxy/Worker connections).
+> fronted connections, regardless of `--danger-accept-invalid-certs` — the
+> real Telegram certificate can never match a fronted SNI, so hostname
+> verification would always fail. This is inherent to the technique, not a
+> bug, and only applies to the direct-WS path (not CF proxy/Worker
+> connections).
 
 ## Upstream MTProto proxy fallback
 

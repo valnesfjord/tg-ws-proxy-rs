@@ -42,17 +42,17 @@ async fn check_reports_success_when_there_is_nothing_configured() {
 }
 
 #[tokio::test]
-async fn check_cf_domain_uses_outbound_proxy() {
+async fn check_cf_domain_honors_disabled_tls() {
     let (proxy_addr, proxy_task) = rejecting_http_proxy().await;
     let config = check_config(
         &format!("http://{proxy_addr}"),
-        &["--cf-domain", "example.net"],
+        &["--cf-domain", "example.net", "--cf-disable-tls"],
     );
     let outbound = config.outbound_connector().unwrap();
 
     assert!(!run_check_with_outbound(&config, &outbound).await);
     let request = await_proxy_request(proxy_task).await;
-    assert!(request.starts_with("CONNECT kws2.example.net:443 HTTP/1.1"));
+    assert!(request.starts_with("CONNECT kws2.example.net:80 HTTP/1.1"));
 }
 
 #[tokio::test]

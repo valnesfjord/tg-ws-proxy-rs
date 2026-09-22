@@ -190,12 +190,11 @@ tg-ws-proxy [OPTIONS]
 | `--cf-domain <DOMAIN>` | — | Cloudflare-proxied domain(s) for alternative WS routing, comma-separated |
 | `--cf-worker-domain <DOMAIN>` | — | Cloudflare Worker domain(s) for TCP-tunnel fallback, comma-separated/repeatable |
 | `--default-domains` | off | Fetch and use the built-in CF proxy domain list from GitHub (no Cloudflare setup needed) |
-| `--cf-priority` | off | Try the CF tiers (Worker, then CF proxy) **before** direct WS for all DCs |
+| `--pinned-upstream <TIERS>` / `--pinned-media-upstream <TIERS>` | default ladder | Pin the upstream tier order (`ws,cfworker,cfproxy,mtproto,tcp`, try-order); the media flag overrides the base one for media connections, which otherwise inherit it (see [docs/Fallbacks.md](docs/Fallbacks.md#pinning-the-tier-order-per-traffic-class)) |
 | `--cf-balance` | off | Round-robin load balance across multiple `--cf-domain` and `--cf-worker-domain` values |
+| `--cf-disable-tls` | off | Use plaintext `ws://` on port 80 for CF proxy and Worker connections; direct Telegram WS remains TLS |
 | `--ip-fail-cooldown <SECS>` | `3600` | How long to skip the direct WS path for a `--dc-ip` address whose TCP connect timed out, when a Cloudflare/upstream fallback is configured |
-| `--fronting-domain <DOMAIN>` | off | Domain-fronting fallback SNI, e.g. `sprinthost.ru` |
-| `--fronting-cooldown <SECS>` | `1800` | How long the fronting fallback stays active after it last succeeded |
-| `--fronting-fail-cooldown <SECS>` | `60` | How long to stop retrying fronting after it fails for a DC (protects against networks that block Telegram's DC IPs outright, where fronting can never succeed) |
+| `--fronting-domain <DOMAIN>` | off | Always present this domain as the TLS SNI for direct WS connections (fronting), e.g. `sprinthost.ru`; needs `--dc-ip` |
 | `--max-connections <N>` | auto | Max concurrent client connections (auto-computed from `ulimit -n`) |
 | `--mtproto-proxy <HOST:PORT:SECRET>` | — | Upstream MTProto proxy fallback (repeatable) |
 | `--outbound-proxy <URL>` | — | Proxy for all outgoing connections: `http://`, `socks5://`, or `socks5h://`; `https://` proxy URLs are not supported |
@@ -238,8 +237,8 @@ tg-ws-proxy --port 9050 --dc-ip 1:149.154.175.205 --dc-ip 2:149.154.167.220
 # Use default CF domains from GitHub — no Cloudflare setup required
 tg-ws-proxy --default-domains
 
-# Default domains + CF priority (try CF first, fall back to direct WS)
-tg-ws-proxy --default-domains --cf-priority
+# Default domains + CF-first pin (try CF first, fall back to direct WS)
+tg-ws-proxy --default-domains --pinned-upstream cfworker,cfproxy,ws,mtproto,tcp
 
 # Your own Cloudflare-proxied domain
 tg-ws-proxy --cf-domain yourdomain.com
@@ -249,6 +248,9 @@ tg-ws-proxy --cf-domain proxy.net,example.com --cf-balance
 
 # Free workers.dev TCP tunnel fallback
 tg-ws-proxy --cf-worker-domain random-symbols-1234.username.workers.dev
+
+# Use plaintext WebSocket to Cloudflare when TLS interception breaks WSS
+tg-ws-proxy --cf-domain yourdomain.com --cf-disable-tls
 
 # Upstream MTProto proxy fallback
 tg-ws-proxy --mtproto-proxy proxy.example.com:443:ddabcdef1234567890abcdef1234567890

@@ -170,6 +170,30 @@ pub async fn connect_ws_with_outbound(
     outbound: &OutboundConnector,
     sni_override: Option<&str>,
 ) -> WsConnectResult {
+    connect_ws_with_outbound_mode(
+        ip,
+        domain,
+        skip_tls_verify,
+        timeout,
+        outbound,
+        sni_override,
+        false,
+    )
+    .await
+}
+
+/// Same as [`connect_ws_with_outbound`], optionally using plaintext `ws://` on
+/// port 80. Only Cloudflare tiers should pass `disable_tls = true`; Telegram's
+/// direct WebSocket endpoint requires TLS.
+pub async fn connect_ws_with_outbound_mode(
+    ip: &str,
+    domain: &str,
+    skip_tls_verify: bool,
+    timeout: Duration,
+    outbound: &OutboundConnector,
+    sni_override: Option<&str>,
+    disable_tls: bool,
+) -> WsConnectResult {
     connect_ws_with_path(
         ip,
         domain,
@@ -179,11 +203,13 @@ pub async fn connect_ws_with_outbound(
         timeout,
         outbound,
         sni_override,
+        disable_tls,
     )
     .await
 }
 
-/// Connect to `ip:443` and perform the WebSocket upgrade to `wss://{domain}{path}`.
+/// Connect to the DC endpoint and perform the WebSocket upgrade to
+/// `{ws|wss}://{domain}{path}`.
 ///
 /// Normally the TLS SNI is `domain` (matching the `Host` header). When
 /// `sni_override` is set, the TLS handshake instead presents that unrelated
@@ -193,6 +219,12 @@ pub async fn connect_ws_with_outbound(
 /// Because the server's real certificate can never match a fronted SNI,
 /// certificate verification is unconditionally skipped in that case,
 /// regardless of `skip_tls_verify`.
+///
+/// `disable_tls` (`--cf-disable-tls`) turns the whole TLS layer off: the TCP
+/// dial goes to port 80 and the upgrade request is built for plaintext
+/// `ws://`. Only the Cloudflare tiers ever pass it — Cloudflare's edge serves
+/// plaintext HTTP on 80 for proxied hostnames whose SSL mode does not force
+/// HTTPS.
 #[allow(clippy::too_many_arguments)]
 async fn connect_ws_with_path(
     ip: &str,
@@ -203,9 +235,11 @@ async fn connect_ws_with_path(
     timeout: Duration,
     outbound: &OutboundConnector,
     sni_override: Option<&str>,
+    disable_tls: bool,
 ) -> WsConnectResult {
     // ── TCP connection to the configured IP ──────────────────────────────
-    let tcp = match outbound.connect(ip, 443, timeout).await {
+    let port = if disable_tls { 80 } else { 443 };
+    let tcp = match outbound.connect(ip, port, timeout).await {
         Ok(s) => s,
         Err(e) if e.timed_out => return WsConnectResult::ConnectTimedOut(e.reason),
         Err(e) => return WsConnectResult::Failed(e.reason),
@@ -215,7 +249,8 @@ async fn connect_ws_with_path(
     let _ = tcp.set_nodelay(true);
 
     // ── Build WebSocket request with Telegram-required headers ───────────
-    let url = format!("wss://{}{}", domain, path);
+    let scheme = if disable_tls { "ws" } else { "wss" };
+    let url = format!("{}://{}{}", scheme, domain, path);
     let mut request = match url.into_client_request() {
         Ok(r) => r,
         Err(e) => return WsConnectResult::Failed(format!("bad URL: {}", e)),
@@ -241,11 +276,17 @@ async fn connect_ws_with_path(
     }
 
     // ── TLS handshake + WebSocket upgrade ─────────────────────────────────
-    let result = tokio::time::timeout(
-        timeout,
-        tls_handshake_and_upgrade(tcp, request, skip_tls_verify, sni_override),
-    )
-    .await;
+    let upgrade = async {
+        if disable_tls {
+            // Plaintext ws:// — no TLS handshake at all, just the HTTP
+            // upgrade. Wrapping in MaybeTlsStream::Plain keeps the
+            // connection type identical for the bridge.
+            client_async_with_config(request, MaybeTlsStream::Plain(tcp), Some(ws_config())).await
+        } else {
+            tls_handshake_and_upgrade(tcp, request, skip_tls_verify, sni_override).await
+        }
+    };
+    let result = tokio::time::timeout(timeout, upgrade).await;
 
     match result {
         Ok(Ok((ws, response))) => {
@@ -424,8 +465,16 @@ pub async fn connect_ws_for_dc_with_outbound(
     for domain in &domains {
         debug!("WS trying DC{}{} → {} via {}", dc, media, domain, ip);
 
-        match connect_ws_with_outbound(ip, domain, skip_tls_verify, timeout, outbound, sni_override)
-            .await
+        match connect_ws_with_outbound_mode(
+            ip,
+            domain,
+            skip_tls_verify,
+            timeout,
+            outbound,
+            sni_override,
+            false,
+        )
+        .await
         {
             WsConnectResult::Connected(ws) => {
                 return WsAttempt::connected(ws);
@@ -658,13 +707,14 @@ pub async fn connect_cf_ws_for_dc(
     skip_tls_verify: bool,
     timeout: Duration,
 ) -> (Option<TgWsStream>, Option<String>, bool) {
-    connect_cf_ws_for_dc_with_outbound(
+    connect_cf_ws_for_dc_with_outbound_mode(
         dc,
         cf_domains,
         is_media,
         skip_tls_verify,
         timeout,
         &OutboundConnector::direct(),
+        false,
     )
     .await
 }
@@ -679,6 +729,29 @@ pub async fn connect_cf_ws_for_dc_with_outbound(
     timeout: Duration,
     outbound: &OutboundConnector,
 ) -> (Option<TgWsStream>, Option<String>, bool) {
+    connect_cf_ws_for_dc_with_outbound_mode(
+        dc,
+        cf_domains,
+        is_media,
+        skip_tls_verify,
+        timeout,
+        outbound,
+        false,
+    )
+    .await
+}
+
+/// Same as [`connect_cf_ws_for_dc_with_outbound`], optionally using plaintext
+/// `ws://` on port 80.
+pub async fn connect_cf_ws_for_dc_with_outbound_mode(
+    dc: u32,
+    cf_domains: &[String],
+    is_media: bool,
+    skip_tls_verify: bool,
+    timeout: Duration,
+    outbound: &OutboundConnector,
+    disable_tls: bool,
+) -> (Option<TgWsStream>, Option<String>, bool) {
     connect_cf_ws_for_dc_with_outbound_ordered(
         dc,
         cf_domains,
@@ -687,10 +760,12 @@ pub async fn connect_cf_ws_for_dc_with_outbound(
         timeout,
         outbound,
         0,
+        disable_tls,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn connect_cf_ws_for_dc_with_outbound_ordered(
     dc: u32,
     cf_domains: &[String],
@@ -699,6 +774,7 @@ pub(crate) async fn connect_cf_ws_for_dc_with_outbound_ordered(
     timeout: Duration,
     outbound: &OutboundConnector,
     first_domain: usize,
+    disable_tls: bool,
 ) -> (Option<TgWsStream>, Option<String>, bool) {
     let media = media_tag(is_media);
     let mut all_redirects = true;
@@ -709,8 +785,16 @@ pub(crate) async fn connect_cf_ws_for_dc_with_outbound_ordered(
 
         // Pass the CF domain as the TCP host so that Tokio's DNS resolution
         // returns Cloudflare's anycast IP rather than Telegram's DC IP.
-        match connect_ws_with_outbound(&domain, &domain, skip_tls_verify, timeout, outbound, None)
-            .await
+        match connect_ws_with_outbound_mode(
+            &domain,
+            &domain,
+            skip_tls_verify,
+            timeout,
+            outbound,
+            None,
+            disable_tls,
+        )
+        .await
         {
             WsConnectResult::Connected(ws) => {
                 return (Some(ws), Some(domain), false);
@@ -761,7 +845,29 @@ pub async fn connect_cf_record_with_outbound(
     timeout: Duration,
     outbound: &OutboundConnector,
 ) -> Option<TgWsStream> {
-    match connect_ws_with_outbound(record, record, skip_tls_verify, timeout, outbound, None).await {
+    connect_cf_record_with_outbound_mode(record, skip_tls_verify, timeout, outbound, false).await
+}
+
+/// Same as [`connect_cf_record_with_outbound`], optionally using plaintext
+/// `ws://` on port 80.
+pub async fn connect_cf_record_with_outbound_mode(
+    record: &str,
+    skip_tls_verify: bool,
+    timeout: Duration,
+    outbound: &OutboundConnector,
+    disable_tls: bool,
+) -> Option<TgWsStream> {
+    match connect_ws_with_outbound_mode(
+        record,
+        record,
+        skip_tls_verify,
+        timeout,
+        outbound,
+        None,
+        disable_tls,
+    )
+    .await
+    {
         WsConnectResult::Connected(ws) => Some(ws),
         _ => None,
     }
@@ -781,7 +887,7 @@ pub async fn connect_cf_worker_ws_for_dc(
     skip_tls_verify: bool,
     timeout: Duration,
 ) -> Option<TgWsStream> {
-    connect_cf_worker_ws_for_dc_with_outbound(
+    connect_cf_worker_ws_for_dc_with_outbound_mode(
         worker_domain,
         dst,
         dc,
@@ -789,6 +895,7 @@ pub async fn connect_cf_worker_ws_for_dc(
         skip_tls_verify,
         timeout,
         &OutboundConnector::direct(),
+        false,
     )
     .await
 }
@@ -803,6 +910,32 @@ pub async fn connect_cf_worker_ws_for_dc_with_outbound(
     skip_tls_verify: bool,
     timeout: Duration,
     outbound: &OutboundConnector,
+) -> Option<TgWsStream> {
+    connect_cf_worker_ws_for_dc_with_outbound_mode(
+        worker_domain,
+        dst,
+        dc,
+        is_media,
+        skip_tls_verify,
+        timeout,
+        outbound,
+        false,
+    )
+    .await
+}
+
+/// Same as [`connect_cf_worker_ws_for_dc_with_outbound`], optionally using
+/// plaintext `ws://` on port 80.
+#[allow(clippy::too_many_arguments)]
+pub async fn connect_cf_worker_ws_for_dc_with_outbound_mode(
+    worker_domain: &str,
+    dst: &str,
+    dc: u32,
+    is_media: bool,
+    skip_tls_verify: bool,
+    timeout: Duration,
+    outbound: &OutboundConnector,
+    disable_tls: bool,
 ) -> Option<TgWsStream> {
     let path = cf_worker_path(dst, dc, is_media);
     let media = media_tag(is_media);
@@ -820,6 +953,7 @@ pub async fn connect_cf_worker_ws_for_dc_with_outbound(
         timeout,
         outbound,
         None,
+        disable_tls,
     )
     .await
     {

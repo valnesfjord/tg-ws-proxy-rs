@@ -76,6 +76,11 @@ default domain can stop working at any time.
    tg-ws-proxy
    ```
 
+   If TLS interception prevents `wss://` from connecting, add
+   `--cf-disable-tls` (or `TG_CF_DISABLE_TLS=true`) to use plaintext `ws://` on
+   port 80 for Cloudflare connections. This exposes the HTTP hostname and
+   traffic metadata, so keep the default TLS mode unless required.
+
 ## How it works
 
 When `--cf-domain` is configured the proxy:
@@ -86,29 +91,17 @@ When `--cf-domain` is configured the proxy:
    DNS resolves to Cloudflare's anycast IP.
    Cloudflare terminates TLS and forwards the WebSocket traffic as plain HTTP
    to the origin (Flexible SSL mode) — which is Telegram's actual DC server.
+   With `--cf-disable-tls`, the client-to-Cloudflare leg instead uses port 80
+   without TLS.
 3. If the CF proxy also fails, falls back to upstream MTProto proxies (if
    configured) and finally direct TCP.
 
 When no `--dc-ip` is configured for a DC, the CF proxy is tried as the
 **primary** path (before upstreams / TCP fallback). If `--dc-ip` is omitted
 entirely and `--cf-domain` is set, CF proxy becomes the primary path for
-**all** DCs.
-
-### `--cf-priority`
-
-When `--cf-priority` is set, the Cloudflare tiers are tried **before** the
-normal direct WebSocket connection for **all** DCs (even those with `--dc-ip`
-configured): the Worker tunnel first (`--cf-worker-domain`), then the CF proxy
-(`--cf-domain`).  If both fail, the proxy falls back to the normal WS path,
-then upstream MTProto proxies, then direct TCP.
-
-The flag covers a Worker-only setup too — with only `--cf-worker-domain`
-configured it used to do nothing at all, so every connection still waited out
-the direct-WS timeout before reaching the Worker.
-
-```sh
-tg-ws-proxy --dc-ip 2:149.154.167.220 --cf-domain yourdomain.com --cf-priority
-```
+**all** DCs. To try the CF tiers first even for DCs with `--dc-ip`, pin them
+in front of the ladder: `--pinned-upstream cfworker,cfproxy,ws,mtproto,tcp`
+(see [Fallbacks.md](Fallbacks.md#pinning-the-tier-order-per-traffic-class)).
 
 ## Verifying your configuration with `--check`
 
@@ -148,4 +141,3 @@ Common causes:
 
 The check exits with status code `0` if all probes pass, or `1` if any fail,
 making it suitable for use in scripts or watchdog setups.
-
