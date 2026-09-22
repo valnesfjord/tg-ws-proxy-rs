@@ -29,6 +29,10 @@ assert "luci-app-tg-ws-proxy-rs" in entry["depends"]["acl"]
 assert "tg-ws-proxy-rs" in acl["read"]["uci"]
 assert "tg-ws-proxy-rs" in acl["write"]["uci"]
 assert "/sbin/logread -e tg-ws-proxy-rs" in acl["read"]["file"]
+# Read-only probes: which release the binary is, and whether a stopped
+# service's port is held by another program.
+for probe in ("/usr/bin/tg-ws-proxy-rs --version", "/bin/netstat -lnt"):
+    assert acl["read"]["file"].get(probe) == ["exec"], probe
 assert "list" in acl["read"]["ubus"]["service"]
 assert "rc" not in acl["write"].get("ubus", {})
 service_commands = acl["write"]["file"]
@@ -51,6 +55,9 @@ grep -Fq "node.textContent = _('Log is not available yet: %s').format(error.mess
 if grep -Fq 'dom.content(node, visible' "$VIEW"; then fail 'untrusted log output still reaches dom.content'; fi
 grep -Fq 'statusPollRegistered' "$VIEW" || fail 'service status poller is not guarded against duplicate registration'
 grep -Fq "fs.exec('/etc/init.d/tg-ws-proxy-rs', [action])" "$VIEW" || fail 'service controls do not use the scoped init script'
+grep -Fq "const BINARY = '/usr/bin/tg-ws-proxy-rs';" "$VIEW" || fail 'version probe does not ask the -rs binary'
+grep -Fq "fs.exec(BINARY, ['--version'])" "$VIEW" || fail 'installed version is not shown'
+grep -Fq "fs.exec('/bin/netstat', ['-lnt'])" "$VIEW" || fail 'a port held by another program is not diagnosed'
 grep -Fq "form.DynamicList, 'cf_worker_domain'" "$VIEW" || fail 'Worker domains are not repeatable'
 for action in start stop restart; do
     grep -Fq "'$action'" "$VIEW" || fail "$action action is missing"
