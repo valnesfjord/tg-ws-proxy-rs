@@ -42,6 +42,9 @@ source "$INSTALLER"
 for mapping in \
     aarch64_cortex-a53:aarch64-unknown-linux-musl \
     arm_cortex-a7_neon-vfpv4:armv7-unknown-linux-musleabihf \
+    arm_cortex-a9_vfpv3-d16:armv7-unknown-linux-musleabihf \
+    arm_cortex-a9:armv7-unknown-linux-musleabi \
+    arm_cortex-a7:armv7-unknown-linux-musleabi \
     mips_24kc:mips-unknown-linux-musl \
     mipsel_24kc:mipsel-unknown-linux-musl \
     x86_64:x86_64-unknown-linux-musl; do
@@ -66,6 +69,23 @@ USE_UPX=1
 [[ "$(binary_archive_name)" == tg-ws-proxy-aarch64-unknown-linux-musl-upx.tar.gz ]] || {
     printf 'FAIL: UPX archive name is wrong\n' >&2; exit 1;
 }
+
+# `musleabi` is a prefix of `musleabihf`, and the hard-float archive is listed
+# first here: a lookup by target stem would hand a router without VFP the build
+# that dies on it.
+for variant in '' -upx; do
+    want="tg-ws-proxy-armv7-unknown-linux-musleabi$variant.tar.gz"
+    got="$(
+        release_asset_urls() {
+            printf 'https://example.invalid/%s\n' \
+                "tg-ws-proxy-armv7-unknown-linux-musleabihf$variant.tar.gz" "$want"
+        }
+        find_release_asset release.json "$want" ''
+    )"
+    [[ "$got" == "https://example.invalid/$want" ]] || {
+        printf 'FAIL: %s resolved to %s\n' "$want" "$got" >&2; exit 1;
+    }
+done
 
 APK_ARGS=''
 OPKG_ARGS=''

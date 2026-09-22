@@ -28,6 +28,16 @@ The release binary is installed directly as:
 /usr/bin/tg-ws-proxy-rs
 ```
 
+The archive itself holds `tg-ws-proxy`, the name the binary has on every other
+platform and in existing scripts; only the OpenWrt integration renames it, so
+that it cannot collide with the upstream package. `install.sh` does the rename.
+Installing by hand means doing it yourself:
+
+```sh
+tar -xzf tg-ws-proxy-<target>.tar.gz -C /tmp
+mv /tmp/tg-ws-proxy /usr/bin/tg-ws-proxy-rs
+```
+
 The LuCI/integration package owns:
 
 ```text
@@ -51,12 +61,15 @@ for these Rust targets:
 
 - `aarch64-unknown-linux-musl`;
 - `armv7-unknown-linux-musleabihf`;
+- `armv7-unknown-linux-musleabi` — soft-float, for the ARMv7 cores OpenWrt
+  builds without an FPU: `arm_cortex-a9` (bcm53xx) and `arm_cortex-a7`. The
+  `musleabihf` binary dies with `SIGILL` there;
 - `mips-unknown-linux-musl`;
 - `mipsel-unknown-linux-musl`;
 - `x86_64-unknown-linux-musl`.
 
 It additionally contains one LuCI APK, one LuCI IPK and a shared `SHA256SUMS`
-covering all ten Linux archives and both LuCI packages. There are no core APKs,
+covering all twelve Linux archives and both LuCI packages. There are no core APKs,
 core IPKs, per-router optimization wrappers or package feeds.
 
 ## Install or upgrade
@@ -210,6 +223,11 @@ the bounded OpenWrt `logd` ring buffer. The log-level selector maps to
 `off|error|warn|info|debug|trace`; application debug/trace can be enabled without
 turning on dependency-crate noise.
 
+The status block shows the version `/usr/bin/tg-ws-proxy-rs --version` reports,
+or says that the binary is missing or does not run on this router. A stopped
+service whose TCP port is held by another program is reported as such, see
+[Troubleshooting](#troubleshooting).
+
 Example UCI changes:
 
 ```sh
@@ -224,6 +242,44 @@ uci commit tg-ws-proxy-rs
 
 The secret is persistent in `/etc/config/tg-ws-proxy-rs`; do not include that
 file in public logs.
+
+## Troubleshooting
+
+### The service stays STOPPED and Start does not help
+
+The proxy exits at once when its TCP port is already taken, and procd only sees
+that it stopped. The LuCI status says when another program holds the port. Most
+often that is the upstream `tg-ws-proxy` package, which listens on 1443 by
+default as well. Stop and disable it, or move one of the two to another port:
+
+```sh
+/etc/init.d/tg-ws-proxy stop
+/etc/init.d/tg-ws-proxy disable
+```
+
+### `apk add` fails with `breaks: world[…><Q1…]`
+
+```text
+ERROR: unable to select packages:
+  tg-ws-proxy-0.9.3-r2:
+    breaks: world[tg-ws-proxy><Q16ikvzQeX+6jdG5KlIoCXgdFp9jw=]
+```
+
+The package to fix is the one named in the error, not `luci-app-tg-ws-proxy-rs`.
+`apk add ./file.apk` pins that exact file in `/etc/apk/world` (the `><Q1…`
+part). Once the installed package no longer matches the pin, apk refuses every
+transaction, whatever it was asked to install. Remove that package if it is not
+needed:
+
+```sh
+apk del tg-ws-proxy
+```
+
+or keep it and drop the pin:
+
+```sh
+sed -i 's/^tg-ws-proxy><.*/tg-ws-proxy/' /etc/apk/world
+```
 
 ## Uninstall
 

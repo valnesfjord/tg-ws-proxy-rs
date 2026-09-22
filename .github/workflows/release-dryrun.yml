@@ -71,6 +71,10 @@ jobs:
                       build_std: true
                     - target: armv7-unknown-linux-musleabihf
                       qemu: qemu-arm-static
+                    # The same CPU release.yml's compress-assets leg runs it on.
+                    - target: armv7-unknown-linux-musleabi
+                      qemu: qemu-arm-static
+                      qemu_cpu: cortex-a9,vfp=off,vfp-d32=off,neon=off
                     - target: aarch64-unknown-linux-musl
                       qemu: qemu-aarch64-static
                     - target: x86_64-unknown-linux-musl
@@ -102,7 +106,7 @@ jobs:
             - name: Install cross
               run: cargo install cross --locked
 
-            # release.yml builds the three non-mips targets through
+            # release.yml builds the four non-mips targets through
             # taiki-e/upload-rust-binary-action, which has no hook to pack in the
             # middle. Building them with `cross` here gives the same profile and
             # the same target ABI, which is what the packing check needs.
@@ -141,7 +145,8 @@ jobs:
               run: |
                   set -euxo pipefail
                   .github/scripts/pack-verify.sh \
-                      "target/${{ matrix.target }}/release/tg-ws-proxy" ${{ matrix.qemu }}
+                      "target/${{ matrix.target }}/release/tg-ws-proxy" ${{ matrix.qemu }} \
+                      "${{ matrix.qemu_cpu }}"
 
             - uses: actions/upload-artifact@v7
               with:

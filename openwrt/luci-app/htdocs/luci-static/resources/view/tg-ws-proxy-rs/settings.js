@@ -10,6 +10,10 @@
 'require view';
 
 const SERVICE = 'tg-ws-proxy-rs';
+const BINARY = '/usr/bin/tg-ws-proxy-rs';
+// The upstream tg-ws-proxy package runs under this service name and listens on
+// 1443 by default, the same port as this one.
+const UPSTREAM_SERVICE = 'tg-ws-proxy';
 const isReadonlyView = !L.hasViewPermission() || null;
 
 const callServiceList = rpc.declare({
@@ -19,31 +23,87 @@ const callServiceList = rpc.declare({
 	expect: { '': {} }
 });
 
+function runningInstance(services, name) {
+	const instances = (services[name] || {}).instances || {};
+	for (const id in instances) {
+		if (instances[id].running)
+			return { pid: instances[id].pid || null };
+	}
+	return null;
+}
+
+function configuredPort() {
+	return uci.get(SERVICE, 'main', 'port') || '1443';
+}
+
+// procd only sees the process exit, so a port held by another program shows up
+// as a bare STOPPED that the Start button cannot fix.
+function portInUse(port) {
+	return L.resolveDefault(fs.exec('/bin/netstat', ['-lnt']), null).then((result) =>
+		!!result && String(result.stdout || '').split('\n').some((line) => {
+			const fields = line.trim().split(/\s+/);
+			const local = fields[3] || '';
+			return /^tcp/.test(fields[0]) && local.slice(local.lastIndexOf(':') + 1) === port;
+		}));
+}
+
 function serviceStatus() {
-	return L.resolveDefault(callServiceList(SERVICE), {}).then((result) => {
-		const service = result[SERVICE] || {};
-		const instances = service.instances || {};
-		for (const name in instances) {
-			if (instances[name].running)
-				return { running: true, pid: instances[name].pid || null };
-		}
-		return { running: false, pid: null };
+	return L.resolveDefault(callServiceList(SERVICE), {}).then((services) => {
+		const instance = runningInstance(services, SERVICE);
+		if (instance)
+			return { running: true, pid: instance.pid };
+		return portInUse(configuredPort()).then((portBusy) => {
+			if (!portBusy)
+				return { running: false };
+			return L.resolveDefault(callServiceList(UPSTREAM_SERVICE), {}).then((upstream) => ({
+				running: false,
+				portBusy: true,
+				upstream: runningInstance(upstream, UPSTREAM_SERVICE)
+			}));
+		});
 	});
 }
 
 function statusNode(status) {
-	const port = uci.get(SERVICE, 'main', 'port') || '1443';
+	const port = configuredPort();
 	const state = status.running ? _('RUNNING') : _('STOPPED');
 	const color = status.running ? 'green' : 'red';
-	const detail = status.running && status.pid
-		? _('PID %s, listening on TCP %s').format(status.pid, port)
-		: _('Configured TCP port: %s').format(port);
+	let detail;
+	if (status.running && status.pid)
+		detail = _('PID %s, listening on TCP %s').format(status.pid, port);
+	else if (status.upstream)
+		detail = _('TCP port %s is already in use, and the service of the separate tg-ws-proxy package is running (PID %s). Stop and disable it, or change the listen port.').format(port, status.upstream.pid || '?');
+	else if (status.portBusy)
+		detail = _('TCP port %s is already in use by another program. Stop it, or change the listen port.').format(port);
+	else
+		detail = _('Configured TCP port: %s').format(port);
 
 	return E('span', {}, [
 		E('strong', { style: 'color:%s'.format(color) }, state),
 		' — ',
 		detail
 	]);
+}
+
+// Asked of the binary rather than of this package: the two are installed
+// separately, so only the binary knows which release is actually running.
+function binaryVersion() {
+	return fs.exec(BINARY, ['--version']).then((result) => {
+		const version = result.code === 0 && String(result.stdout || '').match(/\d+\.\d+\.\d+\S*/);
+		return version
+			? { version: version[0] }
+			: { error: _('%s does not run on this router (exit code %s). Install the release archive built for this architecture.').format(BINARY, result.code) };
+	}).catch((error) => ({
+		error: error.name === 'NotFoundError'
+			? _('%s is missing. Run install.sh, or save the tg-ws-proxy binary from the release archive under this name.').format(BINARY)
+			: _('Version is not available: %s').format(error.message)
+	}));
+}
+
+function binaryNode(binary) {
+	return binary.version
+		? _('Version: %s').format(binary.version)
+		: E('span', { style: 'color:red' }, binary.error);
 }
 
 function formatLogLine(line) {
@@ -118,7 +178,7 @@ function addSeconds(section, option, title, description, defaultValue) {
 
 return view.extend({
 	load() {
-		return uci.load(SERVICE);
+		return Promise.all([ uci.load(SERVICE), binaryVersion() ]);
 	},
 
 	updateStatus() {
@@ -189,9 +249,10 @@ return view.extend({
 		});
 	},
 
-	render() {
+	render(data) {
 		let m, s, o;
 		const self = this;
+		const binary = data[1];
 
 		m = new form.Map('tg-ws-proxy-rs', _('Telegram WS Proxy (Rust)'),
 			_('Telegram MTProto proxy with WebSocket, FakeTLS, Cloudflare and upstream proxy fallbacks.'));
@@ -205,6 +266,7 @@ return view.extend({
 			return E('div', { class: 'cbi-section' }, [
 				E('h3', {}, _('Service status')),
 				E('p', { id: 'tg_ws_proxy_service_status' }, _('Collecting data...')),
+				E('p', {}, binaryNode(binary)),
 				E('div', {}, [
 					E('button', {
 						class: 'btn cbi-button cbi-button-positive',

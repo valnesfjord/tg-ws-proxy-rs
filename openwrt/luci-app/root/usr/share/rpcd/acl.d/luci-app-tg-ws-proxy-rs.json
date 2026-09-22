@@ -4,7 +4,9 @@
 		"read": {
 			"cgi-io": [ "exec" ],
 			"file": {
-				"/sbin/logread -e tg-ws-proxy-rs": [ "exec" ]
+				"/sbin/logread -e tg-ws-proxy-rs": [ "exec" ],
+				"/usr/bin/tg-ws-proxy-rs --version": [ "exec" ],
+				"/bin/netstat -lnt": [ "exec" ]
 			},
 			"ubus": {
 				"service": [ "list" ]

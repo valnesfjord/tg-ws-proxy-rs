@@ -149,6 +149,9 @@ binary_target() {
 		armv7|arm_cortex-a5_vfpv4|arm_cortex-a7_vfpv4|arm_cortex-a7_neon-vfpv4|\
 		arm_cortex-a8_vfpv3|arm_cortex-a9_vfpv3-d16|arm_cortex-a9_neon|\
 		arm_cortex-a15_neon-vfpv4) printf '%s' armv7-unknown-linux-musleabihf ;;
+		# OpenWrt builds these two without an FPU (bcm53xx is a Cortex-A9 with no
+		# VFP), and a musleabihf binary dies with SIGILL there.
+		arm_cortex-a7|arm_cortex-a9) printf '%s' armv7-unknown-linux-musleabi ;;
 		mipsel|mipsel_24kc|mipsel_74kc) printf '%s' mipsel-unknown-linux-musl ;;
 		mips|mips_24kc) printf '%s' mips-unknown-linux-musl ;;
 		x86_64) printf '%s' x86_64-unknown-linux-musl ;;

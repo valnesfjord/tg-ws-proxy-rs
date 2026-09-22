@@ -52,6 +52,8 @@ jobs:
                       os: ubuntu-latest
                     - target: armv7-unknown-linux-musleabihf
                       os: ubuntu-latest
+                    - target: armv7-unknown-linux-musleabi
+                      os: ubuntu-latest
                     - target: x86_64-apple-darwin
                       os: macos-latest
                     - target: x86_64-pc-windows-gnu
@@ -463,6 +465,12 @@ jobs:
                       qemu: qemu-mips-static
                     - target: armv7-unknown-linux-musleabihf
                       qemu: qemu-arm-static
+                    # Run on a Cortex-A9 with VFP and NEON switched off -- bcm53xx,
+                    # the routers this build exists for -- rather than on QEMU's
+                    # default CPU, which has every extension there is.
+                    - target: armv7-unknown-linux-musleabi
+                      qemu: qemu-arm-static
+                      qemu_cpu: cortex-a9,vfp=off,vfp-d32=off,neon=off
                     - target: aarch64-unknown-linux-musl
                       qemu: qemu-aarch64-static
                     - target: x86_64-unknown-linux-musl
@@ -503,7 +511,7 @@ jobs:
                   tar -C "$WORK" -xzf "${WORK}/${NAME}.tar.gz"
                   test -f "${WORK}/tg-ws-proxy"
 
-                  .github/scripts/pack-verify.sh "${WORK}/tg-ws-proxy" ${{ matrix.qemu }}
+                  .github/scripts/pack-verify.sh "${WORK}/tg-ws-proxy" ${{ matrix.qemu }} "${{ matrix.qemu_cpu }}"
 
                   tar -C "$WORK" -czf "${NAME}-upx.tar.gz" tg-ws-proxy
                   gh release upload "$TAG" "${NAME}-upx.tar.gz" \
@@ -558,14 +566,14 @@ jobs:
                   apks=(tg-ws-proxy-rs-android-*.apk)
                   luci=(luci-app-tg-ws-proxy-rs-*.apk luci-app-tg-ws-proxy-rs_*.ipk)
 
-                  # 9 archives from `upload-assets`, 5 `-upx` ones from
+                  # 10 archives from `upload-assets`, 6 `-upx` ones from
                   # `compress-assets`, 2 LuCI packages, 4 APKs. The total is what
                   # catches an asset from the four macOS/Windows targets going
                   # missing without spelling out archive names this job never
                   # chose; the per-group counts say which path came up short.
-                  if [[ "${#all[@]}" -ne 20 || "${#musl[@]}" -ne 10 ||
+                  if [[ "${#all[@]}" -ne 22 || "${#musl[@]}" -ne 12 ||
                         "${#apks[@]}" -ne 4 || "${#luci[@]}" -ne 2 ]]; then
-                      echo "::error::release carries ${#all[@]} assets, expected 20: ${#musl[@]}/10 musl tarballs, ${#apks[@]}/4 APKs, ${#luci[@]}/2 LuCI packages"
+                      echo "::error::release carries ${#all[@]} assets, expected 22: ${#musl[@]}/12 musl tarballs, ${#apks[@]}/4 APKs, ${#luci[@]}/2 LuCI packages"
                       printf '%s\n' "${all[@]}"
                       exit 1
                   fi
