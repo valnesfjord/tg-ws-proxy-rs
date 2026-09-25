@@ -473,10 +473,27 @@ jobs:
             # every gh call below.
             - uses: actions/checkout@v6
 
+            # UPX is pinned to 4.2.4, and this is not a stale pin: every 5.x
+            # unpacking stub calls `memfd_create` before anything else, which
+            # needs Linux >= 3.17 (October 2014), and router firmwares ship much
+            # older kernels. There a 5.x-packed binary dies with
+            # `Trace/breakpoint trap` before the proxy's first instruction —
+            # measured on a Xiaomi R3P (kernel 3.4.113) in a sibling project:
+            # `execve` succeeds, the stub makes a couple of syscalls, not one of
+            # them a network call, then the kernel raises SIGTRAP. UPX closed
+            # exactly that report as "kernel too old" and points at 4.2.4, whose
+            # stub works through `/proc/self/exe` and `mmap` instead (upx/upx#904
+            # for mipsel on 3.4, upx/upx#902 for arm32 on 3.14); 4.2.4 packs to
+            # the same ratio. The newest lines are no better: 5.0.2, 5.1.1 and
+            # 5.2.0 also mis-pack an armv7 PT_LOAD whose `p_filesz` is an exact
+            # multiple of the page size into a binary that segfaults at startup
+            # (upx/upx#18898, fixed in 5.2.1) — and 5.2.1 still needs
+            # `memfd_create`. Do not move this to `latest`, and check both an
+            # old and a new kernel before considering a bump.
             - name: Install UPX and qemu-user-static
               env:
-                  UPX_VERSION: 5.2.0
-                  UPX_SHA256: 3db5d3294707439db97866feab8d75d800f028f48481a40547411824da4288a1
+                  UPX_VERSION: 4.2.4
+                  UPX_SHA256: 75cab4e57ab72fb4585ee45ff36388d280c7afd72aa03e8d4b9c3cbddb474193
               shell: bash
               run: |
                   set -euxo pipefail

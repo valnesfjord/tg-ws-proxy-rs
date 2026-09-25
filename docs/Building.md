@@ -149,6 +149,14 @@ upx -9 --lzma target/mipsel-unknown-linux-musl/release/tg-ws-proxy
 upx -t      target/mipsel-unknown-linux-musl/release/tg-ws-proxy   # verify
 ```
 
+Use **UPX 4.2.4**, not the latest, for router targets. Every 5.x unpacking stub
+calls `memfd_create` before anything else, which needs Linux 3.17 or newer, and
+router firmwares ship much older kernels — there a 5.x-packed binary dies with
+`Trace/breakpoint trap` before the proxy's first instruction. 4.2.4 works
+through `/proc/self/exe` and `mmap` instead and packs to the same ratio, which is
+why the `-upx` assets on the releases page are built with it. `upx -t` unpacks in
+memory and compares, so it passes on either version and will not catch this.
+
 ### The trade-off
 
 UPX buys flash with RAM. A normal ELF maps its code straight from the file, so

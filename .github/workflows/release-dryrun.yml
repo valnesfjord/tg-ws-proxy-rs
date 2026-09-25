@@ -116,10 +116,13 @@ jobs:
               if: ${{ !matrix.build_std }}
               run: cross build --release --bin tg-ws-proxy --target ${{ matrix.target }}
 
+            # UPX 4.2.4, same pin and same reason as release.yml: every 5.x stub
+            # needs `memfd_create` (Linux >= 3.17) and dies with
+            # `Trace/breakpoint trap` on the older kernels router firmwares ship.
             - name: Install UPX and qemu-user-static
               env:
-                  UPX_VERSION: 5.2.0
-                  UPX_SHA256: 3db5d3294707439db97866feab8d75d800f028f48481a40547411824da4288a1
+                  UPX_VERSION: 4.2.4
+                  UPX_SHA256: 75cab4e57ab72fb4585ee45ff36388d280c7afd72aa03e8d4b9c3cbddb474193
               run: |
                   set -euxo pipefail
                   curl -fsSL -o upx.tar.xz \
