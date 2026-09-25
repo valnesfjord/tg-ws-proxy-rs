@@ -1,18 +1,16 @@
 use std::net::SocketAddr;
 
 use clap::Parser;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
 
 use tg_ws_proxy_rs::check::run_check_with_outbound;
 use tg_ws_proxy_rs::config::Config;
-use tg_ws_proxy_rs::crypto;
 
 mod common;
 
 use common::{
     await_proxy_request, await_task, await_unit_task, mtproto_acceptor, rejecting_http_proxy,
-    tunneling_http_proxy,
+    silent_mtproto_acceptor, tunneling_http_proxy,
 };
 
 /// Build a `--check` config that routes through `proxy_addr` and disables
@@ -94,7 +92,7 @@ async fn check_upstream_mtproto_uses_outbound_proxy() {
 
 #[tokio::test]
 async fn check_upstream_mtproto_successfully_tunnels_through_proxy() {
-    let (upstream, upstream_task) = mtproto_acceptor().await;
+    let (upstream, upstream_task) = mtproto_acceptor(upstream_secret_bytes()).await;
     let (proxy_addr, proxy_task) = tunneling_http_proxy(upstream).await;
     let config = check_config(
         &format!("http://{proxy_addr}"),
@@ -108,6 +106,36 @@ async fn check_upstream_mtproto_successfully_tunnels_through_proxy() {
     assert!(run_check_with_outbound(&config, &outbound, None).await);
     let request = await_proxy_request(proxy_task).await;
     assert!(request.starts_with("CONNECT upstream.example:443 HTTP/1.1"));
+    await_unit_task(upstream_task).await;
+}
+
+/// The 16 bytes `--mtproto-proxy` is given as hex below, decoded — the secret
+/// the fixture upstream has to parse the handshake with.
+fn upstream_secret_bytes() -> Vec<u8> {
+    vec![
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+        0xff,
+    ]
+}
+
+#[tokio::test]
+async fn check_upstream_mtproto_fails_when_it_never_answers() {
+    // An upstream that accepts the handshake and then says nothing, as one
+    // whose own route to a data centre is dead does.  Before the probe read a
+    // reply it passed, which is exactly the weakness this pins.
+    let (upstream, upstream_task) = silent_mtproto_acceptor().await;
+    let (proxy_addr, proxy_task) = tunneling_http_proxy(upstream).await;
+    let config = check_config(
+        &format!("http://{proxy_addr}"),
+        &[
+            "--mtproto-proxy",
+            "upstream.example:443:00112233445566778899aabbccddeeff",
+        ],
+    );
+    let outbound = config.outbound_connector().unwrap();
+
+    assert!(!run_check_with_outbound(&config, &outbound, None).await);
+    await_proxy_request(proxy_task).await;
     await_unit_task(upstream_task).await;
 }
 
@@ -164,38 +192,7 @@ async fn res_pq_listener(secret: Vec<u8>) -> (SocketAddr, JoinHandle<()>) {
 
     let task = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
-
-        let mut init = [0u8; crypto::HANDSHAKE_LEN];
-        stream.read_exact(&mut init).await.unwrap();
-        let info = crypto::parse_handshake(&init, &secret).expect("client handshake parses");
-        let relay_init = crypto::generate_relay_init(info.proto, info.dc_id as i16);
-        let mut ciphers =
-            crypto::build_connection_ciphers(&info.prekey_and_iv, &secret, &relay_init);
-
-        // The whole 44-byte request: leaving its tail unread would reset the
-        // connection when the listener closes and discard the reply still
-        // sitting in the probe's receive buffer.
-        let mut request = [0u8; 44];
-        stream.read_exact(&mut request).await.unwrap();
-        crypto::apply_keystream(&mut ciphers.clt_dec, &mut request);
-        assert_eq!(
-            &request[4..12],
-            &[0u8; 8],
-            "no session key in a req_pq_multi"
-        );
-        assert_eq!(
-            &request[24..28],
-            &0xbe7e_8ef1u32.to_le_bytes(),
-            "the request is a req_pq_multi"
-        );
-
-        let mut reply = [0u8; 28];
-        // A real frame carries its length: 4 bytes of prefix, then the 24-byte
-        // packet this fixture sends.
-        reply[..4].copy_from_slice(&24u32.to_le_bytes());
-        reply[24..28].copy_from_slice(&0x0516_2463u32.to_le_bytes());
-        crypto::apply_keystream(&mut ciphers.clt_enc, &mut reply);
-        stream.write_all(&reply).await.unwrap();
+        common::answer_res_pq(&mut stream, &secret).await;
     });
 
     (addr, task)

@@ -190,16 +190,82 @@ pub async fn tunneling_http_proxy(target: SocketAddr) -> (SocketAddr, JoinHandle
     (proxy_addr, proxy_task)
 }
 
-/// A server that accepts one connection and reads a 64-byte MTProto
-/// obfuscation handshake — the minimum an upstream MTProto proxy must do for
-/// a `--check` probe to pass.
-pub async fn mtproto_acceptor() -> (SocketAddr, JoinHandle<()>) {
+/// Read a client handshake and answer the `req_pq_multi` that follows with a
+/// `resPQ` frame — what a working upstream MTProto proxy does, and what the
+/// `--check` probe now requires of one.
+///
+/// The ciphers are built here rather than taken from the crate's client side on
+/// purpose: the fixture parses the handshake and builds `clt_dec`/`clt_enc` the
+/// way the real server does, so a swapped cipher or a wrong constructor offset
+/// fails here rather than only on a real network.
+pub async fn answer_res_pq(stream: &mut TcpStream, secret: &[u8]) {
+    let mut init = [0u8; tg_ws_proxy_rs::crypto::HANDSHAKE_LEN];
+    stream.read_exact(&mut init).await.unwrap();
+    let info =
+        tg_ws_proxy_rs::crypto::parse_handshake(&init, secret).expect("client handshake parses");
+    let relay_init = tg_ws_proxy_rs::crypto::generate_relay_init(info.proto, info.dc_id as i16);
+    let mut ciphers =
+        tg_ws_proxy_rs::crypto::build_connection_ciphers(&info.prekey_and_iv, secret, &relay_init);
+
+    // The whole 44-byte request: leaving its tail unread would reset the
+    // connection when the fixture closes and discard the reply still sitting in
+    // the probe's receive buffer.
+    let mut request = [0u8; 44];
+    stream.read_exact(&mut request).await.unwrap();
+    tg_ws_proxy_rs::crypto::apply_keystream(&mut ciphers.clt_dec, &mut request);
+    assert_eq!(
+        &request[4..12],
+        &[0u8; 8],
+        "no session key in a req_pq_multi"
+    );
+    assert_eq!(
+        &request[24..28],
+        &0xbe7e_8ef1u32.to_le_bytes(),
+        "the request is a req_pq_multi"
+    );
+
+    let mut reply = [0u8; 28];
+    // A real frame carries its length: 4 bytes of prefix, then the 24-byte
+    // packet this fixture sends.
+    reply[..4].copy_from_slice(&24u32.to_le_bytes());
+    reply[24..28].copy_from_slice(&0x0516_2463u32.to_le_bytes());
+    tg_ws_proxy_rs::crypto::apply_keystream(&mut ciphers.clt_enc, &mut reply);
+    stream.write_all(&reply).await.unwrap();
+}
+
+/// A server that accepts one connection, reads a 64-byte MTProto obfuscation
+/// handshake and answers with a `resPQ` — the minimum an upstream MTProto proxy
+/// must do for a `--check` probe to pass.
+pub async fn mtproto_acceptor(secret: Vec<u8>) -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        answer_res_pq(&mut stream, &secret).await;
+    });
+
+    (addr, task)
+}
+
+/// A server that accepts the handshake and then stays silent, as an upstream
+/// whose own route to a data centre is dead does.  A probe that only sends
+/// cannot tell it from a working one.
+pub async fn silent_mtproto_acceptor() -> (SocketAddr, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut handshake = [0u8; 64];
         stream.read_exact(&mut handshake).await.unwrap();
+
+        // Hold the connection open without answering, and drain whatever the
+        // probe sends until it gives up and closes.
+        let mut buf = vec![0u8; 1024];
+        while let Ok(n) = stream.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+        }
     });
 
     (addr, task)

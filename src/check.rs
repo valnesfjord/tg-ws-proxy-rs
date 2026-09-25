@@ -47,10 +47,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cipher::StreamCipher;
 use rand::RngCore;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::config::{Config, MtProtoProxy, default_dc_ip};
-use crate::crypto::{self, ProtoTag, generate_client_handshake};
+use crate::crypto::{self, AesCtr256, ProtoTag, generate_client_handshake};
 use crate::faketls;
 use crate::outbound::OutboundConnector;
 use crate::ws_client::{
@@ -273,12 +273,16 @@ async fn probe_cf_worker(
     }
 }
 
-/// Probe an MTProto proxy (plain or FakeTLS) by connecting and sending the
-/// MTProto obfuscation handshake.
+/// Probe an MTProto proxy (plain or FakeTLS) by connecting, sending the
+/// MTProto obfuscation handshake and — on the plain path — requiring a real
+/// `resPQ` back.
 ///
-/// For FakeTLS proxies the probe also drains the server's fake TLS handshake,
-/// verifying end-to-end protocol negotiation.  For plain proxies a successful
-/// TCP connect + handshake send is sufficient to confirm reachability.
+/// For FakeTLS proxies the probe drains the server's fake TLS handshake,
+/// verifying end-to-end protocol negotiation; reading a `resPQ` through that
+/// record layer is a further step.  For plain proxies a TCP connect plus a
+/// handshake send used to be enough, which accepted an upstream that cannot
+/// reach Telegram at all — the same weakness the listener probe had, so it now
+/// shares [`require_res_pq`].
 async fn probe_mtproto_proxy(
     proxy: &MtProtoProxy,
     timeout: Duration,
@@ -297,7 +301,7 @@ async fn probe_mtproto_proxy(
     let _ = stream.set_nodelay(true);
 
     // Use DC index 2 (non-media) as a representative test target.
-    let (handshake, _enc, _dec) =
+    let (handshake, mut enc, mut dec) =
         generate_client_handshake(key_bytes, 2, ProtoTag::PaddedIntermediate);
     let (mut reader, mut writer) = stream.into_split();
 
@@ -327,18 +331,109 @@ async fn probe_mtproto_proxy(
         if let Err(e) = writer.write_all(&handshake).await {
             return ProbeStatus::Fail(format!("send MTProto handshake: {}", e));
         }
+
+        // An accepted handshake only says the socket is open: the proxy answers
+        // one before its own route to a DC works, and Telegram stays silent
+        // behind it.  Ask for resPQ, as the listener probe does.
+        if let Err(e) = require_res_pq(
+            &mut reader,
+            &mut writer,
+            &mut enc,
+            &mut dec,
+            timeout,
+            "the upstream proxy",
+        )
+        .await
+        {
+            return ProbeStatus::Fail(e);
+        }
     }
 
     ProbeStatus::Ok(start.elapsed())
 }
 
+/// Send a real `req_pq_multi` through the obfuscated stream and require the
+/// reply to decrypt to `resPQ`.
+///
+/// This is the part that separates "the peer accepted our handshake" from "the
+/// peer reached Telegram", and both probes need it: a listener accepts a
+/// handshake before it has anywhere to forward the connection, and an upstream
+/// proxy accepts one before its own route to a data centre works.  A successful
+/// send says only that a socket is open — the trap the Worker probe hit in #93.
+///
+/// `peer` names the other end in the failure messages ("the listener", "the
+/// upstream proxy"), so each caller keeps its own wording.
+async fn require_res_pq<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    enc: &mut AesCtr256,
+    dec: &mut AesCtr256,
+    timeout: Duration,
+    peer: &str,
+) -> Result<(), String>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut request = build_req_pq_multi();
+    enc.apply_keystream(&mut request);
+    writer
+        .write_all(&request)
+        .await
+        .map_err(|e| format!("send req_pq_multi: {e}"))?;
+
+    // Read until the fixed-size header is complete.  Telegram stays silent
+    // until it has the request and the proxy's pool may still be coming up, so
+    // this waits the whole budget the caller allows.
+    let mut header = [0u8; FRAME_HEADER_LEN];
+    let mut filled = 0;
+    let read = tokio::time::timeout(timeout, async {
+        while filled < header.len() {
+            match reader.read(&mut header[filled..]).await {
+                Ok(0) => break,
+                Ok(read) => filled += read,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    })
+    .await;
+
+    // Decrypt whatever arrived, so a transport error sent through the same
+    // stream is readable as one.
+    dec.apply_keystream(&mut header[..filled]);
+
+    match read {
+        Err(_) => Err(format!("no reply within {}s", timeout.as_secs())),
+        Ok(Err(e)) => Err(format!("read from {peer}: {e}")),
+        Ok(Ok(())) if filled == 0 => Err(format!(
+            "{peer} closed without answering — no tier reached the DC"
+        )),
+        // A transport error arrives as an ordinary packet: a 4-byte length of 4
+        // followed by the negative code, so 8 bytes on the wire.  A bare
+        // 4-byte prefix is not an error — it is a truncated packet.
+        Ok(Ok(())) if filled >= 8 && header[..4] == 4u32.to_le_bytes() => {
+            let mut code = [0u8; 4];
+            code.copy_from_slice(&header[4..8]);
+            Err(format!(
+                "{peer} reported a transport error: {}",
+                i32::from_le_bytes(code)
+            ))
+        }
+        Ok(Ok(())) if filled < header.len() => Err(format!(
+            "{peer} closed after {filled} of {} header bytes — no tier reached the DC",
+            header.len()
+        )),
+        Ok(Ok(())) if reply_is_res_pq(&header) => Ok(()),
+        Ok(Ok(())) => Err(format!("{peer}'s reply is not resPQ")),
+    }
+}
+
 /// Probe the listener at `addr` the way a client would.
 ///
 /// Connects, sends the obfuscation handshake and a real `req_pq_multi`, and
-/// requires the reply to decrypt to `resPQ`.  Nothing weaker will do: the
-/// listener accepts a handshake before it has anywhere to forward the
-/// connection, so a successful send says only that the socket is open — the
-/// trap the Worker probe hit in #93.
+/// requires the reply to decrypt to `resPQ` — see [`require_res_pq`] for why
+/// nothing weaker will do.
 ///
 /// The connection goes through a direct connector: our own listener is never
 /// outbound, and a configured `--outbound-proxy` would otherwise carry the
@@ -368,56 +463,18 @@ async fn probe_listener(
         return ProbeStatus::Fail(format!("send MTProto handshake: {}", e));
     }
 
-    let mut request = build_req_pq_multi();
-    enc.apply_keystream(&mut request);
-    if let Err(e) = writer.write_all(&request).await {
-        return ProbeStatus::Fail(format!("send req_pq_multi: {}", e));
-    }
-
-    // Read until the fixed-size header is complete.  Telegram stays silent
-    // until it has the request and the proxy's pool may still be coming up, so
-    // this waits the whole budget the caller allows.
-    let mut header = [0u8; FRAME_HEADER_LEN];
-    let mut filled = 0;
-    let read = tokio::time::timeout(timeout, async {
-        while filled < header.len() {
-            match reader.read(&mut header[filled..]).await {
-                Ok(0) => break,
-                Ok(read) => filled += read,
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
-    })
-    .await;
-
-    // Decrypt whatever arrived, so a transport error sent through the same
-    // stream is readable as one.
-    dec.apply_keystream(&mut header[..filled]);
-
-    match read {
-        Err(_) => ProbeStatus::Fail(format!("no reply within {}s", timeout.as_secs())),
-        Ok(Err(e)) => ProbeStatus::Fail(format!("read from listener: {}", e)),
-        Ok(Ok(())) if filled == 0 => ProbeStatus::Fail(
-            "the listener closed without answering — no tier reached the DC".to_string(),
-        ),
-        // A transport error arrives as an ordinary packet: a 4-byte length of 4
-        // followed by the negative code, so 8 bytes on the wire.  A bare
-        // 4-byte prefix is not an error — it is a truncated packet.
-        Ok(Ok(())) if filled >= 8 && header[..4] == 4u32.to_le_bytes() => {
-            let mut code = [0u8; 4];
-            code.copy_from_slice(&header[4..8]);
-            ProbeStatus::Fail(format!(
-                "the proxy reported a transport error: {}",
-                i32::from_le_bytes(code)
-            ))
-        }
-        Ok(Ok(())) if filled < header.len() => ProbeStatus::Fail(format!(
-            "the listener closed after {filled} of {} header bytes — no tier reached the DC",
-            header.len()
-        )),
-        Ok(Ok(())) if reply_is_res_pq(&header) => ProbeStatus::Ok(start.elapsed()),
-        Ok(Ok(())) => ProbeStatus::Fail("the reply is not resPQ".to_string()),
+    match require_res_pq(
+        &mut reader,
+        &mut writer,
+        &mut enc,
+        &mut dec,
+        timeout,
+        "the listener",
+    )
+    .await
+    {
+        Ok(()) => ProbeStatus::Ok(start.elapsed()),
+        Err(e) => ProbeStatus::Fail(e),
     }
 }
 
