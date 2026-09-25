@@ -833,10 +833,15 @@ entware_configured_port() {
 	printf '%s' "$port"
 }
 
-# A secret is 16 bytes of urandom as 32 hex characters. od rather than hexdump:
-# BusyBox hexdump has no -e format language.
+# A secret is 16 bytes of urandom as 32 hex characters. `tr` rather than `od`:
+# BusyBox od has no -A, so `od -An -tx1` dies with "od: invalid option -- 'A'"
+# on the routers this path exists for, and the firmware's od has no -t either
+# (both checked on a Keenetic, kernel 4.9, BusyBox 1.37). Each character tr
+# keeps is uniform over the sixteen it accepts, so the result still carries the
+# same 128 bits. The OpenWrt path keeps hexdump, whose -e was checked to work
+# on the same BusyBox.
 entware_new_secret() {
-	secret="$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+	secret="$(tr -dc 'a-f0-9' < /dev/urandom | head -c 32)"
 	case "$secret" in
 		????????????????????????????????) printf '%s' "$secret" ;;
 		*) return 1 ;;
