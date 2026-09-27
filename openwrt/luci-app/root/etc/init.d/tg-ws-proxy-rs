@@ -99,7 +99,7 @@ rust_log_filter() {
 }
 
 start_service() {
-	local enabled secret log_level log_filter
+	local enabled secret log_level log_filter socks_enabled
 
 	config_load "$CONFIG"
 	config_get_bool enabled "$SECTION" enabled 0
@@ -122,6 +122,15 @@ start_service() {
 	procd_append_param env "RUST_LOG=$log_filter"
 	append_env host TG_HOST 0.0.0.0
 	append_env port TG_PORT 1443
+	config_get_bool socks_enabled "$SECTION" socks_enabled 0
+	if [ "$socks_enabled" -eq 1 ]; then
+		procd_append_param env TG_SOCKS_ENABLED=true
+		append_env socks_host TG_SOCKS_HOST 127.0.0.1
+		append_env socks_port TG_SOCKS_PORT 1080
+		append_list_env socks_dc TG_SOCKS_DC
+	else
+		procd_append_param env TG_SOCKS_ENABLED=false
+	fi
 	append_env link_ip TG_LINK_IP
 	append_env listen_faketls_domain TG_LISTEN_FAKETLS_DOMAIN
 	append_env buf_kb TG_BUF_KB 256

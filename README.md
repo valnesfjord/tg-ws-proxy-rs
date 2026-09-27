@@ -95,6 +95,18 @@ binary, without the LuCI package. See
 
 Or use the `tg://proxy?...` link that is printed on startup.
 
+## Optional SOCKS5 input / Forkop
+
+Enable `--socks-enabled` (or **Enable SOCKS5 input** in LuCI) to expose a separate
+Telegram-only SOCKS5 listener on `127.0.0.1:1080`. A local routing service can send
+supported Telegram TCP transports through it while existing MTProto clients keep
+using the original listener. WSS, Cloudflare and fallback settings are shared.
+
+See **[SOCKS5 and Forkop setup](docs/Forkop.md)** / **[Настройка Forkop на русском](docs/Forkop.ru.md)**
+for installation, device-scoped routing, loop prevention, DC mappings, testing and
+rollback. This is not a general-purpose SOCKS proxy or a virtual VPN interface;
+UDP calls and arbitrary HTTPS traffic are not supported.
+
 ## OpenWrt installation
 
 ### Requirements
@@ -247,6 +259,9 @@ tg-ws-proxy [OPTIONS]
 | `--link-ip <IP>` | auto-detected | IP shown in the `tg://` link (see [Router deployment](docs/Deployment.md#router-deployment)) |
 | `--secret <HEX>` | random | 32 hex-char MTProto secret (repeatable / comma-separated for per-user secrets) |
 | `--listen-faketls-domain <DOMAIN>` | — | Accept inbound clients with `ee` FakeTLS and advertise this SNI domain in the link |
+| `--socks-enabled` | off | Also listen for Telegram over SOCKS5, no authentication (see [docs/Forkop.md](docs/Forkop.md)) |
+| `--socks-host <IP>` / `--socks-port <PORT>` | `127.0.0.1` / `1080` | SOCKS5 listen address |
+| `--socks-dc <DC:IP>` | built-in map | Extra SOCKS destination mappings, signed (`-2` = DC2 media), comma-separated/repeatable |
 | `--dc-ip <DC:IP>` | DC2 + DC4 | Target IP per DC (repeatable); omit when using `--cf-domain` to let CF proxy handle all DCs |
 | `--buf-kb <KB>` | `256` | Socket buffer size (accepted but currently unused) |
 | `--pool-size <N>` | `4` | Pre-warmed WS connections per DC |
@@ -266,6 +281,7 @@ tg-ws-proxy [OPTIONS]
 | `--no-proxy <LIST>` | — | Comma-separated host bypass list for `--outbound-proxy` |
 | `--check` | off | Test every configured CF domain and MTProto proxy, print OK/FAIL with latency, then exit `0` if all pass and `1` otherwise |
 | `--check-listener` | off | Implies `--check`: binds and serves, probes its own listener end-to-end (obfuscation handshake, a real `req_pq_multi`, the DC's `resPQ` back), then exits with the check's code |
+| `--print-links` | off | Print every enabled listener's connection links (`inbound<TAB>label<TAB>url` per line) and exit without binding; LuCI uses it for its copy buttons |
 | `--log-file <PATH>` | — | Write logs to a file instead of stderr (no ANSI color codes) |
 | `-q / --quiet` | off | Suppress all log output |
 | `-v / --verbose` | off | Debug logging |

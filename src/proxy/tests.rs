@@ -2,25 +2,7 @@ use super::*;
 
 use clap::Parser;
 
-use crate::crypto::HANDSHAKE_LEN;
-
-#[test]
-fn faketls_pending_uses_an_offset_and_releases_its_record() {
-    let mut pending = PendingData::from_record(vec![10, 11, 12, 13, 14], 2);
-    let original_ptr = pending.data.as_ptr();
-    let mut first = [0u8; 2];
-
-    assert_eq!(pending.read(&mut first), Some(2));
-    assert_eq!(first, [12, 13]);
-    assert_eq!(pending.data.as_ptr(), original_ptr);
-
-    let mut last = [0u8; 2];
-    assert_eq!(pending.read(&mut last), Some(1));
-    assert_eq!(last[0], 14);
-    assert!(pending.data.is_empty());
-    assert_eq!(pending.data.capacity(), 0);
-    assert_eq!(pending.read(&mut last), None);
-}
+use crate::crypto::{HANDSHAKE_LEN, build_connection_ciphers};
 
 #[tokio::test]
 async fn client_handler_future_stays_compact() {
@@ -257,7 +239,13 @@ async fn upstream_frame_sizes(framing: WsFraming, payload: &[u8]) -> Vec<usize> 
     let (reader, writer) = server.into_split();
 
     let relay_init = generate_relay_init(ProtoTag::PaddedIntermediate, 2);
-    let ciphers = build_connection_ciphers(&[0u8; 48], &[0u8; 32], &relay_init);
+    let c = build_connection_ciphers(&[0u8; 48], &[0u8; 32], &relay_init);
+    let ciphers = BridgeCiphers {
+        clt_dec: ClientCipher(Some(c.clt_dec)),
+        clt_enc: ClientCipher(Some(c.clt_enc)),
+        tg_enc: c.tg_enc,
+        tg_dec: c.tg_dec,
+    };
 
     let bridge = tokio::spawn(async move {
         bridge_ws(

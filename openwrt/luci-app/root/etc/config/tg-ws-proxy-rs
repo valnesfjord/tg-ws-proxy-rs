@@ -41,3 +41,7 @@ config tg-ws-proxy-rs 'main'
 	option fronting_fail_cooldown '60'
 
 	option log_level 'info'
+
+	option socks_enabled '0'
+	option socks_host '127.0.0.1'
+	option socks_port '1080'
