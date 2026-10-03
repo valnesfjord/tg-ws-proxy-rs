@@ -401,6 +401,7 @@ entware_service_control() { printf '%s\n' "$1" >> "$tmp/rollback-control.log"; }
 
 : > "$tmp/rollback-control.log"
 ENTWARE_WAS_RUNNING=1
+# shellcheck disable=SC2218 # rollback_entware comes from the sourced installer; the stub further down is for the last case.
 rollback_entware >/dev/null 2>&1
 [[ "$(cat "$ENTWARE_BIN")" == 'old binary' ]] || {
 	printf 'FAIL: the rollback did not restore the binary\n' >&2
@@ -426,10 +427,97 @@ grep -Fxq start "$tmp/rollback-control.log" || {
 # A install that failed from nothing restores nothing running.
 : > "$tmp/rollback-control.log"
 ENTWARE_WAS_RUNNING=0
+# shellcheck disable=SC2218 # as above: the sourced installer defines it.
 rollback_entware >/dev/null 2>&1
 if grep -Fxq start "$tmp/rollback-control.log"; then
 	printf 'FAIL: the rollback started a service that was not running before\n' >&2
 	exit 1
 fi
+
+# A start that fails has to say why. The install no longer pre-checks the port
+# -- the listener can be this build's own previous instance, or one whose bind
+# would not have collided at all -- so the reason comes from the binary's own
+# startup line: stderr goes to the log file, and the failure path prints its
+# tail. The init script is generated and run for real here.
+nr="$tmp/not-ready"
+mkdir -p "$nr/bin" "$nr/etc/init.d" "$nr/etc/tg-ws-proxy-rs" "$nr/var/log"
+ENTWARE_ROOT="$nr"
+ENTWARE_BIN="$nr/bin/tg-ws-proxy-rs"
+ENTWARE_INIT="$nr/etc/init.d/S99tg-ws-proxy-rs"
+ENTWARE_CONF_DIR="$nr/etc/tg-ws-proxy-rs"
+ENTWARE_LOGFILE="$nr/var/log/tg-ws-proxy-rs.log"
+printf 'HOST="0.0.0.0"\nPORT="2443"\n' > "$ENTWARE_CONF_DIR/config.conf"
+printf 'SECRET=deadbeefdeadbeefdeadbeefdeadbeef\n' > "$ENTWARE_CONF_DIR/secret.conf"
+write_entware_init
+# A binary that fails the way the proxy does on a lost bind: one line on stderr,
+# non-zero exit, nothing listening.
+printf '#!/bin/sh\nprintf "%%s\\n" "cannot bind 0.0.0.0:2443: Address in use" >&2\nexit 1\n' > "$ENTWARE_BIN"
+chmod +x "$ENTWARE_BIN"
+# netstat and pidof are stubbed so the case does not depend on what the runner
+# happens to be listening on, or on a process that shares the proxy's name. The
+# pidof stub answers the start() sequence exactly: nothing running at the
+# already-running check, a live process on the first poll (so the loop sleeps and
+# the stub binary gets its moment to write to stderr), and nothing after that.
+# That is what makes this deterministic instead of a race.
+mkdir -p "$tmp/fakebin-notready"
+printf '#!/bin/sh\nexit 1\n' > "$tmp/fakebin-notready/netstat"
+# shellcheck disable=SC2016 # The stub is single-quoted on purpose: its $ expand on the router, not here.
+printf '#!/bin/sh\nn=$(cat "%s/pidof-calls" 2>/dev/null || printf 0)\nn=$((n + 1))\nprintf "%%s\\n" "$n" > "%s/pidof-calls"\n[ "$n" = 2 ] && { printf "4242\\n"; exit 0; }\nexit 1\n' \
+    "$tmp" "$tmp" > "$tmp/fakebin-notready/pidof"
+chmod +x "$tmp/fakebin-notready/netstat" "$tmp/fakebin-notready/pidof"
+PATH="$tmp/fakebin-notready:$PATH"
+: > "$ENTWARE_LOGFILE"
+if out="$("$ENTWARE_INIT" start 2>&1)"; then
+    printf 'FAIL: the init script reported a failing binary as started\n' >&2
+    exit 1
+fi
+grep -Fq 'cannot bind 0.0.0.0:2443: Address in use' "$ENTWARE_LOGFILE" || {
+    printf 'FAIL: the binary stderr never reached the log file\n' >&2
+    exit 1
+}
+[[ "$out" == *'cannot bind 0.0.0.0:2443: Address in use'* ]] || {
+    printf 'FAIL: the failed start did not print the log tail: %s\n' "$out" >&2
+    exit 1
+}
+
+# The readiness wait must stop polling once the process is gone -- that polling
+# is the silent quarter of a minute being removed -- and must still accept a
+# listener that comes up.
+started=$SECONDS
+if entware_wait_ready 2443; then
+    printf 'FAIL: the readiness wait accepted a port with no listener\n' >&2
+    exit 1
+fi
+(( SECONDS - started < 5 )) || {
+    printf 'FAIL: the readiness wait polled for %ss with no process to wait for\n' "$((SECONDS - started))" >&2
+    exit 1
+}
+printf '#!/bin/sh\nprintf "%%s\\n" "tcp 0 0 0.0.0.0:2443 0.0.0.0:* LISTEN 4242/tg-ws-proxy"\n' > "$tmp/fakebin-notready/netstat"
+printf '#!/bin/sh\nprintf "4242\\n"\n' > "$tmp/fakebin-notready/pidof"
+chmod +x "$tmp/fakebin-notready/netstat" "$tmp/fakebin-notready/pidof"
+entware_wait_ready 2443 || {
+    printf 'FAIL: a listener that is up was not accepted\n' >&2
+    exit 1
+}
+
+# And the same reason has to survive the installer: it prints the tail before
+# the rollback, because the rollback restarts the previous service, whose start()
+# rotates the log the reason is in. These stubs come last: they replace the
+# sourced functions for the rest of this file.
+printf 'cannot bind 0.0.0.0:2443: Address in use\n' > "$ENTWARE_LOGFILE"
+entware_wait_ready() { return 1; }
+rollback_entware() { mv -f "$ENTWARE_LOGFILE" "$ENTWARE_LOGFILE.1"; }
+if out="$(entware_fail_not_ready 2>&1)"; then
+    printf 'FAIL: a service that never became ready was reported as started\n' >&2
+    exit 1
+fi
+[[ "$out" == *'cannot bind 0.0.0.0:2443: Address in use'* ]] || {
+    printf 'FAIL: the not-ready message lost the log tail to the rollback: %s\n' "$out" >&2
+    exit 1
+}
+[[ -f "$ENTWARE_LOGFILE.1" ]] || {
+    printf 'FAIL: the rollback stub did not rotate the log, so the ordering is untested\n' >&2
+    exit 1
+}
 
 printf 'PASS: installer contract\n'
