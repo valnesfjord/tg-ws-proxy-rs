@@ -125,6 +125,10 @@ Every flag except `--dc-ip` also has a `TG_*` environment variable. Booleans acc
 | `TG_LINK_IP` | `--link-ip` | auto | IP shown in the `tg://` link. **Set this** (see above) |
 | `TG_SECRET` | `--secret` | random | 32 hex-char secret; comma-separated for per-user secrets. **Set this** |
 | `TG_LISTEN_FAKETLS_DOMAIN` | `--listen-faketls-domain` | — | Accept inbound clients with `ee` FakeTLS and advertise this SNI domain |
+| `TG_SOCKS_ENABLED` | `--socks-enabled` | `false` | Also accept Telegram over SOCKS5, no authentication ([guide](https://github.com/valnesfjord/tg-ws-proxy-rs/blob/main/docs/Forkop.md)) |
+| `TG_SOCKS_HOST` | `--socks-host` | `127.0.0.1` | SOCKS5 listen address. In a container set `0.0.0.0`, and publish the port only to trusted hosts |
+| `TG_SOCKS_PORT` | `--socks-port` | `1080` | SOCKS5 listen port |
+| `TG_SOCKS_DC` | `--socks-dc` | built-in map | Extra SOCKS destination → DC mappings, signed `DC:IP` (`-2` = DC2 media) |
 | — | `--dc-ip <DC:IP>` | DC2 + DC4 | Target IP per DC (repeatable). No env var — pass it as an argument |
 | `TG_POOL_SIZE` | `--pool-size` | `4` | Pre-warmed WS connections per DC |
 | `TG_MAX_CONNECTIONS` | `--max-connections` | auto | Max concurrent client connections |
@@ -141,6 +145,7 @@ Every flag except `--dc-ip` also has a `TG_*` environment variable. Booleans acc
 | `TG_NO_OUTBOUND_PROXY` | `--no-outbound-proxy` | `false` | Ignore the standard proxy environment variables |
 | `TG_NO_PROXY` | `--no-proxy` | — | Comma-separated bypass list for `--outbound-proxy` |
 | `TG_CHECK` | `--check` | `false` | Probe every configured CF domain / MTProto proxy, print OK/FAIL, exit |
+| `TG_PRINT_LINKS` | `--print-links` | `false` | Print every enabled listener's connection links and exit without binding |
 | `TG_LOG_FILE` | `--log-file` | — | Write logs to a file instead of stderr (needs a mounted, writable volume) |
 | `TG_VERBOSE` | `-v` / `--verbose` | `false` | Debug logging |
 | `TG_QUIET` | `-q` / `--quiet` | `false` | Suppress all log output |

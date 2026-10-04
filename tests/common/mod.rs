@@ -358,6 +358,17 @@ pub async fn run_proxy_once_for_dc(config: Config, dc: i16) {
 /// Tests that need to speak something other than a plain MTProto handshake
 /// (e.g. the inbound FakeTLS camouflage) drive the client side themselves.
 pub async fn start_proxy_connection(config: Config) -> (TcpStream, JoinHandle<()>) {
+    let (client, handler) = proxy_connection(config, handle_client_with_runtime).await;
+    (client, tokio::spawn(handler))
+}
+
+/// The same wiring for any listener's entry point, e.g.
+/// `inbound::socks::handle_client`, returning the handler unspawned so a test
+/// can also measure it.
+pub async fn proxy_connection<F, H>(config: Config, entry: F) -> (TcpStream, H)
+where
+    F: FnOnce(TcpStream, SocketAddr, Arc<Config>, Arc<WsPool>, Arc<Runtime>) -> H,
+{
     let outbound = config.outbound_connector().unwrap();
     let runtime = Arc::new(
         Runtime::new(outbound)
@@ -378,14 +389,7 @@ pub async fn start_proxy_connection(config: Config) -> (TcpStream, JoinHandle<()
     let (client, accepted) = tokio::join!(client, accept);
     let (server, peer) = accepted.unwrap();
 
-    let handler = tokio::spawn(handle_client_with_runtime(
-        server,
-        peer,
-        Arc::new(config),
-        pool,
-        runtime,
-    ));
-
+    let handler = entry(server, peer, Arc::new(config), pool, runtime);
     (client.unwrap(), handler)
 }
 
