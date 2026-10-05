@@ -1084,6 +1084,11 @@ start() {
 		return 0
 	fi
 
+	# No port pre-check here: a listener found now may belong to this build's own
+	# previous instance (started by hand, or with the init script disabled by
+	# chmod -x), and a listener on another address or the other IP family would
+	# not stop the bind below. The bind decides, and stderr -- which the caller
+	# now finds in the log file -- names the reason.
 	rotate_log
 	export_environment
 
@@ -1095,8 +1100,17 @@ start() {
 		IFS="$old_ifs"
 	fi
 
+	# stderr goes to the log file rather than /dev/null: with TG_LOG_FILE set the
+	# binary writes its tracing there and keeps stderr for the startup errors
+	# that happen before any logging exists -- an invalid listen address, an
+	# unreadable config, a bind that failed anyway. Those are exactly the lines
+	# the caller prints from the tail of this file when the start fails.
+	stderr_file=/dev/null
+	if [ -d "${LOGFILE%/*}" ]; then
+		stderr_file="$LOGFILE"
+	fi
 	# shellcheck disable=SC2086 # EXTRA_ARGS is a list of arguments, not one.
-	"$PROG" "$@" $EXTRA_ARGS >/dev/null 2>&1 &
+	"$PROG" "$@" $EXTRA_ARGS >/dev/null 2>>"$stderr_file" &
 
 	tries=0
 	while [ "$tries" -lt 15 ]; do
@@ -1217,13 +1231,39 @@ entware_wait_ready() {
 	port="$1"
 	tries=0
 	while [ "$tries" -lt 15 ]; do
-		if [ -n "$(pidof tg-ws-proxy-rs 2>/dev/null)" ] && listener_ready "$port"; then
+		# Nothing is running: no listener is coming, and the remaining polls
+		# would only delay the message. The caller has already let the init
+		# script's own start() finish, so a process that is gone here is gone
+		# for good -- this is the busy port, an unusable address, an unreadable
+		# config, and every other startup failure, without the 15 seconds of
+		# silence that used to end in "service did not become ready" and nothing
+		# else.
+		[ -n "$(pidof tg-ws-proxy-rs 2>/dev/null)" ] || return 1
+		if listener_ready "$port"; then
 			return 0
 		fi
 		tries=$((tries + 1))
 		sleep 1
 	done
 	return 1
+}
+
+# The readiness wait failed: name the reason. The last lines of the log are the
+# binary's own startup error -- stderr is redirected there by the init script --
+# so a lost bind, an address it cannot use or a config it cannot read all say so
+# here.
+#
+# The tail is read before the rollback on purpose: when the previous build was
+# running, rollback_entware starts it again, and that start() rotates this log
+# to .log.1 -- the message would then point at a file the reason has left.
+entware_fail_not_ready() {
+	ready_tail="$(tail -n 5 "$ENTWARE_LOGFILE" 2>/dev/null | sed 's/^/  /')"
+	rollback_entware
+	if [ -n "$ready_tail" ]; then
+		die "service did not become ready (see $ENTWARE_LOGFILE):
+$ready_tail"
+	fi
+	die "service did not become ready (see $ENTWARE_LOGFILE)"
 }
 
 entware_print_link() {
@@ -1285,7 +1325,7 @@ install_entware() {
 	mv -f "$binary_tmp" "$ENTWARE_BIN" || { rm -f "$binary_tmp"; rollback_entware; die "cannot install binary"; }
 
 	entware_service_control restart >/dev/null 2>&1 || true
-	entware_wait_ready "$ENTWARE_PORT" || { rollback_entware; die "service did not become ready (see $ENTWARE_LOGFILE)"; }
+	entware_wait_ready "$ENTWARE_PORT" || entware_fail_not_ready
 
 	new_pid="$(pidof tg-ws-proxy-rs 2>/dev/null || true)"
 	[ -n "$new_pid" ] || { rollback_entware; die "new process is missing"; }
