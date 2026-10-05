@@ -25,48 +25,6 @@ fn media_tag_marks_only_media_dcs() {
 }
 
 #[test]
-fn base_cf_record_strips_only_the_dash_one_label() {
-    assert_eq!(
-        base_cf_record("kws2-1.example.net").as_deref(),
-        Some("kws2.example.net")
-    );
-    // Only the first `-1.` is replaced, so a customer domain that itself
-    // contains `-1.` keeps its own labels intact.
-    assert_eq!(
-        base_cf_record("kws2-1.node-1.example.net").as_deref(),
-        Some("kws2.node-1.example.net")
-    );
-    assert_eq!(base_cf_record("kws2.example.net"), None);
-    assert_eq!(base_cf_record("kws2-1"), None);
-}
-
-#[test]
-fn dns_not_found_is_recognised_on_every_platform() {
-    // The `-1` record fallback keys off this, and each libc words the failure
-    // differently — a missed variant turns an optional record into a hard
-    // failure of the whole CF tier.
-    for reason in [
-        "TCP connect: failed to lookup address information: Name or service not known",
-        "TCP connect: nodename nor servname provided, or not known",
-        "TCP connect: No such host is known. (os error 11001)",
-    ] {
-        assert!(is_dns_not_found(reason), "not recognised: {reason}");
-    }
-
-    // Anything that is not a resolver failure on the connect step must not
-    // trigger the silent retry.
-    for reason in [
-        "TCP connect: Connection refused (os error 111)",
-        "TCP connect timed out",
-        "HTTP proxy http://127.0.0.1:1: 407 from server",
-        // Same text, but from a later phase than the TCP connect.
-        "TLS handshake: failed to lookup address information",
-    ] {
-        assert!(!is_dns_not_found(reason), "wrongly recognised: {reason}");
-    }
-}
-
-#[test]
 fn ordered_records_put_the_preferred_variant_first() {
     let base = || "kws2.example".to_string();
     let dash_one = || "kws2-1.example".to_string();
@@ -337,103 +295,51 @@ async fn a_second_connection_to_the_same_host_resumes_its_tls_session() {
 
 // ─── Cloudflare attempt ordering ─────────────────────────────────────────────
 
-fn drain(attempts: &mut CfAttempts, missing_dash_one: bool) -> Vec<String> {
-    let mut order = Vec::new();
-    while let Some(domain) = attempts.next_domain() {
-        order.push(domain.clone());
-        // Simulate the `-1` record being absent from DNS.
-        if missing_dash_one && domain.contains("-1.") {
-            attempts.retry_base_of(&domain);
-        }
-    }
-
-    order
+fn drain(attempts: &mut CfAttempts) -> Vec<String> {
+    std::iter::from_fn(|| attempts.next_domain()).collect()
 }
 
 #[test]
-fn a_missing_dash_one_record_buys_the_base_record_a_second_attempt() {
+fn every_base_record_gets_a_second_attempt() {
     // Regression test: deduplicating this retry away measurably pushed
-    // connections into the TCP fallback (see CfAttempts' docs). For a
-    // non-media DC the base record must be attempted twice.
-    let domains = ["example.net".to_string()];
-    let mut attempts = CfAttempts::new(2, &domains, false);
+    // connections into the TCP fallback (see CfAttempts' docs).
+    let domains = ["a.example".to_string(), "b.example".to_string()];
+    let mut attempts = CfAttempts::new(2, &domains);
 
     assert_eq!(
-        drain(&mut attempts, true),
+        drain(&mut attempts),
         [
-            "kws2.example.net",
-            "kws2-1.example.net",
-            // ...the retry queued by the missing `-1` record.
-            "kws2.example.net",
+            "kws2.a.example",
+            "kws2.a.example",
+            "kws2.b.example",
+            "kws2.b.example",
         ]
     );
 }
 
 #[test]
-fn a_media_dc_gets_the_same_two_attempts_as_everything_else() {
-    // Media DCs try the `-1` variant first, so its fallback is the base
-    // record's *first* attempt rather than its second. Without forcing, the
-    // base record's own turn would then be skipped as already-tried and media
-    // would get half the attempts — which is what made video the thing that
-    // kept failing to load first time.
-    let domains = ["example.net".to_string()];
-    let mut attempts = CfAttempts::new(2, &domains, true);
+fn no_dash_one_record_is_ever_attempted() {
+    // Through Cloudflare a `-1` record reaches the same origin as the base
+    // one, and the shared default domains do not define it, so every lookup
+    // was a wasted NXDOMAIN (issue #139).
+    let domains = ["a.example".to_string(), "b.example".to_string()];
+    let mut attempts = CfAttempts::new(203, &domains);
 
-    assert_eq!(
-        drain(&mut attempts, true),
-        ["kws2-1.example.net", "kws2.example.net", "kws2.example.net",]
-    );
-}
-
-#[test]
-fn both_orderings_attempt_the_base_record_the_same_number_of_times() {
-    let domains = ["example.net".to_string()];
-    let count = |is_media| {
-        let mut attempts = CfAttempts::new(2, &domains, is_media);
-        drain(&mut attempts, true)
-            .into_iter()
-            .filter(|d| d == "kws2.example.net")
-            .count()
-    };
-
-    assert_eq!(count(false), 2);
-    assert_eq!(count(true), count(false));
+    assert!(drain(&mut attempts).iter().all(|d| !d.contains("-1.")));
 }
 
 #[test]
 fn a_record_that_timed_out_is_not_retried() {
     // Retrying a record that ran out the clock just buys another full connect
     // timeout before the fallback chain can move on.
-    let domains = ["example.net".to_string()];
-    let mut attempts = CfAttempts::new(2, &domains, false);
-
-    assert_eq!(attempts.next_domain().as_deref(), Some("kws2.example.net"));
-    attempts.note_timed_out("kws2.example.net");
-    assert_eq!(
-        attempts.next_domain().as_deref(),
-        Some("kws2-1.example.net")
-    );
-
-    assert_eq!(attempts.retry_base_of("kws2-1.example.net"), None);
-    assert_eq!(attempts.next_domain(), None);
-}
-
-#[test]
-fn records_present_in_dns_are_each_attempted_once() {
-    // With both records resolving, nothing is retried and nothing repeats,
-    // across several domains.
     let domains = ["a.example".to_string(), "b.example".to_string()];
-    let mut attempts = CfAttempts::new(2, &domains, false);
+    let mut attempts = CfAttempts::new(2, &domains);
 
-    assert_eq!(
-        drain(&mut attempts, false),
-        [
-            "kws2.a.example",
-            "kws2-1.a.example",
-            "kws2.b.example",
-            "kws2-1.b.example",
-        ]
-    );
+    assert_eq!(attempts.next_domain().as_deref(), Some("kws2.a.example"));
+    attempts.note_timed_out();
+    assert_eq!(attempts.next_domain().as_deref(), Some("kws2.b.example"));
+    assert_eq!(attempts.next_domain().as_deref(), Some("kws2.b.example"));
+    assert_eq!(attempts.next_domain(), None);
 }
 
 #[test]
@@ -443,17 +349,17 @@ fn lazy_attempts_rotate_domains_without_rebuilding_the_list() {
         "b.example".to_string(),
         "c.example".to_string(),
     ];
-    let mut attempts = CfAttempts::with_offset(2, &domains, false, 1);
+    let mut attempts = CfAttempts::with_offset(2, &domains, 1);
 
     assert_eq!(
-        drain(&mut attempts, false),
+        drain(&mut attempts),
         [
             "kws2.b.example",
-            "kws2-1.b.example",
+            "kws2.b.example",
             "kws2.c.example",
-            "kws2-1.c.example",
+            "kws2.c.example",
             "kws2.a.example",
-            "kws2-1.a.example",
+            "kws2.a.example",
         ]
     );
 }
@@ -461,23 +367,14 @@ fn lazy_attempts_rotate_domains_without_rebuilding_the_list() {
 #[test]
 fn lazy_attempts_preserve_duplicate_domain_deduplication() {
     let domains = ["a.example".to_string(), "a.example".to_string()];
-    let mut attempts = CfAttempts::new(2, &domains, false);
+    let mut attempts = CfAttempts::new(2, &domains);
 
-    assert_eq!(
-        drain(&mut attempts, false),
-        ["kws2.a.example", "kws2-1.a.example"]
-    );
+    assert_eq!(drain(&mut attempts), ["kws2.a.example", "kws2.a.example"]);
 }
 
 #[test]
-fn a_forced_retry_is_not_itself_retried_forever() {
-    // The queued base record has no `-1.` label, so it cannot queue another
-    // retry — the loop is guaranteed to terminate.
-    let domains = ["example.net".to_string()];
-    let mut attempts = CfAttempts::new(2, &domains, false);
-    let order = drain(&mut attempts, true);
+fn no_domains_means_no_attempts() {
+    let mut attempts = CfAttempts::new(2, &[]);
 
-    assert_eq!(order.len(), 3);
-    assert!(attempts.next_domain().is_none());
-    assert_eq!(attempts.retry_base_of("kws2.example.net"), None);
+    assert_eq!(attempts.next_domain(), None);
 }

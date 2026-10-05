@@ -594,24 +594,6 @@ pub fn cf_worker_path(dst: &str, dc: u32, is_media: bool) -> String {
     )
 }
 
-/// Return `true` when `reason` describes a DNS lookup failure.
-///
-/// Used in the CF-proxy path to detect when a `kws{N}-1.domain` record is
-/// absent so that the connection can be transparently retried using the base
-/// `kws{N}.domain` record (which the user is only required to configure once).
-fn is_dns_not_found(reason: &str) -> bool {
-    // The error originates from the "TCP connect" phase and contains one of
-    // several platform-specific messages for "host not found":
-    //   Linux glibc:  "failed to lookup address information: ..."
-    //   macOS/BSD:    "nodename nor servname provided, or not known"
-    //   Windows:      "No such host is known"
-    reason.starts_with("TCP connect:")
-        && (reason.contains("failed to lookup address information")
-            || reason.contains("nodename nor servname provided")
-            || reason.contains("No such host is known")
-            || reason.contains("Name or service not known"))
-}
-
 /// Try all domains for a DC in order; return the first success or the last error.
 ///
 /// Returns `(Some(stream), all_redirects)`:
@@ -727,161 +709,94 @@ pub async fn connect_ws_for_dc_with_outbound(
 /// DC 203 (`kws203.{cf_domain}`).  Remapping 203 → 2 would incorrectly route
 /// traffic to DC 2 instead of DC 203 (they have different IPs/servers).
 ///
-/// When multiple CF domains are given, each domain's subdomains are generated
-/// in order — the first domain has highest priority.
-pub fn cf_ws_domains(dc: u32, cf_domains: &[String], is_media: bool) -> Vec<String> {
+/// Only the base `kws{N}` record is used, never a `kws{N}-1` one.  Through
+/// Cloudflare the hostname only selects the origin IP, and both records point
+/// at the same DC, so a `-1` record buys nothing — while the shared
+/// `--default-domains` zones do not define it at all, which made every lookup
+/// a guaranteed NXDOMAIN.  `is_media` is accepted for API compatibility only.
+///
+/// When multiple CF domains are given, they are returned in order — the first
+/// domain has highest priority.
+pub fn cf_ws_domains(dc: u32, cf_domains: &[String], _is_media: bool) -> Vec<String> {
     cf_domains
         .iter()
-        .flat_map(|cf_domain| {
-            ordered_records(
-                format!("kws{}.{}", dc, cf_domain),
-                format!("kws{}-1.{}", dc, cf_domain),
-                is_media,
-            )
-        })
+        .map(|cf_domain| format!("kws{}.{}", dc, cf_domain))
         .collect()
-}
-
-/// The base `kws{N}` record matching a `kws{N}-1` record, if `domain` is one.
-///
-/// `kws{N}-1` records are optional in a user-managed Cloudflare zone, so a
-/// missing DNS entry transparently falls back to the base record.
-fn base_cf_record(domain: &str) -> Option<String> {
-    domain
-        .contains("-1.")
-        .then(|| domain.replacen("-1.", ".", 1))
 }
 
 /// Ordering policy for the Cloudflare connect loop.
 ///
-/// The configured records are attempted in order, skipping any already tried.
-/// A `kws{N}-1` record missing from DNS additionally queues its base record as
-/// a *forced* attempt, which neither skips nor consumes the record's normal
-/// turn — so the base record is attempted twice.
+/// Each configured domain's `kws{N}` record is attempted twice in a row, and
+/// duplicate domains are skipped.  The second attempt is skipped when the
+/// first ran out the clock — retrying it just buys another full connect
+/// timeout before the fallback chain can move on.
 ///
-/// That second attempt is load-bearing, not an accident. `kws{N}-1` records
-/// are optional and most zones omit them, so a missing one is the normal case
-/// and its fallback is what gives a transiently-failing base record another
-/// chance. Deduplicating it away measurably pushed connections into the (often
+/// That second attempt is load-bearing, not an accident.  It used to happen
+/// implicitly, as the fallback for a missing `kws{N}-1` record, and
+/// deduplicating it away measurably pushed connections into the (often
 /// blocked) TCP fallback: on one tester's network the fallback share nearly
 /// doubled, 5.9% -> 11.4%, each costing a full `--tcp-fallback-timeout`.
-///
-/// Forcing rather than merely queueing matters because the two orderings would
-/// otherwise get different numbers of attempts. Media DCs try `-1` first, so
-/// its fallback *is* the base record's first attempt; without the force, the
-/// base record's own turn would then be skipped as already-tried and media
-/// would get one attempt where everything else got two. The same tester's log
-/// showed exactly that asymmetry — 61 base attempts against 61 `-1` attempts
-/// on media, versus 99 against 11 elsewhere — while video was the thing that
-/// kept failing to load first time.
 struct CfAttempts<'a> {
     dc: u32,
     domains: &'a [String],
-    is_media: bool,
     first_domain: usize,
-    next_record: usize,
-    forced_base: Option<usize>,
-    last_record: Option<(usize, CfRecord)>,
-    /// Records whose attempt ran out the clock. Retrying one of these just
-    /// buys another full connect timeout, so the forced retry skips them.
-    timed_out: Vec<bool>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CfRecord {
-    Base,
-    DashOne,
+    next_ordinal: usize,
+    /// The domain just attempted for the first time, until its retry is due.
+    pending_retry: Option<usize>,
 }
 
 impl<'a> CfAttempts<'a> {
     #[cfg(test)]
-    fn new(dc: u32, domains: &'a [String], is_media: bool) -> Self {
-        Self::with_offset(dc, domains, is_media, 0)
+    fn new(dc: u32, domains: &'a [String]) -> Self {
+        Self::with_offset(dc, domains, 0)
     }
 
-    fn with_offset(dc: u32, domains: &'a [String], is_media: bool, first_domain: usize) -> Self {
+    fn with_offset(dc: u32, domains: &'a [String], first_domain: usize) -> Self {
         Self {
             dc,
             domains,
-            is_media,
             first_domain: if domains.is_empty() {
                 0
             } else {
                 first_domain % domains.len()
             },
-            next_record: 0,
-            forced_base: None,
-            last_record: None,
-            timed_out: vec![false; domains.len() * 2],
+            next_ordinal: 0,
+            pending_retry: None,
         }
     }
 
-    /// The next record to attempt, skipping ones already tried unless they
-    /// were queued as a forced retry.
+    /// The next record to attempt.
     fn next_domain(&mut self) -> Option<String> {
-        if let Some(domain_index) = self.forced_base.take() {
-            self.last_record = Some((domain_index, CfRecord::Base));
-            return Some(self.hostname(domain_index, CfRecord::Base));
+        if let Some(domain_index) = self.pending_retry.take() {
+            return Some(self.hostname(domain_index));
         }
 
-        while self.next_record < self.domains.len() * 2 {
-            let ordinal = self.next_record;
-            self.next_record += 1;
-            let logical_index = ordinal / 2;
-            let domain_index = (self.first_domain + logical_index) % self.domains.len();
-            if (0..logical_index).any(|prior| {
+        while self.next_ordinal < self.domains.len() {
+            let ordinal = self.next_ordinal;
+            self.next_ordinal += 1;
+            let domain_index = (self.first_domain + ordinal) % self.domains.len();
+            if (0..ordinal).any(|prior| {
                 self.domains[(self.first_domain + prior) % self.domains.len()]
                     == self.domains[domain_index]
             }) {
                 continue;
             }
 
-            let record = match (self.is_media, ordinal % 2) {
-                (false, 0) | (true, 1) => CfRecord::Base,
-                _ => CfRecord::DashOne,
-            };
-            self.last_record = Some((domain_index, record));
-            return Some(self.hostname(domain_index, record));
+            self.pending_retry = Some(domain_index);
+            return Some(self.hostname(domain_index));
         }
 
         None
     }
 
-    /// Record that `domain`'s attempt hit the connect timeout.
-    fn note_timed_out(&mut self, domain: &str) {
-        if let Some((domain_index, record)) = self.last_record {
-            debug_assert_eq!(domain, self.hostname(domain_index, record));
-            self.timed_out[Self::record_index(domain_index, record)] = true;
-        }
+    /// Record that the attempt just returned by `next_domain` hit the connect
+    /// timeout, so it is not retried.
+    fn note_timed_out(&mut self) {
+        self.pending_retry = None;
     }
 
-    /// Queue the base record for `domain` as a forced retry, if `domain` is a
-    /// `-1` record whose base is worth attempting again. Returns the queued
-    /// record.
-    fn retry_base_of(&mut self, domain: &str) -> Option<String> {
-        let (domain_index, record) = self.last_record?;
-        if record != CfRecord::DashOne {
-            return None;
-        }
-        let base = base_cf_record(domain)?;
-        debug_assert_eq!(base, self.hostname(domain_index, CfRecord::Base));
-        if self.timed_out[Self::record_index(domain_index, CfRecord::Base)] {
-            return None;
-        }
-        self.forced_base = Some(domain_index);
-
-        Some(base)
-    }
-
-    fn hostname(&self, domain_index: usize, record: CfRecord) -> String {
-        match record {
-            CfRecord::Base => format!("kws{}.{}", self.dc, self.domains[domain_index]),
-            CfRecord::DashOne => format!("kws{}-1.{}", self.dc, self.domains[domain_index]),
-        }
-    }
-
-    fn record_index(domain_index: usize, record: CfRecord) -> usize {
-        domain_index * 2 + usize::from(record == CfRecord::DashOne)
+    fn hostname(&self, domain_index: usize) -> String {
+        format!("kws{}.{}", self.dc, self.domains[domain_index])
     }
 }
 
@@ -890,10 +805,6 @@ impl<'a> CfAttempts<'a> {
 /// The hostname serves as both the TCP destination (DNS resolves to Cloudflare's
 /// anycast IP, not directly to Telegram) and the TLS SNI, so no separate DC IP
 /// is required.
-///
-/// `kws{N}-1` records are **optional** in a CF setup.  When one is absent the
-/// proxy transparently retries the same DC using `kws{N}` — the user only needs
-/// to configure the base record in Cloudflare.
 ///
 /// Returns `(Some(stream), record, all_redirects)`, where `record` is the
 /// expanded `kws{N}` hostname that answered — the caller can reconnect straight
@@ -1004,7 +915,7 @@ pub(crate) async fn connect_cf_ws_for_dc_with_outbound_ordered(
 ) -> (Option<TgWsStream>, Option<String>, bool) {
     let media = media_tag(is_media);
     let mut all_redirects = true;
-    let mut attempts = CfAttempts::with_offset(dc, cf_domains, is_media, first_domain);
+    let mut attempts = CfAttempts::with_offset(dc, cf_domains, first_domain);
 
     while let Some(domain) = attempts.next_domain() {
         debug!("CF WS trying DC{}{} → {}", dc, media, domain);
@@ -1030,26 +941,12 @@ pub(crate) async fn connect_cf_ws_for_dc_with_outbound_ordered(
                 );
             }
             WsConnectResult::Failed(reason) => {
-                // A `kws{N}-1` record that is simply absent from the user's CF
-                // zone is expected, not a failure: retry the base record next
-                // without a warning and without counting it against
-                // `all_redirects`.
-                if is_dns_not_found(&reason)
-                    && let Some(base) = attempts.retry_base_of(&domain)
-                {
-                    debug!(
-                        "CF WS DC{}{}: {} not in DNS, retrying with {}",
-                        dc, media, domain, base
-                    );
-                    continue;
-                }
-
                 warn!("CF WS DC{}{} failed on {}: {}", dc, media, domain, reason);
                 all_redirects = false;
             }
             WsConnectResult::TimedOut | WsConnectResult::ConnectTimedOut(_) => {
                 warn!("CF WS DC{}{} timed out on {}", dc, media, domain);
-                attempts.note_timed_out(&domain);
+                attempts.note_timed_out();
                 all_redirects = false;
             }
         }
@@ -1061,7 +958,7 @@ pub(crate) async fn connect_cf_ws_for_dc_with_outbound_ordered(
 /// Reconnect to a single already-expanded `kws{N}` Cloudflare record.
 ///
 /// Used by the pool to re-open the exact route that just served a client,
-/// skipping the per-DC record expansion and the `-1`/base fallback dance that
+/// skipping the per-DC domain walk and the retry that
 /// [`connect_cf_ws_for_dc_with_outbound`] performs on a cold connect.
 pub async fn connect_cf_record_with_outbound(
     record: &str,
@@ -1301,17 +1198,17 @@ static NO_VERIFY_CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
 
 /// How many TLS sessions to keep for resumption — `rustls`'s own default,
 /// stated explicitly because it is easy to assume it is oversized and shrink
-/// it. It is not: it is about right for the largest realistic config.
+/// it. It is not: it leaves headroom over the largest realistic config.
 ///
 /// The cache holds one entry per *hostname*, and this proxy dials a lot of
-/// them. Each CF domain contributes `kws{N}` and `kws{N}-1` for every DC in
-/// play (media and non-media share those names, they only reorder them), plus
-/// `kws{1..5}[-1].web.telegram.org` for the direct path and one name per
-/// Worker. With `--default-domains` that is roughly:
+/// them. Each CF domain contributes `kws{N}` for every DC in play (media and
+/// non-media share that name), plus `kws{1..5}[-1].web.telegram.org` for the
+/// direct path and one name per Worker. With `--default-domains` that is
+/// roughly:
 ///
 /// ```text
-///   21 domains x 3 DCs x 2 records + 10 + 1  ~= 140 names
-///   21 domains x 6 DCs x 2 records + 10 + 1  ~= 260 names
+///   21 domains x 3 DCs + 10 + 1  ~=  75 names
+///   21 domains x 6 DCs + 10 + 1  ~= 140 names
 /// ```
 ///
 /// and `--cf-balance` deliberately keeps every one of them hot. Undersizing

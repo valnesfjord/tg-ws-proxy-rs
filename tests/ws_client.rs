@@ -46,18 +46,14 @@ fn cf_ws_domains_keep_the_raw_dc_number_and_domain_priority() {
     // server.
     assert_eq!(
         cf_ws_domains(203, &["a.example".to_string()], false),
-        ["kws203.a.example", "kws203-1.a.example"]
+        ["kws203.a.example"]
     );
 
-    // Multiple domains are tried in the order given, both records each.
+    // Multiple domains are tried in the order given, base record only — a
+    // `-1` record would reach the same origin through Cloudflare.
     assert_eq!(
         cf_ws_domains(2, &["a.example".to_string(), "b.example".to_string()], true),
-        [
-            "kws2-1.a.example",
-            "kws2.a.example",
-            "kws2-1.b.example",
-            "kws2.b.example",
-        ]
+        ["kws2.a.example", "kws2.b.example"]
     );
 }
 
@@ -208,9 +204,9 @@ async fn disabled_cf_tls_sends_a_plaintext_websocket_upgrade() {
 }
 
 #[tokio::test]
-async fn cloudflare_ws_connector_tries_every_record_of_every_domain() {
-    // Two CF domains × the kwsN / kwsN-1 record pair = four attempts before
-    // the caller is told the whole CF tier failed.
+async fn cloudflare_ws_connector_tries_every_domain_twice() {
+    // Two CF domains × two attempts at their kwsN record = four attempts
+    // before the caller is told the whole CF tier failed.
     let (proxy_addr, proxy_task) = common::rejecting_http_proxy_requests().await;
     let outbound =
         OutboundConnector::from_config(Some(&format!("http://{proxy_addr}")), None, false).unwrap();
@@ -235,9 +231,9 @@ async fn cloudflare_ws_connector_tries_every_record_of_every_domain() {
         targets,
         [
             "kws2.a.example:443",
-            "kws2-1.a.example:443",
+            "kws2.a.example:443",
             "kws2.b.example:443",
-            "kws2-1.b.example:443",
+            "kws2.b.example:443",
         ]
     );
 }
