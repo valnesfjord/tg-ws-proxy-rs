@@ -479,8 +479,8 @@ impl WsPool {
     /// served this DC.
     ///
     /// The proxy tier is dialled with a single domain rather than the whole
-    /// `--cf-domain` list; that still covers its `kwsN` *and* `kwsN-1` records,
-    /// exactly as the inline path does.
+    /// `--cf-domain` list; its `kwsN` record still gets the same second
+    /// attempt as on the inline path.
     async fn cf_connect_one(&self, target: &CfTarget) -> Option<TgWsStream> {
         match target.tier {
             CfTier::Worker => {

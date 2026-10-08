@@ -145,10 +145,10 @@ async fn cf_proxy_is_retried_fresh_on_every_connection_no_cooldown() {
     // connection in that window straight to the (often doomed) TCP fallback.
     // Upstream tg-ws-proxy's `_cfproxy_fallback` has no such cooldown at
     // all — every connection retries every configured domain fresh — so we
-    // now match that. With one CF domain configured (2 domain variants:
-    // kwsN and kwsN-1) and no --dc-ip/upstream-proxy, each of 2 separate
-    // client connections should independently try both CF domain variants
-    // before falling through to TCP: 3 CONNECTs per connection, 6 total.
+    // now match that. With one CF domain configured (its kwsN record tried
+    // twice) and no --dc-ip/upstream-proxy, each of 2 separate client
+    // connections should independently try both CF attempts before falling
+    // through to TCP: 3 CONNECTs per connection, 6 total.
     // The old cooldown-gated behavior would only produce 4 (connection 2
     // skips CF and goes straight to its single TCP-fallback attempt).
     let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
@@ -166,7 +166,7 @@ async fn cf_proxy_is_retried_fresh_on_every_connection_no_cooldown() {
     assert_eq!(
         requests.len(),
         6,
-        "expected both connections to retry CF fresh (2 domains + TCP \
+        "expected both connections to retry CF fresh (2 CF attempts + TCP \
          fallback each), got {requests:?}"
     );
 }
@@ -195,7 +195,7 @@ async fn cf_tiers_use_plaintext_without_changing_the_tcp_fallback() {
         [
             "worker.example.dev:80",
             "kws2.example.net:80",
-            "kws2-1.example.net:80",
+            "kws2.example.net:80",
             "149.154.167.51:443",
         ]
     );
@@ -250,7 +250,7 @@ async fn pinned_media_upstream_leaves_non_media_connections_on_the_default_ladde
         [
             "worker-medpin.example.dev:443",
             "kws2.medpin.example.net:443",
-            "kws2-1.medpin.example.net:443",
+            "kws2.medpin.example.net:443",
             "149.154.167.51:443",
         ]
     );
@@ -301,7 +301,7 @@ async fn pinned_upstream_reorders_the_ladder_for_non_media_connections() {
         connect_targets(&requests),
         [
             "kws2.pin.example.net:443",
-            "kws2-1.pin.example.net:443",
+            "kws2.pin.example.net:443",
             "worker-pin.example.dev:443",
             "149.154.167.51:443",
         ]
@@ -508,9 +508,9 @@ async fn cf_priority_tries_the_cf_proxy_before_the_direct_websocket() {
     assert_eq!(
         connect_targets(&requests),
         [
-            // CF first, both records...
+            // CF first, its record twice...
             "kws2.example.net:443",
-            "kws2-1.example.net:443",
+            "kws2.example.net:443",
             // ...then the direct WS attempt on both Telegram hostnames...
             "149.154.167.220:443",
             "149.154.167.220:443",

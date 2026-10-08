@@ -38,19 +38,17 @@ default domain can stop working at any time.
    | Name      | IPv4 address      |
    |-----------|-------------------|
    | `kws1`    | `149.154.175.50`  |
-   | `kws1-1`  | `149.154.175.50`  |
    | `kws2`    | `149.154.167.51`  |
-   | `kws2-1`  | `149.154.167.51`  |
    | `kws3`    | `149.154.175.100` |
-   | `kws3-1`  | `149.154.175.100` |
    | `kws4`    | `149.154.167.91`  |
-   | `kws4-1`  | `149.154.167.91`  |
    | `kws5`    | `149.154.171.5`   |
-   | `kws5-1`  | `149.154.171.5`   |
    | `kws203`  | `91.105.192.100`  |
-   | `kws203-1`| `91.105.192.100`  |
 
    Make sure the **orange cloud** (Proxy status) is **enabled** for each record.
+
+   Older versions of this guide also listed `kws1-1`…`kws203-1`. The proxy no
+   longer queries them — through Cloudflare they reach the same origin as the
+   base record — so they can be deleted.
 
 4. If Cloudflare's own IP ranges are also blocked by your ISP, add your
    domain to [zapret](https://github.com/Flowseal/zapret-discord-youtube/)
@@ -86,8 +84,9 @@ default domain can stop working at any time.
 When `--cf-domain` is configured the proxy:
 
 1. Tries the normal direct WebSocket connection to the Telegram DC first.
-2. If that fails, connects to `kws{N}.{cf_domain}:443` and `kws{N}-1.{cf_domain}:443`
-   (where `N` is the DC number) for each configured domain in order.
+2. If that fails, connects to `kws{N}.{cf_domain}:443` (where `N` is the DC
+   number) for each configured domain in order, twice per domain unless the
+   first attempt timed out.
    DNS resolves to Cloudflare's anycast IP.
    Cloudflare terminates TLS and forwards the WebSocket traffic as plain HTTP
    to the origin (Flexible SSL mode) — which is Telegram's actual DC server.
