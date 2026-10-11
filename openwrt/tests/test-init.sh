@@ -162,4 +162,27 @@ EVENTS=()
 service_triggers
 has_event 'trigger:tg-ws-proxy-rs' || { printf 'FAIL: reload trigger missing\n' >&2; exit 1; }
 
+# Disabled SOCKS must not pick up stale addresses/mappings from UCI.
+EVENTS=(); ENVS=(); CFG=(); LISTS=()
+CFG[main.enabled]=1
+CFG[main.secret]=0123456789abcdef0123456789abcdef
+CFG[main.socks_host]=not-an-ip
+LISTS[main.socks_dc]='invalid'
+start_service
+has_env 'TG_SOCKS_ENABLED=false' || { printf 'FAIL: SOCKS not disabled by default\n' >&2; exit 1; }
+if has_env 'TG_SOCKS_HOST=not-an-ip' || has_env 'TG_SOCKS_DC=invalid'; then
+    printf 'FAIL: disabled SOCKS passed stale configuration\n' >&2; exit 1
+fi
+
+EVENTS=(); ENVS=()
+CFG[main.socks_enabled]=1
+CFG[main.socks_host]=127.0.0.1
+CFG[main.socks_port]=1081
+LISTS[main.socks_dc]=$'-2:149.154.167.222\n4:149.154.167.91'
+start_service
+for expected in 'TG_SOCKS_ENABLED=true' 'TG_SOCKS_HOST=127.0.0.1' 'TG_SOCKS_PORT=1081' \
+    'TG_SOCKS_DC=-2:149.154.167.222,4:149.154.167.91'; do
+    has_env "$expected" || { printf 'FAIL: missing SOCKS env %s\n' "$expected" >&2; exit 1; }
+done
+
 printf 'PASS: init/UCI mapping\n'

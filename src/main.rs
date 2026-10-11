@@ -25,6 +25,16 @@ async fn main() {
         .expect("failed to install rustls ring CryptoProvider");
 
     let config = Config::from_args();
+    if config.print_links {
+        match server::connection_links(&config) {
+            Ok(links) => links.iter().for_each(|link| println!("{link}")),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     init_logging(&config);
 
     match server::run(config, std::future::pending()).await {

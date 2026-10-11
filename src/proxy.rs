@@ -1,13 +1,13 @@
-//! Core proxy logic: client handling, re-encryption bridge, TCP fallback.
+//! Core proxy logic: routing, re-encryption bridge, TCP fallback.
 //!
 //! Flow for each inbound client connection:
 //!
 //! ```text
-//!  Telegram Desktop
-//!       │  MTProto obfuscated TCP (port 1443)
+//!  Telegram client
+//!       │  MTProto (port 1443) or SOCKS5
 //!       ▼
-//!  [parse_handshake]  ← validates secret, extracts DC id + protocol
-//!       │
+//!  [inbound::serve]   ← the listener's handshake yields a Session:
+//!       │                DC, framing, client obfuscation
 //!       ▼
 //!  [select_upstream]  ← the fallback ladder: pooled/direct WebSocket,
 //!       │                Cloudflare Worker, Cloudflare proxy, upstream
@@ -40,14 +40,14 @@ use tungstenite::Message;
 
 use crate::config::{Config, MtProtoProxy, UpstreamTier};
 use crate::crypto::{
-    AesCtr256, ConnectionCiphers, ProtoTag, build_connection_ciphers, generate_client_handshake,
-    generate_relay_init, parse_handshake,
+    AesCtr256, ProtoTag, build_raw_ciphers, generate_client_handshake, generate_relay_init,
 };
 use crate::faketls::{
-    TLS_MAX_RECORD_PAYLOAD, TLS_RECORD_HANDSHAKE, build_faketls_client_hello,
-    build_faketls_server_hello, drain_faketls_server_hello, parse_faketls_client_hello,
-    read_tls_appdata, read_tls_record_bytes, sign_faketls_client_hello, write_tls_appdata,
+    TLS_MAX_RECORD_PAYLOAD, TLS_READ_HEADROOM, build_faketls_client_hello,
+    drain_faketls_server_hello, read_tls_appdata, sign_faketls_client_hello, write_tls_appdata,
 };
+use crate::inbound::mtproto::MtProto;
+use crate::inbound::{self, CLIENT_READ_BUF_SIZE, ClientReader, ClientWriter, Session};
 use crate::outbound::OutboundConnector;
 use crate::pool::{CfTarget, CfTier, WsPool};
 use crate::runtime::Runtime;
@@ -75,20 +75,23 @@ type TcpWriter = OwnedWriteHalf;
 /// from 12.5 MiB to 3.1 MiB on the WebSocket path, and from 25 MiB to 6.2 MiB
 /// on the TCP fallback.
 const RELAY_BUF_SIZE: usize = 16 * 1024;
-/// AEAD expansion allowance over a full TLS record payload (RFC 8446 §5.2
-/// caps a ciphertext record at 2^14 + 256).  The 5-byte record header is read
-/// separately and never lands in these buffers.
-const TLS_READ_HEADROOM: usize = 256;
+/// A client direction's transport obfuscation; `None` for a plain transport.
+struct ClientCipher(Option<AesCtr256>);
 
-/// Buffer size for reads from the *client*.
-///
-/// With `--listen-faketls-domain` a client read is a whole TLS record, and
-/// `read_tls_appdata` reports a record that does not fit as `Ok(0)` — which
-/// every bridge loop reads as EOF and silently ends the session. Sizing this
-/// to the same tolerance the inbound handshake already accepts keeps a client
-/// that emits a slightly oversized record working, for 256 bytes per
-/// connection.
-const CLIENT_READ_BUF_SIZE: usize = TLS_MAX_RECORD_PAYLOAD + TLS_READ_HEADROOM;
+impl ClientCipher {
+    fn apply_keystream(&mut self, data: &mut [u8]) {
+        if let Some(cipher) = &mut self.0 {
+            cipher.apply_keystream(data);
+        }
+    }
+}
+
+struct BridgeCiphers {
+    clt_dec: ClientCipher,
+    clt_enc: ClientCipher,
+    tg_enc: AesCtr256,
+    tg_dec: AesCtr256,
+}
 
 // ─── Failure cooldowns ───────────────────────────────────────────────────────
 
@@ -132,142 +135,6 @@ fn domain_order(domains: &[String], first: usize) -> impl Iterator<Item = &str> 
     (0..domains.len()).map(move |offset| domains[(first + offset) % domains.len()].as_str())
 }
 
-// ─── Client-side framing ─────────────────────────────────────────────────────
-
-enum ClientReader {
-    Plain(TcpReader),
-    FakeTls {
-        reader: TcpReader,
-        pending: PendingData,
-    },
-}
-
-#[derive(Default)]
-struct PendingData {
-    data: Vec<u8>,
-    offset: usize,
-}
-
-impl PendingData {
-    fn from_record(data: Vec<u8>, offset: usize) -> Self {
-        Self { data, offset }
-    }
-
-    fn read(&mut self, buf: &mut [u8]) -> Option<usize> {
-        let remaining = self.data.get(self.offset..)?;
-        if remaining.is_empty() {
-            return None;
-        }
-
-        let n = std::cmp::min(buf.len(), remaining.len());
-        buf[..n].copy_from_slice(&remaining[..n]);
-        self.offset += n;
-        if self.offset == self.data.len() {
-            self.data = Vec::new();
-            self.offset = 0;
-        }
-        Some(n)
-    }
-}
-
-impl ClientReader {
-    async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            Self::Plain(reader) => reader.read(buf).await,
-            Self::FakeTls { reader, pending } => {
-                if let Some(n) = pending.read(buf) {
-                    return Ok(n);
-                }
-
-                read_tls_appdata(reader, buf).await
-            }
-        }
-    }
-
-    async fn drain(self) {
-        match self {
-            Self::Plain(mut reader) | Self::FakeTls { mut reader, .. } => {
-                let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
-            }
-        }
-    }
-}
-
-enum ClientWriter {
-    Plain(TcpWriter),
-    FakeTls(TcpWriter),
-}
-
-impl ClientWriter {
-    async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
-        match self {
-            Self::Plain(writer) => writer.write_all(data).await,
-            Self::FakeTls(writer) => write_tls_appdata(writer, data).await,
-        }
-    }
-}
-
-async fn accept_inbound_faketls(
-    label: SocketAddr,
-    reader: &mut TcpReader,
-    writer: &mut TcpWriter,
-    secrets: &[Vec<u8>],
-    expected_domain: &str,
-) -> Option<([u8; 64], PendingData)> {
-    let record = read_tls_record_bytes(reader, TLS_MAX_RECORD_PAYLOAD + TLS_READ_HEADROOM)
-        .await
-        .ok()??;
-    if record[0] != TLS_RECORD_HANDSHAKE || record[1..3] != [0x03, 0x01] {
-        debug!("[{}] bad FakeTLS ClientHello record", label);
-        return None;
-    }
-
-    let Some((hello, matched_secret)) = secrets.iter().find_map(|secret| {
-        parse_faketls_client_hello(&record, secret).map(|hello| (hello, secret))
-    }) else {
-        debug!("[{}] bad FakeTLS ClientHello digest", label);
-        return None;
-    };
-
-    if hello.hostname.as_deref() != Some(expected_domain) {
-        debug!(
-            "[{}] FakeTLS SNI mismatch: got {:?}, expected {}",
-            label, hello.hostname, expected_domain
-        );
-        return None;
-    }
-
-    let server_hello = build_faketls_server_hello(matched_secret, &hello);
-    if let Err(e) = writer.write_all(&server_hello).await {
-        debug!("[{}] write FakeTLS ServerHello: {}", label, e);
-        return None;
-    }
-
-    let mut handshake_buf = [0u8; 64];
-    let mut filled = 0;
-    while filled < handshake_buf.len() {
-        let record = read_tls_record_bytes(reader, TLS_MAX_RECORD_PAYLOAD + TLS_READ_HEADROOM)
-            .await
-            .ok()??;
-        let record_type = record[0];
-        let payload_len = record.len() - 5;
-        if record_type == crate::faketls::TLS_RECORD_CHANGE_CIPHER_SPEC {
-            continue;
-        }
-        if record_type != crate::faketls::TLS_RECORD_APPLICATION_DATA || payload_len == 0 {
-            return None;
-        }
-        let take = std::cmp::min(payload_len, handshake_buf.len() - filled);
-        handshake_buf[filled..filled + take].copy_from_slice(&record[5..5 + take]);
-        filled += take;
-        if take != payload_len {
-            return Some((handshake_buf, PendingData::from_record(record, 5 + take)));
-        }
-    }
-
-    Some((handshake_buf, PendingData::default()))
-}
-
 // ─── Client handler ──────────────────────────────────────────────────────────
 
 /// Connect timeouts and failure cooldowns for one connection, resolved from
@@ -278,7 +145,6 @@ struct Timeouts {
     ws_fail_cooldown: Duration,
     ws_redirect_cooldown: Duration,
     ip_fail_cooldown: Duration,
-    handshake: Duration,
     tcp_fallback: Duration,
     upstream_connect: Duration,
     upstream_fail_cooldown: Duration,
@@ -294,7 +160,6 @@ impl Timeouts {
             ws_fail_cooldown: Duration::from_secs(config.ws_fail_cooldown),
             ws_redirect_cooldown: Duration::from_secs(config.ws_redirect_cooldown),
             ip_fail_cooldown: Duration::from_secs(config.ip_fail_cooldown),
-            handshake: Duration::from_secs(config.handshake_timeout),
             tcp_fallback: Duration::from_secs(config.tcp_fallback_timeout),
             upstream_connect: Duration::from_secs(config.upstream_connect_timeout),
             upstream_fail_cooldown: Duration::from_secs(config.upstream_fail_cooldown),
@@ -304,7 +169,7 @@ impl Timeouts {
     }
 }
 
-/// Handle one inbound client connection end-to-end.
+/// Handle one MTProto-listener client end-to-end.
 ///
 /// `config` is shared rather than owned: it is read-only for the whole life of
 /// the process, and cloning it per connection meant copying every secret and
@@ -335,143 +200,93 @@ pub async fn handle_client_with_runtime(
     pool: Arc<WsPool>,
     runtime: Arc<Runtime>,
 ) {
-    let label = peer;
-    let _ = stream.set_nodelay(true);
+    inbound::serve(&MtProto, stream, peer, config, pool, runtime).await;
+}
 
-    let secrets = config.normalized_secrets();
-    let timeouts = Timeouts::from_config(&config);
-
-    // Split into independent read / write halves.
-    let (mut reader, mut writer) = stream.into_split();
-
-    // ── Step 1: read the 64-byte MTProto obfuscation init ────────────────
-    let inbound_faketls_domain = config.normalized_listen_faketls_domain();
-    let handshake = tokio::time::timeout(
-        timeouts.handshake,
-        read_inbound_handshake(
-            label,
-            &mut reader,
-            &mut writer,
-            secrets,
-            inbound_faketls_domain,
-        ),
-    )
-    .await;
-
-    let (handshake_buf, faketls_pending) = match handshake {
-        Ok(Some(result)) => result,
-        Ok(None) => return,
-        Err(_) => {
-            debug!("[{}] handshake timeout", label);
-            return;
-        }
-    };
-
-    let (reader, writer) = if inbound_faketls_domain.is_some() {
-        (
-            ClientReader::FakeTls {
-                reader,
-                pending: faketls_pending,
-            },
-            ClientWriter::FakeTls(writer),
-        )
-    } else {
-        (ClientReader::Plain(reader), ClientWriter::Plain(writer))
-    };
-
-    // ── Step 2: parse and validate the handshake ─────────────────────────
-    let Some((info, secret)) = secrets
-        .iter()
-        .find_map(|secret| parse_handshake(&handshake_buf, secret).map(|i| (i, secret.as_slice())))
-    else {
-        debug!(
-            "[{}] bad handshake (wrong secret or reserved prefix)",
-            label
-        );
-
-        // Drain the connection silently to avoid giving information to scanners.
-        reader.drain().await;
-
-        return;
-    };
-
-    let dc_id = info.dc_id;
-    let is_media = info.is_media;
-    let proto = info.proto;
-    let dc_idx: i16 = if is_media {
-        -(dc_id as i16)
-    } else {
-        dc_id as i16
-    };
-
-    debug!(
-        "[{}] handshake ok: DC{}{} proto={:?}",
-        label,
-        dc_id,
-        media_tag(is_media),
-        proto
-    );
-
-    // ── Step 3: generate the relay init packet for the Telegram backend ──
-    let relay_init = generate_relay_init(proto, dc_idx);
-
-    // ── Step 4: build all four AES-256-CTR ciphers ───────────────────────
-    let ciphers = build_connection_ciphers(&info.prekey_and_iv, secret, &relay_init);
-
-    // ── Step 5: walk the fallback ladder ─────────────────────────────────
-    let route = Route {
-        label,
-        config: &config,
-        runtime: &runtime,
-        pool: &pool,
-        timeouts,
-        dc: dc_id,
-        is_media,
-        media: media_tag(is_media),
-        dc_idx,
-        proto,
-    };
-    let target_ip = config.dc_target_ip(dc_id);
-
-    // ── Step 6: bridge whatever we ended up connected to ─────────────────
+/// Route and bridge a client whose inbound handshake is done.
+pub(crate) fn serve_session(
+    label: SocketAddr,
+    session: Session,
+    config: Arc<Config>,
+    pool: Arc<WsPool>,
+    runtime: Arc<Runtime>,
+) -> impl Future<Output = ()> + Send {
     // The routing ladder contains every TLS/WS fallback handshake, while only
     // one bridge branch survives for the session. Box the short-lived ladder,
     // then box only the bridge actually selected; otherwise Rust's async state
-    // machine reserves space for their combined widest variants forever.
-    let bridge = Box::pin(select_bridge(
-        &route,
-        target_ip,
-        reader,
-        writer,
-        BridgeDispatch {
-            label,
-            relay_init,
-            ciphers,
-            proto,
-            dc: dc_id,
-            is_media,
-            tcp_connect_timeout: route.timeouts.tcp_fallback,
-            runtime: Arc::clone(&runtime),
-        },
-    ))
-    .await;
-    if let Some(bridge) = bridge {
-        bridge.await;
+    // machine reserves space for their combined widest variants forever. Not
+    // an `async fn`: its arguments, the session's ciphers among them, would
+    // stay in the session's state machine after moving into the ladder.
+    let ladder = Box::pin(select_bridge(label, session, config, pool, runtime));
+    async move {
+        let bridge = ladder.await;
+        if let Some(bridge) = bridge {
+            bridge.await;
+        }
     }
 }
 
 // ─── Routing ─────────────────────────────────────────────────────────────────
 
 async fn select_bridge(
-    route: &Route<'_>,
-    target_ip: Option<&str>,
-    reader: ClientReader,
-    writer: ClientWriter,
-    params: BridgeDispatch,
+    label: SocketAddr,
+    session: Session,
+    config: Arc<Config>,
+    pool: Arc<WsPool>,
+    runtime: Arc<Runtime>,
 ) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
-    select_upstream(route, target_ip)
-        .await
-        .map(|upstream| bridge_selected(reader, writer, upstream, params))
+    let dc_id = u32::from(session.dc_idx.unsigned_abs());
+    let is_media = session.dc_idx < 0;
+    debug!(
+        "[{}] handshake ok: DC{}{} proto={:?}",
+        label,
+        dc_id,
+        media_tag(is_media),
+        session.proto
+    );
+
+    let route = Route {
+        label,
+        config: &config,
+        runtime: &runtime,
+        pool: &pool,
+        timeouts: Timeouts::from_config(&config),
+        dc: dc_id,
+        is_media,
+        media: media_tag(is_media),
+        dc_idx: session.dc_idx,
+        proto: session.proto,
+    };
+    let upstream = select_upstream(&route, config.dc_target_ip(dc_id)).await?;
+
+    // Whatever the inbound, the Telegram side is keyed the same way; built
+    // after the ladder so these ciphers are not held across it.
+    let relay_init = generate_relay_init(session.proto, session.dc_idx);
+    let (tg_enc, tg_dec) = build_raw_ciphers(&relay_init);
+    let (clt_dec, clt_enc) = match session.obfuscation {
+        Some((dec, enc)) => (Some(dec), Some(enc)),
+        None => (None, None),
+    };
+    Some(bridge_selected(
+        session.reader,
+        session.writer,
+        upstream,
+        BridgeDispatch {
+            label,
+            relay_init,
+            ciphers: BridgeCiphers {
+                clt_dec: ClientCipher(clt_dec),
+                clt_enc: ClientCipher(clt_enc),
+                tg_enc,
+                tg_dec,
+            },
+            proto: session.proto,
+            dc: dc_id,
+            is_media,
+            tcp_connect_timeout: route.timeouts.tcp_fallback,
+            runtime: Arc::clone(&runtime),
+        },
+    ))
 }
 
 /// The upstream a connection was routed to, ready to be bridged.
@@ -493,7 +308,7 @@ enum Upstream {
 struct BridgeDispatch {
     label: SocketAddr,
     relay_init: [u8; 64],
-    ciphers: ConnectionCiphers,
+    ciphers: BridgeCiphers,
     proto: ProtoTag,
     dc: u32,
     is_media: bool,
@@ -540,7 +355,7 @@ fn bridge_selected(
             },
         )),
         Upstream::Mtproto(conn) => {
-            let ConnectionCiphers {
+            let BridgeCiphers {
                 clt_dec, clt_enc, ..
             } = ciphers;
 
@@ -551,7 +366,7 @@ fn bridge_selected(
                     label,
                     rem_reader: conn.reader,
                     rem_writer: conn.writer,
-                    ciphers: ConnectionCiphers {
+                    ciphers: BridgeCiphers {
                         clt_dec,
                         clt_enc,
                         tg_enc: conn.enc,
@@ -1319,7 +1134,7 @@ struct WsBridgeParams {
     ws: TgWsStream,
     framing: WsFraming,
     relay_init: [u8; 64],
-    ciphers: ConnectionCiphers,
+    ciphers: BridgeCiphers,
     proto: ProtoTag,
     dc: u32,
     is_media: bool,
@@ -1337,7 +1152,7 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
         is_media,
     } = params;
 
-    let ConnectionCiphers {
+    let BridgeCiphers {
         mut clt_dec,
         mut clt_enc,
         mut tg_enc,
@@ -1572,7 +1387,7 @@ struct RelayParams {
     label: SocketAddr,
     rem_reader: TcpReader,
     rem_writer: TcpWriter,
-    ciphers: ConnectionCiphers,
+    ciphers: BridgeCiphers,
     faketls: bool,
     dc: u32,
     is_media: bool,
@@ -1589,7 +1404,7 @@ async fn bridge_relay(reader: ClientReader, writer: ClientWriter, params: RelayP
         is_media,
     } = params;
 
-    let ConnectionCiphers {
+    let BridgeCiphers {
         mut clt_dec,
         mut clt_enc,
         mut tg_enc,
@@ -1695,7 +1510,7 @@ struct TcpBridgeParams<'a> {
     label: SocketAddr,
     dst: &'a str,
     relay_init: &'a [u8; 64],
-    ciphers: ConnectionCiphers,
+    ciphers: BridgeCiphers,
     dc: u32,
     is_media: bool,
     connect_timeout: Duration,
@@ -1735,7 +1550,7 @@ async fn bridge_tcp(
         return;
     }
 
-    let ConnectionCiphers {
+    let BridgeCiphers {
         mut clt_dec,
         mut clt_enc,
         mut tg_enc,
@@ -1894,27 +1709,6 @@ fn log_session_closed(
         human_bytes(bytes_down),
         start.elapsed().as_secs_f32()
     );
-}
-
-async fn read_inbound_handshake(
-    label: SocketAddr,
-    reader: &mut TcpReader,
-    writer: &mut TcpWriter,
-    secrets: &[Vec<u8>],
-    faketls_domain: Option<&str>,
-) -> Option<([u8; 64], PendingData)> {
-    if let Some(domain) = faketls_domain {
-        return accept_inbound_faketls(label, reader, writer, secrets, domain).await;
-    }
-
-    let mut handshake_buf = [0u8; 64];
-    match reader.read_exact(&mut handshake_buf).await {
-        Ok(_) => Some((handshake_buf, PendingData::default())),
-        Err(e) => {
-            debug!("[{}] read handshake: {}", label, e);
-            None
-        }
-    }
 }
 
 pub fn split_mtproto_init_and_pending(data: &[u8]) -> Option<([u8; 64], Vec<u8>)> {
