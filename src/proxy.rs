@@ -21,6 +21,7 @@
 //! client's own reader/writer halves only ever have to be moved into a single
 //! bridge call.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -110,6 +111,120 @@ static CF_WORKER_FAIL: CooldownMap<String> = CooldownMap::new();
 
 fn upstream_key(host: &str, port: u16) -> String {
     format!("{}:{}", host, port)
+}
+
+// ─── Cooled-address probe ────────────────────────────────────────────────────
+
+/// `--dc-ip` addresses with an [`IpProbe`] waiting on them.
+static IP_PROBES: StdMutex<BTreeSet<String>> = StdMutex::new(BTreeSet::new());
+
+/// Decides, off the client path, when a cooled `--dc-ip` address comes back.
+///
+/// Without it the cooldown simply ran out, and the next client to arrive
+/// dialled the address on the full connect timeout.  On a box whose address
+/// stays dark, that was one client an hour, on the dot, sitting through ten
+/// seconds of silence that Telegram's own proxy check does not wait for
+/// (#148).  So the entry is held for as long as a probe needs, and only the
+/// probe ends it: an answer clears it, another timeout re-arms it.
+///
+/// A client's own direct connect still clears it as before — the "every
+/// fallback failed" re-probe and the no-fallback path both dial regardless —
+/// and a probe that finds its entry gone simply stops.
+struct IpProbe {
+    runtime: Arc<Runtime>,
+    ip: String,
+    dc: u32,
+    is_media: bool,
+    skip_tls_verify: bool,
+    connect_timeout: Duration,
+    cooldown: Duration,
+}
+
+/// Releases an address from [`IP_PROBES`] however its probe ends, including
+/// the runtime dropping the task on shutdown — an embedder that restarts the
+/// proxy in the same process would otherwise never probe that address again.
+struct IpProbeGuard(String);
+
+impl Drop for IpProbeGuard {
+    fn drop(&mut self) {
+        IP_PROBES.lock().unwrap().remove(&self.0);
+    }
+}
+
+impl IpProbe {
+    /// How long past the cooldown the entry is held: enough for one probe to
+    /// finish, so a client arriving mid-probe still steps over the address.
+    fn grace(&self) -> Duration {
+        self.connect_timeout * 2
+    }
+
+    /// Start or extend the cooldown, and make sure a probe waits at its end.
+    fn arm(self) {
+        // `--ip-fail-cooldown 0` turns the skipping off; there is no window
+        // for a probe to close.
+        if self.cooldown.is_zero() {
+            return;
+        }
+
+        IP_FAIL.set(self.ip.clone(), self.cooldown + self.grace());
+        if !IP_PROBES.lock().unwrap().insert(self.ip.clone()) {
+            return;
+        }
+
+        let guard = IpProbeGuard(self.ip.clone());
+        tokio::spawn(async move {
+            let _guard = guard;
+            self.run().await;
+        });
+    }
+
+    async fn run(self) {
+        let media = media_tag(self.is_media);
+        loop {
+            tokio::time::sleep(self.cooldown).await;
+            if !IP_FAIL.active(&self.ip) {
+                return;
+            }
+
+            let attempt = tokio::time::timeout(
+                self.grace(),
+                connect_ws_for_dc_with_outbound(
+                    &self.ip,
+                    self.runtime.websocket_dc(self.dc),
+                    self.is_media,
+                    self.skip_tls_verify,
+                    self.connect_timeout,
+                    self.runtime.outbound(),
+                    self.runtime.fronting_domain(),
+                ),
+            )
+            .await;
+            // Same verdict `direct_ws` reaches: only a connect that ran out
+            // the clock says the address is still dark.
+            let still_dark = attempt.map_or(true, |a| a.ws.is_none() && a.connect_timed_out);
+
+            if !IP_FAIL.active(&self.ip) {
+                return;
+            }
+            if !still_dark {
+                IP_FAIL.clear(&self.ip);
+                info!(
+                    "DC{}{} background probe: {} answers again, cooldown cleared",
+                    self.dc, media, self.ip
+                );
+                return;
+            }
+
+            IP_FAIL.set(self.ip.clone(), self.cooldown + self.grace());
+            info!(
+                "DC{}{} background probe: {} still times out, cooldown {}s",
+                self.dc,
+                media,
+                self.ip,
+                self.cooldown.as_secs()
+            );
+        }
+    }
 }
 
 // ─── Cloudflare domain balancing ─────────────────────────────────────────────
@@ -609,7 +724,7 @@ enum WsFraming {
 struct Route<'a> {
     label: SocketAddr,
     config: &'a Config,
-    runtime: &'a Runtime,
+    runtime: &'a Arc<Runtime>,
     pool: &'a Arc<WsPool>,
     timeouts: Timeouts,
     dc: u32,
@@ -1302,7 +1417,8 @@ impl Route<'_> {
         }
     }
 
-    /// Back off from a target IP whose TCP connect timed out.
+    /// Back off from a target IP whose TCP connect timed out, leaving an
+    /// [`IpProbe`] to decide when it comes back.
     ///
     /// Recorded even with no fallback tier configured, where nothing will skip
     /// the address: the pool reads the same cooldown to stop pre-connecting
@@ -1310,7 +1426,16 @@ impl Route<'_> {
     /// where the skipping decision — the part that does need a fallback — is
     /// made.
     fn cool_down_ip(&self, target_ip: &str) {
-        IP_FAIL.set(target_ip.to_string(), self.timeouts.ip_fail_cooldown);
+        IpProbe {
+            runtime: Arc::clone(self.runtime),
+            ip: target_ip.to_string(),
+            dc: self.dc,
+            is_media: self.is_media,
+            skip_tls_verify: self.config.skip_tls_verify,
+            connect_timeout: self.timeouts.ws_connect,
+            cooldown: self.timeouts.ip_fail_cooldown,
+        }
+        .arm();
         info!(
             "[{}] DC{}{} TCP to {} timed out, cooldown {}s",
             self.label,

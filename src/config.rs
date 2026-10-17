@@ -454,7 +454,9 @@ pub struct Config {
     /// Stepped over, not written off: a connection that finds every fallback
     /// tier dead re-probes the address anyway, and the first direct connect
     /// that succeeds clears the cooldown — so a window opened by a passing
-    /// glitch cannot strand anyone.  The skipping needs a fallback tier to be
+    /// glitch cannot strand anyone.  When the window ends, a background probe
+    /// re-tests the address before any client is sent back to it: an answer
+    /// clears the cooldown, another timeout starts a new window.  The skipping needs a fallback tier to be
     /// configured; the record itself is always kept, since the pool reads it
     /// to stop pre-connecting into the same hole.  Matches upstream
     /// tg-ws-proxy's `IP_FAIL_COOLDOWN`.
