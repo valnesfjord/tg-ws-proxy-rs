@@ -22,7 +22,10 @@ src/
   main.rs              Thin CLI wrapper: clap parse, tracing, then server::run
   server.rs            Process-level bind / banner / accept loop (shared by the binary and embedders)
   config.rs            clap-derived Config struct; all CLI flags + TG_* env var fallbacks
-  proxy.rs              Core per-connection logic: client handshake, DC routing, WS/CF/TCP fallback chain
+  inbound.rs            Inbound layer: `Inbound` trait → `Session`, shared handshake timeout, listeners, client stream
+  inbound/mtproto.rs    MTProto listener: MTProxy-secret handshake, optional inbound FakeTLS
+  inbound/socks.rs      Optional SOCKS5 listener: destination IP → DC map, secretless transports
+  proxy.rs              Routing core fed a `Session`: DC routing, WS/CF/TCP fallback chain, bridges
   crypto.rs             MTProto obfuscated-transport crypto (AES-256-CTR key derivation, secret layout)
   faketls.rs            0xee FakeTLS camouflage: fake TLS 1.3 handshake for inbound + upstream proxies
   splitter.rs            Splits/reassembles MTProto transport frames from WebSocket message boundaries
@@ -40,7 +43,7 @@ tests/common/mod.rs      Shared integration fixtures (fake HTTP CONNECT proxy, p
 docs/                    User-facing guides. README stays an overview and links here rather than growing:
                          Fallbacks.md (routing tiers), Building.md (cross-compiling, UPX), Deployment.md
                          (Docker, OpenWrt, env vars), CfProxy.md + CfWorker.md (Cloudflare setup),
-                         Android.md (Compose app + NDK build)
+                         Android.md (Compose app + NDK build), Forkop.md (SOCKS5 inbound + router routing)
 android/                 Jetpack Compose app (Gradle catalog + build-logic convention; see docs/Android.md)
 crates/android-jni/      JNI start/stop + log callback cdylib; built only by the Android Gradle task
 ```
@@ -131,6 +134,12 @@ requests, so add a rehearsal there when adding one.
 - **Module-level `//!` doc comments explain the *protocol/why*, not the *what*.** Look at the top
   of `crypto.rs`, `faketls.rs`, `splitter.rs`, `pool.rs` for the expected level of detail — they
   describe non-obvious protocol framing/timing reasons, not restate the code.
+- **Listener protocols implement `inbound::Inbound`.** A handshake ends at a `Session` (client
+  stream, DC, framing, client obfuscation) and never builds relay ciphers or routes; `links` says
+  how users reach it. Register it in `inbound::planned`, which both the server and
+  `--print-links` (LuCI's copy buttons) read. Each handler is pinned to 4 KiB of per-connection
+  state by a size test (`proxy/tests.rs`, `tests/socks.rs`): nothing large — ciphers especially
+  — may stay alive across an `.await`.
 - **All outbound TCP connections go through `src/outbound/`.** Direct WS, Cloudflare, Cloudflare
   Worker, TCP fallback, `--check`, and the default-domain fetch all call into the shared outbound
   connector so proxy/NO_PROXY behavior stays consistent. Don't open a raw `TcpStream::connect`

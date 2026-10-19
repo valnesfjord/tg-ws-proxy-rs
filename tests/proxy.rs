@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use clap::Parser;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use tg_ws_proxy_rs::config::Config;
 use tg_ws_proxy_rs::crypto::{ProtoTag, generate_client_handshake};
@@ -64,6 +64,32 @@ fn split_mtproto_init_rejects_short_input() {
 
     assert!(split_mtproto_init_and_pending(&data).is_none());
     assert!(split_mtproto_init_and_pending(&[]).is_none());
+}
+
+#[tokio::test]
+async fn a_wrong_secret_is_drained_without_closing_the_connection() {
+    // A scanner must not learn anything from when the connection ends: after
+    // a bad handshake the listener reads and discards, sending no FIN even
+    // past the handshake timeout, until the client gives up.
+    let config = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--secret",
+        SECRET,
+        "--handshake-timeout",
+        "1",
+        "--no-outbound-proxy",
+    ])
+    .unwrap();
+    let (mut client, handler) = start_proxy_connection(config).await;
+    client.write_all(&[0x5a; 64]).await.unwrap();
+
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(Duration::from_millis(1500), client.read(&mut byte)).await;
+    assert!(read.is_err(), "the listener answered or closed: {read:?}");
+    assert!(!handler.is_finished());
+
+    drop(client);
+    await_proxy_handler(handler).await;
 }
 
 // ─── Fallback chain ──────────────────────────────────────────────────────────
