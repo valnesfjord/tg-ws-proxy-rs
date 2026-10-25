@@ -112,6 +112,13 @@ Stepped over, not written off: if every fallback tier is also failing, the
 address is re-probed rather than leaving the client on raw TCP for the rest of
 the window, and the first direct connect that succeeds clears the cooldown.
 
+When the window runs out, no client is sent to find out whether the address is
+back. A background probe dials it first, and clients keep stepping over it
+until that probe answers. If the address responds at all, the cooldown is
+cleared. If it times out again, a new window starts. Before 2.5.7, the first
+client after the window paid the full connect timeout, which is longer than
+Telegram's own proxy check waits.
+
 Every connection retries every configured CF domain fresh — a failure isn't
 remembered across connections (matching upstream tg-ws-proxy), so one flaky
 domain can never block the others, or the whole DC, from being tried.

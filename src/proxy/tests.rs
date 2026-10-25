@@ -343,7 +343,7 @@ fn ladder_config(extra: &[&str]) -> Config {
 
 fn ladder_route<'a>(
     config: &'a Config,
-    runtime: &'a Runtime,
+    runtime: &'a Arc<Runtime>,
     pool: &'a Arc<WsPool>,
     dc: u32,
 ) -> Route<'a> {
@@ -478,4 +478,118 @@ async fn a_pinned_ladder_re_probes_a_cooled_dc_ip_when_every_rung_fails() {
         re_probed_the_cooled_ip,
         "the cooled address was never asked again, so nothing can clear it"
     );
+}
+
+// ─── The background probe of a cooled `--dc-ip` ──────────────────────────────
+
+/// An outbound HTTP proxy that counts CONNECTs and either holds them open
+/// without a word — a dark address, as far as the dialler can tell — or
+/// refuses them, which is an address that answers.
+async fn probe_outbound(answer: bool) -> (Arc<Runtime>, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dials = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&dials);
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            seen.fetch_add(1, Ordering::SeqCst);
+            if answer {
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request).await;
+                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+            } else {
+                held.push(stream);
+            }
+        }
+    });
+
+    let outbound = OutboundConnector::from_config(Some(&format!("http://{addr}")), None, false);
+    (Arc::new(Runtime::new(outbound.unwrap())), dials)
+}
+
+fn probe(runtime: &Arc<Runtime>, ip: &str, cooldown: Duration) -> IpProbe {
+    IpProbe {
+        runtime: Arc::clone(runtime),
+        ip: ip.to_string(),
+        dc: 2,
+        is_media: false,
+        skip_tls_verify: false,
+        connect_timeout: Duration::from_millis(500),
+        cooldown,
+    }
+}
+
+async fn probe_finished(ip: &str) -> bool {
+    for _ in 0..60 {
+        if !IP_PROBES.lock().unwrap().contains(ip) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn a_cooled_dc_ip_stays_cooled_while_the_probe_finds_it_dark() {
+    // #148: the cooldown used to simply run out, and the next client dialled
+    // the address on the full connect timeout.  The entry now outlives the
+    // window until the probe has its answer, and a probe that times out again
+    // re-arms it.
+    const IP: &str = "192.0.2.20";
+    let (runtime, dials) = probe_outbound(false).await;
+    let cooldown = Duration::from_millis(200);
+
+    probe(&runtime, IP, cooldown).arm();
+    // A second timeout while the first probe waits must not start another.
+    probe(&runtime, IP, cooldown).arm();
+
+    // Mid-probe: past the bare cooldown, before the 500 ms connect gives up.
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    assert!(
+        IP_FAIL.active(IP),
+        "a client could dial the address mid-probe"
+    );
+    assert_eq!(dials.load(Ordering::SeqCst), 1, "one probe per address");
+
+    // The probe gave up at ~700 ms and re-armed the entry.
+    tokio::time::sleep(Duration::from_millis(550)).await;
+    assert!(IP_FAIL.active(IP), "a dark address came back by itself");
+
+    // A client's direct connect clearing the entry ends the probe.
+    IP_FAIL.clear(IP);
+    assert!(probe_finished(IP).await, "the probe outlived its entry");
+}
+
+#[tokio::test]
+async fn a_cooled_dc_ip_that_answers_the_probe_comes_back() {
+    // Any answer clears it, exactly as in `direct_ws`: only a connect that ran
+    // out the clock says the address itself is gone.
+    const IP: &str = "192.0.2.21";
+    let (runtime, dials) = probe_outbound(true).await;
+
+    probe(&runtime, IP, Duration::from_millis(50)).arm();
+
+    assert!(probe_finished(IP).await, "the probe never finished");
+    assert!(dials.load(Ordering::SeqCst) >= 1);
+    assert!(
+        !IP_FAIL.active(IP),
+        "an address that answered stayed cooled"
+    );
+}
+
+#[tokio::test]
+async fn a_zero_ip_fail_cooldown_starts_no_probe() {
+    // `--ip-fail-cooldown 0` turns the skipping off.  Holding the entry for a
+    // probe's grace period would quietly turn it back on.
+    const IP: &str = "192.0.2.22";
+    let (runtime, dials) = probe_outbound(false).await;
+
+    probe(&runtime, IP, Duration::ZERO).arm();
+
+    assert!(!IP_FAIL.active(IP));
+    assert!(!IP_PROBES.lock().unwrap().contains(IP));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(dials.load(Ordering::SeqCst), 0);
 }
