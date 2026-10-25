@@ -62,12 +62,20 @@ jobs:
                       os: macos-latest
                     - target: mips-unknown-linux-musl
                       os: ubuntu-latest
+                    # Windows 7: tier-3 targets, built by
+                    # .github/scripts/build-win7.sh rather than the action (#156).
+                    - target: x86_64-win7-windows-msvc
+                      os: windows-latest
+                      win7: true
+                    - target: i686-win7-windows-msvc
+                      os: windows-latest
+                      win7: true
         runs-on: ${{ matrix.os }}
         steps:
             - uses: actions/checkout@v6
 
             - name: Read pinned Rust toolchain
-              if: matrix.target != 'mipsel-unknown-linux-musl' && matrix.target != 'mips-unknown-linux-musl'
+              if: matrix.target != 'mipsel-unknown-linux-musl' && matrix.target != 'mips-unknown-linux-musl' && !matrix.win7
               id: rust-toolchain
               shell: bash
               run: |
@@ -76,19 +84,36 @@ jobs:
                   echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
 
             - name: Install pinned Rust
-              if: matrix.target != 'mipsel-unknown-linux-musl' && matrix.target != 'mips-unknown-linux-musl'
+              if: matrix.target != 'mipsel-unknown-linux-musl' && matrix.target != 'mips-unknown-linux-musl' && !matrix.win7
               uses: dtolnay/rust-toolchain@master
               with:
                   toolchain: ${{ steps.rust-toolchain.outputs.toolchain }}
 
             # Default path (all targets except the mips variants)
             - name: Build & upload (default)
-              if: matrix.target != 'mipsel-unknown-linux-musl' && matrix.target != 'mips-unknown-linux-musl'
+              if: matrix.target != 'mipsel-unknown-linux-musl' && matrix.target != 'mips-unknown-linux-musl' && !matrix.win7
               uses: taiki-e/upload-rust-binary-action@v1
               with:
                   bin: tg-ws-proxy
                   target: ${{ matrix.target }}
                   token: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Install nightly + rust-src + llvm-tools (win7)
+              if: matrix.win7
+              uses: dtolnay/rust-toolchain@nightly
+              with:
+                  components: rust-src, llvm-tools
+
+            - name: Build, check and upload (win7)
+              if: matrix.win7
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              shell: bash
+              run: |
+                  set -euxo pipefail
+                  NAME="tg-ws-proxy-${{ matrix.target }}.zip"
+                  .github/scripts/build-win7.sh "${{ matrix.target }}" "$NAME"
+                  gh release upload "${GITHUB_REF_NAME}" "$NAME" --clobber
 
             # Special path for mipsel: nightly + build-std, then upload via gh cli
             - name: Install nightly + rust-src (mipsel and mips)
@@ -583,14 +608,14 @@ jobs:
                   apks=(tg-ws-proxy-rs-android-*.apk)
                   luci=(luci-app-tg-ws-proxy-rs-*.apk luci-app-tg-ws-proxy-rs_*.ipk)
 
-                  # 10 archives from `upload-assets`, 6 `-upx` ones from
+                  # 12 archives from `upload-assets`, 6 `-upx` ones from
                   # `compress-assets`, 2 LuCI packages, 4 APKs. The total is what
-                  # catches an asset from the four macOS/Windows targets going
+                  # catches an asset from the six macOS/Windows targets going
                   # missing without spelling out archive names this job never
                   # chose; the per-group counts say which path came up short.
-                  if [[ "${#all[@]}" -ne 22 || "${#musl[@]}" -ne 12 ||
+                  if [[ "${#all[@]}" -ne 24 || "${#musl[@]}" -ne 12 ||
                         "${#apks[@]}" -ne 4 || "${#luci[@]}" -ne 2 ]]; then
-                      echo "::error::release carries ${#all[@]} assets, expected 22: ${#musl[@]}/12 musl tarballs, ${#apks[@]}/4 APKs, ${#luci[@]}/2 LuCI packages"
+                      echo "::error::release carries ${#all[@]} assets, expected 24: ${#musl[@]}/12 musl tarballs, ${#apks[@]}/4 APKs, ${#luci[@]}/2 LuCI packages"
                       printf '%s\n' "${all[@]}"
                       exit 1
                   fi

@@ -17,6 +17,17 @@ empty until you remove it. That is the default and not a failed start: drop
 lines. The `tg://` link appears either way — it reaches the UI from the listen
 callback rather than by scraping the log, so `--quiet` never hides it.
 
+## Quick Settings tile
+
+Pull down the notification shade, open the tile editor (the pencil icon) and
+drag **TG WS Proxy** into the active tiles. Tapping it starts or stops the
+proxy with the arguments last saved in the app, so set them up there once.
+The tile shows the same running state as the app's Start/Stop button.
+
+If the system refuses to start the proxy from the tile (some vendor builds
+restrict starting a foreground service outside the app), the tile opens the
+app instead, and **Start** there works as usual.
+
 ## Requirements
 
 - JDK 17+ already on `PATH`. The Gradle wrapper downloads *Gradle*, not a JDK:
