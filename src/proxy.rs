@@ -858,8 +858,10 @@ impl Route<'_> {
     /// Each tier runs with the same pool, cooldown and fronting behavior it
     /// has in the default ladder; the first tier that produces a connection
     /// wins.  A tier that is not configured — or not reachable, like `ws` for
-    /// a DC without a `--dc-ip` target — is skipped with a log line, so the
-    /// user can see the pin referring to nothing.  When every listed tier
+    /// a DC without a `--dc-ip` target — is skipped with a debug line: a pin
+    /// plus `--dc-ip` for only some DCs is an ordinary setup, and a warning
+    /// per connection would only repeat what the banner's `Target DC IPs`
+    /// already says (#160).  When every listed tier
     /// fails, the connection is dropped: pinning is opt-in, so tiers the user
     /// left out are not quietly re-added as fallbacks.
     ///
@@ -891,7 +893,7 @@ impl Route<'_> {
             match tier {
                 UpstreamTier::Ws => {
                     let Some(target_ip) = target_ip else {
-                        warn!(
+                        debug!(
                             "[{}] DC{}{} pinned ws tier has no --dc-ip target, skipping",
                             self.label, self.dc, self.media
                         );
@@ -915,7 +917,7 @@ impl Route<'_> {
                 }
                 UpstreamTier::Cfworker => {
                     let Some(dst) = self.runtime.fallback_ip(self.dc).or(target_ip) else {
-                        warn!(
+                        debug!(
                             "[{}] DC{}{} pinned cfworker tier has no destination IP, skipping",
                             self.label, self.dc, self.media
                         );
@@ -943,7 +945,7 @@ impl Route<'_> {
                 }
                 UpstreamTier::Tcp => {
                     let Some(dst) = self.runtime.fallback_ip(self.dc).or(target_ip) else {
-                        warn!(
+                        debug!(
                             "[{}] DC{}{} pinned tcp tier has no fallback IP, skipping",
                             self.label, self.dc, self.media
                         );

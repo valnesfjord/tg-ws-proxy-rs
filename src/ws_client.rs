@@ -524,6 +524,10 @@ async fn connect_cf_with_path(
 /// Split out from `connect_ws_with_path` so it can be exercised in tests
 /// against a stream connected to an arbitrary local port — the public
 /// connect functions always dial `:443`, Telegram's real WS port.
+#[expect(
+    clippy::result_large_err,
+    reason = "passes tokio-tungstenite's own result through; the caller matches on it at once"
+)]
 async fn tls_handshake_and_upgrade<R>(
     tcp: TcpStream,
     request: R,

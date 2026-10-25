@@ -12,7 +12,10 @@
 
 mod http;
 
-use tracing::warn;
+use std::future::Future;
+use std::time::Duration;
+
+use tracing::{debug, warn};
 
 use crate::outbound::OutboundConnector;
 use http::https_get;
@@ -72,7 +75,9 @@ fn parse_domain_list(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn fallback_domains() -> Vec<String> {
+/// The decoded built-in list `--default-domains` serves from until a fetch
+/// succeeds.
+pub fn fallback_domains() -> Vec<String> {
     FALLBACK_ENCODED
         .iter()
         .filter_map(|s| deobfuscate(s))
@@ -93,16 +98,8 @@ pub async fn fetch_default_domains() -> Vec<String> {
 /// connector, deobfuscate it, and return the decoded domains. Falls back to
 /// the embedded list on any error.
 pub async fn fetch_default_domains_with_outbound(outbound: &OutboundConnector) -> Vec<String> {
-    match https_get(DOMAINS_URL_HOST, DOMAINS_URL_PATH, outbound).await {
-        Ok(body) => {
-            let domains = parse_domain_list(&body);
-            if domains.is_empty() {
-                warn!("Default domain list from GitHub was empty; using built-in fallback");
-                fallback_domains()
-            } else {
-                domains
-            }
-        }
+    match try_fetch_default_domains(outbound).await {
+        Ok(domains) => domains,
         Err(e) => {
             warn!(
                 "Failed to fetch default CF domain list ({}); using built-in fallback",
@@ -111,6 +108,59 @@ pub async fn fetch_default_domains_with_outbound(outbound: &OutboundConnector) -
             fallback_domains()
         }
     }
+}
+
+/// Fetch and decode the default CF-proxy domain list, without falling back.
+///
+/// An empty list is an error too: it would leave `--default-domains`
+/// contributing nothing, which is worse than the built-in five.
+pub async fn try_fetch_default_domains(
+    outbound: &OutboundConnector,
+) -> Result<Vec<String>, String> {
+    let body = https_get(DOMAINS_URL_HOST, DOMAINS_URL_PATH, outbound).await?;
+    let domains = parse_domain_list(&body);
+    if domains.is_empty() {
+        return Err("the list from GitHub was empty".to_string());
+    }
+    Ok(domains)
+}
+
+/// Delays between background re-fetches after the startup fetch failed.
+///
+/// The startup fetch runs before the listener binds, which on a router is
+/// routinely before the uplink or DNS is up (#159).  The built-in list keeps
+/// the proxy serving meanwhile, but it is the smallest list there is, and
+/// without a retry it stayed in use until the next restart.  Doubling from
+/// 15 s reaches a 5-minute cap and gives up after about an hour: past that the
+/// network is up and GitHub itself is what is unreachable, and one more GET
+/// every few minutes for the rest of the run would buy nothing.
+pub fn refetch_delays() -> impl Iterator<Item = Duration> {
+    const FIRST: Duration = Duration::from_secs(15);
+    const CAP: Duration = Duration::from_secs(300);
+    const ATTEMPTS: usize = 15;
+    std::iter::successors(Some(FIRST), |d| Some((*d * 2).min(CAP))).take(ATTEMPTS)
+}
+
+/// Retry `fetch` after each of `delays` until it yields a list.
+///
+/// Returns `None` once `delays` runs out.  Failures are logged at debug: the
+/// caller has already warned once that the built-in list is in use.
+pub async fn refetch<F, Fut>(
+    delays: impl IntoIterator<Item = Duration>,
+    mut fetch: F,
+) -> Option<Vec<String>>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Vec<String>, String>>,
+{
+    for delay in delays {
+        tokio::time::sleep(delay).await;
+        match fetch().await {
+            Ok(domains) => return Some(domains),
+            Err(e) => debug!("Default CF domain list re-fetch failed: {}", e),
+        }
+    }
+    None
 }
 
 #[cfg(test)]
