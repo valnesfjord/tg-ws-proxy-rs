@@ -618,8 +618,8 @@ pub struct Config {
     /// configure their own Cloudflare DNS zone.
     ///
     /// The fetched domains are appended after any domains supplied with
-    /// `--cf-domain`.  If the fetch fails the proxy falls back to a small
-    /// built-in list.
+    /// `--cf-domain`.  If the fetch fails the proxy serves from a small
+    /// built-in list and re-fetches in the background for about an hour.
     ///
     /// Source:
     ///   https://github.com/Flowseal/tg-ws-proxy/blob/main/.github/cfproxy-domains.txt

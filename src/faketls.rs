@@ -267,10 +267,12 @@ pub fn parse_faketls_client_hello(record: &[u8], secret: &[u8]) -> Option<FakeTl
 /// `ee` flow from a single ServerHello field.  Pick the client's first TLS 1.3
 /// suite instead, as the official MTProxy does; GREASE never matches `0x13 0x0N`.
 fn select_tls13_cipher_suite(cipher_suites: &[u8]) -> [u8; 2] {
-    cipher_suites
-        .chunks_exact(2)
+    let (suites, _) = cipher_suites.as_chunks::<2>();
+    suites
+        .iter()
+        .copied()
         .find(|suite| suite[0] == 0x13 && (0x01..=0x03).contains(&suite[1]))
-        .map_or([0x13, 0x01], |suite| [suite[0], suite[1]])
+        .unwrap_or([0x13, 0x01])
 }
 
 fn parse_sni_extension(mut extensions: &[u8]) -> Option<String> {

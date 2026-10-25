@@ -10,7 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
+use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::check;
@@ -129,6 +130,9 @@ pub async fn run_with_listen(
     // Done once here so both --check mode and the normal server path share
     // the same fetched list.  The fetch selects on `shutdown` so an embedder
     // can cancel a slow fetch instead of blocking a stop for the full timeout.
+    // A failed fetch serves from the built-in list and, once serving, keeps
+    // retrying in the background — see `default_domains::refetch_delays`.
+    let mut refetch_onto = None;
     if config.default_domains {
         info!("Fetching default CF proxy domain list from GitHub…");
         let fetched = tokio::select! {
@@ -136,10 +140,25 @@ pub async fn run_with_listen(
                 info!("proxy stopped");
                 return Ok(());
             }
-            fetched = default_domains::fetch_default_domains_with_outbound(runtime.outbound()) => fetched,
+            fetched = default_domains::try_fetch_default_domains(runtime.outbound()) => fetched,
         };
-        info!("  Got {} default CF domain(s)", fetched.len());
-        config.cf_domains.extend(fetched);
+        match fetched {
+            Ok(fetched) => {
+                info!("  Got {} default CF domain(s)", fetched.len());
+                config.cf_domains.extend(fetched);
+            }
+            Err(e) => {
+                let builtin = default_domains::fallback_domains();
+                warn!(
+                    "Failed to fetch default CF domain list ({}); using the {} built-in \
+                     domain(s) until a background re-fetch succeeds",
+                    e,
+                    builtin.len()
+                );
+                refetch_onto = Some(config.cf_domains.clone());
+                config.cf_domains.extend(builtin);
+            }
+        }
     }
 
     // ── Pinned upstream sanity ───────────────────────────────────────────
@@ -395,6 +414,17 @@ pub async fn run_with_listen(
     // Shared for the rest of the process: every connection reads the same
     // settings, so they are behind one `Arc` instead of a per-connection clone.
     let config = Arc::new(config);
+    // Connections take their settings from here, so a re-fetched domain list
+    // reaches every connection accepted after it lands.
+    let (config_tx, config_rx) = watch::channel(Arc::clone(&config));
+    let _refetch = match refetch_onto {
+        Some(own_domains) if !config.check => Some(AbortOnDrop(tokio::spawn(refetch_domains(
+            config_tx,
+            own_domains,
+            Arc::clone(&runtime),
+        )))),
+        _ => None,
+    };
     {
         let pool_clone = pool.clone();
         let config_clone = Arc::clone(&config);
@@ -458,7 +488,7 @@ pub async fn run_with_listen(
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, peer_addr)) => {
-                        let cfg = Arc::clone(&config);
+                        let cfg = Arc::clone(&config_rx.borrow());
                         let pool = pool.clone();
                         let runtime = Arc::clone(&runtime);
                         tokio::spawn(async move {
@@ -499,4 +529,48 @@ pub async fn run_with_listen(
 
     info!("proxy stopped");
     Ok(())
+}
+
+/// Aborts the task when dropped, so a background task started by
+/// [`run_with_listen`] ends with it rather than outliving a stopped proxy in
+/// an embedder that keeps its runtime.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Re-fetch the `--default-domains` list after the startup fetch failed, and
+/// swap it in for the built-in one once it arrives.
+///
+/// `own_domains` is the `--cf-domain` list the fetched one is appended to,
+/// exactly as at startup.  The pool's spares were opened through the built-in
+/// domains and are left alone: they still work, and refill through whichever
+/// domain the next connection answers on.
+async fn refetch_domains(
+    config_tx: watch::Sender<Arc<Config>>,
+    own_domains: Vec<String>,
+    runtime: Arc<Runtime>,
+) {
+    let fetched = default_domains::refetch(default_domains::refetch_delays(), || {
+        default_domains::try_fetch_default_domains(runtime.outbound())
+    })
+    .await;
+    let Some(fetched) = fetched else {
+        warn!(
+            "Giving up on re-fetching the default CF domain list; the built-in list stays in use"
+        );
+        return;
+    };
+
+    info!(
+        "Re-fetched the default CF domain list: {} domain(s) now in use",
+        fetched.len()
+    );
+    let mut next = Config::clone(&config_tx.borrow());
+    next.cf_domains = own_domains;
+    next.cf_domains.extend(fetched);
+    config_tx.send_replace(Arc::new(next));
 }
