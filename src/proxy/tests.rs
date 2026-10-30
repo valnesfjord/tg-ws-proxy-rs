@@ -593,3 +593,75 @@ async fn a_zero_ip_fail_cooldown_starts_no_probe() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(dials.load(Ordering::SeqCst), 0);
 }
+
+// ─── Pool spares under `--cf-balance` ────────────────────────────────────────
+
+#[test]
+fn a_balanced_cf_proxy_spare_is_dialled_at_the_kws_record() {
+    // #161: with `--cf-balance` the spare's domain comes from the rotation,
+    // which holds bare zones.  The pool dials it as-is, so every balanced
+    // spare went to the zone apex — no record there, a 530 from Cloudflare,
+    // and half of the `/apiws` requests in the reporter's analytics failing.
+    let config = ladder_config(&[
+        "--cf-domain",
+        "a.example",
+        "--cf-domain",
+        "b.example",
+        "--cf-balance",
+    ]);
+    let runtime = Arc::new(Runtime::new(OutboundConnector::direct()));
+    let pool = Arc::new(WsPool::with_runtime(
+        0,
+        Duration::from_secs(55),
+        Arc::clone(&runtime),
+    ));
+    let route = ladder_route(&config, &runtime, &pool, 203);
+    let counter = AtomicUsize::new(0);
+
+    let picks: Vec<_> = (0..2)
+        .map(|_| {
+            route
+                .cf_target(
+                    CfTier::Proxy,
+                    "",
+                    "kws203.a.example",
+                    &config.cf_domains,
+                    &counter,
+                )
+                .domain
+        })
+        .collect();
+    assert_eq!(picks, ["kws203.a.example", "kws203.b.example"]);
+
+    // A Worker is dialled at its own name; there is no record to expand.
+    let workers = vec!["w.example".to_string()];
+    let worker = route.cf_target(
+        CfTier::Worker,
+        "149.154.167.51",
+        "w.example",
+        &workers,
+        &counter,
+    );
+    assert_eq!(worker.domain, "w.example");
+}
+
+#[test]
+fn an_unbalanced_cf_proxy_spare_keeps_the_record_that_answered() {
+    let config = ladder_config(&["--cf-domain", "a.example", "--cf-domain", "b.example"]);
+    let runtime = Arc::new(Runtime::new(OutboundConnector::direct()));
+    let pool = Arc::new(WsPool::with_runtime(
+        0,
+        Duration::from_secs(55),
+        Arc::clone(&runtime),
+    ));
+    let route = ladder_route(&config, &runtime, &pool, 2);
+
+    let target = route.cf_target(
+        CfTier::Proxy,
+        "",
+        "kws2.b.example",
+        &config.cf_domains,
+        &AtomicUsize::new(0),
+    );
+    assert_eq!(target.domain, "kws2.b.example");
+}
