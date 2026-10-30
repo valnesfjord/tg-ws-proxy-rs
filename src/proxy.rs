@@ -54,8 +54,9 @@ use crate::pool::{CfTarget, CfTier, WsPool};
 use crate::runtime::Runtime;
 use crate::splitter::MsgSplitter;
 use crate::ws_client::{
-    CfDialOpts, CooldownMap, TgWsStream, WsAttempt, connect_cf_worker_ws_for_dc_with_outbound_opts,
-    connect_cf_ws_for_dc_with_outbound_ordered, connect_ws_for_dc_with_outbound, media_tag,
+    CfDialOpts, CooldownMap, TgWsStream, WsAttempt, cf_record,
+    connect_cf_worker_ws_for_dc_with_outbound_opts, connect_cf_ws_for_dc_with_outbound_ordered,
+    connect_ws_for_dc_with_outbound, media_tag,
 };
 
 type TcpReader = OwnedReadHalf;
@@ -1049,6 +1050,12 @@ impl Route<'_> {
     /// balancing — roughly every other connection is a pool hit — so the spare
     /// is opened through the next domain in the rotation instead.
     ///
+    /// `domain` is what the pool dials as-is: the Worker's own hostname, or
+    /// for the proxy tier the expanded `kws{N}` record.  The rotation holds
+    /// bare `--cf-domain` zones, so a proxy-tier pick from it has to be
+    /// expanded the same way the inline walk does — dialled bare, it hit the
+    /// zone apex, which has no record, and every balanced spare failed (#161).
+    ///
     /// `dst` is only meaningful for [`CfTier::Worker`] — the DC IP its tunnel
     /// opens onto.
     fn cf_target(
@@ -1059,13 +1066,15 @@ impl Route<'_> {
         rotation: &[String],
         counter: &AtomicUsize,
     ) -> CfTarget {
-        let domain = if self.config.cf_balance {
-            domain_order(rotation, balance_offset(rotation, true, counter))
-                .next()
-                .unwrap_or(domain)
-                .to_string()
-        } else {
-            domain.to_string()
+        let next = self
+            .config
+            .cf_balance
+            .then(|| domain_order(rotation, balance_offset(rotation, true, counter)).next())
+            .flatten();
+        let domain = match (next, tier) {
+            (Some(zone), CfTier::Proxy) => cf_record(self.dc, zone),
+            (Some(worker), CfTier::Worker) => worker.to_string(),
+            (None, _) => domain.to_string(),
         };
 
         CfTarget {

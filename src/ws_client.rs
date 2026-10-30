@@ -732,8 +732,14 @@ pub async fn connect_ws_for_dc_with_outbound(
 pub fn cf_ws_domains(dc: u32, cf_domains: &[String], _is_media: bool) -> Vec<String> {
     cf_domains
         .iter()
-        .map(|cf_domain| format!("kws{}.{}", dc, cf_domain))
+        .map(|cf_domain| cf_record(dc, cf_domain))
         .collect()
+}
+
+/// The `kws{N}` record of one `--cf-domain` zone — the only name in the zone
+/// that is ever dialled.
+pub(crate) fn cf_record(dc: u32, cf_domain: &str) -> String {
+    format!("kws{}.{}", dc, cf_domain)
 }
 
 /// Ordering policy for the Cloudflare connect loop.
@@ -808,7 +814,7 @@ impl<'a> CfAttempts<'a> {
     }
 
     fn hostname(&self, domain_index: usize) -> String {
-        format!("kws{}.{}", self.dc, self.domains[domain_index])
+        cf_record(self.dc, &self.domains[domain_index])
     }
 }
 
