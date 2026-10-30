@@ -39,6 +39,10 @@ a `-upx` variant that is ~70% smaller on disk, for routers where flash is
 tight — see [docs/Building.md](docs/Building.md#shrinking-the-binary-for-flash-constrained-devices)
 for the RAM trade-off that comes with it.
 
+On Windows 7 and 8, take `tg-ws-proxy-x86_64-win7-windows-msvc.zip` (or the
+`i686` one for 32-bit Windows). The regular `x86_64-pc-windows-gnu` build needs
+Windows 10 or newer.
+
 The Android app ships on the same page. Take
 `tg-ws-proxy-rs-android-<version>-universal.apk` unless you know your phone's
 ABI — the per-ABI `arm64-v8a`, `armeabi-v7a` and `x86_64` builds are about a
