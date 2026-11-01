@@ -553,4 +553,31 @@ fi
     exit 1
 }
 
+# A proxy started from an SSH session must outlive the session (#164). The
+# binary here hangs up on itself, which is what closing that session does to
+# it, and only leaves its marker if it is still alive afterwards.
+hup="$tmp/sighup"
+mkdir -p "$hup/bin" "$hup/etc/init.d" "$hup/etc/tg-ws-proxy-rs" "$hup/var/log"
+ENTWARE_ROOT="$hup"
+ENTWARE_INIT="$hup/etc/init.d/S99tg-ws-proxy-rs"
+ENTWARE_CONF_DIR="$hup/etc/tg-ws-proxy-rs"
+printf 'PORT="2443"\n' > "$ENTWARE_CONF_DIR/config.conf"
+printf 'SECRET=deadbeefdeadbeefdeadbeefdeadbeef\n' > "$ENTWARE_CONF_DIR/secret.conf"
+write_entware_init
+# shellcheck disable=SC2016 # The $$ belongs to the stub binary.
+printf '#!/bin/sh\nkill -HUP $$\n: > "%s/survived"\n' "$hup" > "$hup/bin/tg-ws-proxy-rs"
+# Nothing ever looks started, so start() gives up at once instead of polling.
+printf '#!/bin/sh\nexit 1\n' > "$hup/bin/pidof"
+printf '#!/bin/sh\nexit 1\n' > "$hup/bin/netstat"
+chmod +x "$hup/bin/tg-ws-proxy-rs" "$hup/bin/pidof" "$hup/bin/netstat"
+"$ENTWARE_INIT" start >/dev/null 2>&1 || true
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+	[[ -f "$hup/survived" ]] && break
+	sleep 0.2
+done
+[[ -f "$hup/survived" ]] || {
+	printf 'FAIL: the proxy started by the init script dies on SIGHUP\n' >&2
+	exit 1
+}
+
 printf 'PASS: installer contract\n'
