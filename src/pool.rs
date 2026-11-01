@@ -96,7 +96,8 @@ pub struct CfTarget {
     /// Telegram DC IP the Worker opens its TCP tunnel to.  Unused by
     /// [`CfTier::Proxy`], which reaches the DC through Cloudflare's own routing.
     pub dst: String,
-    /// The domain that just served a connection for this tier.
+    /// The hostname the spare is dialled at, exactly: the Worker's own name,
+    /// or the proxy tier's expanded `kws{N}` record.
     pub domain: String,
     pub skip_tls_verify: bool,
     pub connect_timeout: Duration,

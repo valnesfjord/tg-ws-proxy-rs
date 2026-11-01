@@ -112,6 +112,13 @@ Stepped over, not written off: if every fallback tier is also failing, the
 address is re-probed rather than leaving the client on raw TCP for the rest of
 the window, and the first direct connect that succeeds clears the cooldown.
 
+When the window runs out, no client is sent to find out whether the address is
+back. A background probe dials it first, and clients keep stepping over it
+until that probe answers. If the address responds at all, the cooldown is
+cleared. If it times out again, a new window starts. Before 2.5.7, the first
+client after the window paid the full connect timeout, which is longer than
+Telegram's own proxy check waits.
+
 Every connection retries every configured CF domain fresh — a failure isn't
 remembered across connections (matching upstream tg-ws-proxy), so one flaky
 domain can never block the others, or the whole DC, from being tried.
@@ -275,8 +282,12 @@ At startup the proxy fetches an obfuscated domain list from
 [Flowseal/tg-ws-proxy](https://github.com/Flowseal/tg-ws-proxy/blob/main/.github/cfproxy-domains.txt),
 deobfuscates it, and appends the decoded domains after any explicit
 `--cf-domain` entries. If the fetch fails (network not yet available, GitHub
-unreachable) the proxy falls back to a small built-in list and logs a warning —
-it will still start normally.
+unreachable) the proxy starts normally on a small built-in list, logs a
+warning, and keeps re-fetching in the background — after 15 s, then backing
+off to every 5 minutes, for about an hour. When a re-fetch succeeds the full
+list is used for every new connection, and the log says so. A router that
+boots before its uplink is up no longer stays on the built-in list until the
+next restart.
 
 > **Note:** These are community-maintained domains; availability may change
 > over time. For maximum reliability, consider setting up your own Cloudflare

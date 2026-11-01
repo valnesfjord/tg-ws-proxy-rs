@@ -57,6 +57,25 @@ cargo zigbuild --release --target x86_64-pc-windows-gnu           # Windows x86-
 > and then set `SDKROOT` / `MACOSX_DEPLOYMENT_TARGET` appropriately before
 > running `cargo zigbuild`.
 
+## Windows 7
+
+Rust's regular Windows targets need Windows 10 since Rust 1.78. The
+`*-win7-windows-msvc` targets still run on 7, but they are tier 3, so they
+need nightly and a standard library built from source. On Windows with the
+MSVC build tools:
+
+```powershell
+rustup toolchain install nightly --component rust-src
+$env:RUSTFLAGS = "-C target-feature=+crt-static"
+cargo +nightly build --release --bin tg-ws-proxy --target x86_64-win7-windows-msvc -Z build-std=std,panic_abort
+```
+
+`+crt-static` links the C runtime in, so the exe does not need the Visual C++
+redistributable or the Universal CRT, which a stock Windows 7 lacks. Use
+`i686-win7-windows-msvc` for 32-bit. The release build does the same in
+`.github/scripts/build-win7.sh`, which also fails the build if the exe imports
+any API that only exists from Windows 8 on.
+
 ## Cross-compilation for OpenWrt
 
 OpenWrt uses musl libc and runs on MIPS, ARM, and ARM64 CPUs. A fully static

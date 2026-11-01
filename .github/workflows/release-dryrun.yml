@@ -157,6 +157,33 @@ jobs:
                   path: target/${{ matrix.target }}/release/tg-ws-proxy
                   if-no-files-found: error
 
+    # The Windows 7 legs are release-only too, and tier 3 on a floating
+    # nightly: the likeliest thing to break between two tags. Same script as
+    # release.yml, minus the upload.
+    win7:
+        name: build ${{ matrix.target }}
+        runs-on: windows-latest
+        strategy:
+            fail-fast: false
+            matrix:
+                target: [x86_64-win7-windows-msvc, i686-win7-windows-msvc]
+        steps:
+            - uses: actions/checkout@v6
+
+            - uses: dtolnay/rust-toolchain@nightly
+              with:
+                  components: rust-src, llvm-tools
+
+            - name: Build and check
+              shell: bash
+              run: .github/scripts/build-win7.sh "${{ matrix.target }}" "tg-ws-proxy-${{ matrix.target }}.zip"
+
+            - uses: actions/upload-artifact@v7
+              with:
+                  name: win7-${{ matrix.target }}
+                  path: tg-ws-proxy-${{ matrix.target }}.zip
+                  if-no-files-found: error
+
     android-release:
         name: rehearse the android release job
         runs-on: ubuntu-latest
