@@ -170,24 +170,30 @@ fn destination_dc(ip: IpAddr, config: &Config) -> Option<i16> {
         })
 }
 
-/// Unknown destinations already reported at warn level. Telegram retries a
-/// refused DC every few seconds, and one warning per attempt would flush a
-/// router's small log ring. Bounded, so a client cycling through addresses
-/// cannot grow it: an evicted address is merely reported again.
-static REPORTED_UNKNOWN: Mutex<VecDeque<IpAddr>> = Mutex::new(VecDeque::new());
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReportKind {
+    NotTelegram,
+    HeaderDc,
+    MissingDc,
+}
+
+/// Telegram retries a refused DC every few seconds, so reports are bounded
+/// and deduplicated by address and outcome. A successful header lookup must
+/// not suppress a later warning when another client cannot name the DC.
+static REPORTED_UNKNOWN: Mutex<VecDeque<(IpAddr, ReportKind)>> = Mutex::new(VecDeque::new());
 const REPORTED_UNKNOWN_CAP: usize = 64;
 
-fn first_report(ip: IpAddr) -> bool {
+fn first_report(ip: IpAddr, kind: ReportKind) -> bool {
     let mut reported = REPORTED_UNKNOWN
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    if reported.contains(&ip) {
+    if reported.contains(&(ip, kind)) {
         return false;
     }
     if reported.len() == REPORTED_UNKNOWN_CAP {
         reported.pop_front();
     }
-    reported.push_back(ip);
+    reported.push_back((ip, kind));
     true
 }
 
@@ -267,7 +273,7 @@ async fn negotiate(stream: &mut TcpStream, config: &Config) -> io::Result<(IpAdd
     let ip = host.to_canonical();
     let dc = destination_dc(ip, config);
     if dc.is_none() && !is_telegram(ip) {
-        if first_report(ip) {
+        if first_report(ip, ReportKind::NotTelegram) {
             warn!(
                 "SOCKS destination {}:{} is not a Telegram address; check what the \
                  router sends here (repeats for this address are logged at debug level)",
@@ -367,7 +373,7 @@ impl Inbound for Socks5 {
         let dc_idx = match (mapped, transport.named_dc) {
             (Some(dc), _) => dc,
             (None, Some(dc)) => {
-                if first_report(ip) {
+                if first_report(ip, ReportKind::HeaderDc) {
                     info!(
                         "SOCKS destination {} is not in the DC map; routing it as {} by \
                          its transport header (pin it with --socks-dc {}:{})",
@@ -380,7 +386,7 @@ impl Inbound for Socks5 {
                 dc
             }
             (None, None) => {
-                if first_report(ip) {
+                if first_report(ip, ReportKind::MissingDc) {
                     warn!(
                         "SOCKS destination {} is a Telegram address missing from the DC map, \
                          and its transport names no DC: these connections fail, often as \

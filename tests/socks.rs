@@ -385,3 +385,101 @@ async fn an_unmapped_telegram_address_without_a_named_dc_is_closed() {
     );
     task.await.unwrap();
 }
+
+#[tokio::test]
+async fn a_header_routed_address_still_warns_when_another_client_cannot_name_its_dc() {
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+    impl Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let writer_logs = Arc::clone(&logs);
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(move || LogWriter(Arc::clone(&writer_logs)))
+        .finish();
+    // Other tests register tracing callsites concurrently with these tasks.
+    tracing::subscriber::set_global_default(subscriber).unwrap();
+
+    let cfg = Config::try_parse_from([
+        "test",
+        "--pool-size",
+        "0",
+        "--no-outbound-proxy",
+        "--dc-ip",
+        "4:127.0.0.1",
+        "--pinned-upstream",
+        "ws",
+        "--ws-connect-timeout",
+        "1",
+    ])
+    .unwrap()
+    .with_defaults();
+    let ip = "149.154.164.8".parse().unwrap();
+    let (mut desktop, desktop_task) = start(cfg.clone()).await;
+    greet(&mut desktop).await;
+    assert_eq!(request(&mut desktop, ip, 443, 1).await, 0);
+    desktop
+        .write_all(&generate_relay_init(ProtoTag::Abridged, -4))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if String::from_utf8_lossy(&logs.lock().unwrap())
+                .lines()
+                .any(|line| {
+                    line.contains("149.154.164.8")
+                        && line.contains("routing it as DC4 media by its transport header")
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("header routing was not logged");
+    desktop_task.abort();
+    let _ = desktop_task.await;
+
+    for _ in 0..2 {
+        let (mut client, task) = start(cfg.clone()).await;
+        greet(&mut client).await;
+        assert_eq!(request(&mut client, ip, 443, 1).await, 0);
+        // Android's secretless transport leaves the DC bytes random.
+        client
+            .write_all(&generate_relay_init(ProtoTag::Abridged, 42))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    let output = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        output
+            .lines()
+            .filter(|line| {
+                line.contains("149.154.164.8") && line.contains("and its transport names no DC")
+            })
+            .count(),
+        1,
+        "{output}"
+    );
+}

@@ -138,8 +138,9 @@ An address missing from both maps is handled by where it is:
 - **Outside them**: refused (`not a Telegram address`), with no generic direct proxy
   fallback. That is a routing rule sending the wrong traffic here.
 
-Each address is logged once; repeats go to debug level, since Telegram retries a
-refused DC every few seconds.
+Each outcome is logged once per address; repeated rejections go to debug level,
+since Telegram retries a refused DC every few seconds. A successful header lookup
+does not hide a later warning for a client that cannot name the DC.
 
 Supported: SOCKS5 no-auth CONNECT, IPv4/IPv6 addresses (including IP literals encoded
 as SOCKS DOMAIN) on any destination port, MTProto abridged/intermediate/padded
