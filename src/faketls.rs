@@ -37,6 +37,10 @@ const TLS_RECORD_VERSION: [u8; 2] = [0x03, 0x01];
 
 /// Maximum TLS record payload (RFC 8446 §5.1: 2^14 bytes).
 pub const TLS_MAX_RECORD_PAYLOAD: usize = 16_384;
+/// AEAD expansion allowance over a full TLS record payload (RFC 8446 §5.2
+/// caps a ciphertext record at 2^14 + 256).  The 5-byte record header is read
+/// separately and never lands in these buffers.
+pub const TLS_READ_HEADROOM: usize = 256;
 /// Maximum Application Data payload per record.
 const TLS_MAX_APPDATA_WRITE: usize = TLS_MAX_RECORD_PAYLOAD;
 /// Maximum number of TLS records to read during the server's fake handshake.

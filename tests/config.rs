@@ -779,3 +779,31 @@ fn split_cli_args_rejects_trailing_backslash() {
     let err = tg_ws_proxy_rs::config::split_cli_args(r"--secret abc\").unwrap_err();
     assert!(err.contains("trailing backslash"), "{err}");
 }
+
+#[test]
+fn socks_is_opt_in_and_validates_destination_mappings() {
+    let cfg = Config::try_parse_from(["test"]).unwrap();
+    assert!(!cfg.socks_enabled);
+    assert!(cfg.socks_host.is_loopback());
+    assert_eq!(cfg.socks_port, 1080);
+    let cfg = Config::try_parse_from([
+        "test",
+        "--socks-enabled",
+        "--socks-host",
+        "::1",
+        "--socks-dc",
+        "-2:2001:db8::2,4:149.154.167.91",
+    ])
+    .unwrap();
+    assert!(cfg.socks_enabled);
+    assert_eq!(cfg.socks_dc[0].dc, -2);
+    assert_eq!(cfg.socks_dc[1].dc, 4);
+    for invalid in [
+        "0:127.0.0.1",
+        "6:127.0.0.1",
+        "2:not-an-ip",
+        "-32768:127.0.0.1",
+    ] {
+        assert!(Config::try_parse_from(["test", &format!("--socks-dc={invalid}")]).is_err());
+    }
+}

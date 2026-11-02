@@ -33,6 +33,9 @@ Two things worth setting explicitly in a container:
 
 ## Router deployment
 
+For the optional SOCKS5 listener and transparent routing with Forkop, see
+[SOCKS5 and Forkop](Forkop.md) ([на русском](Forkop.ru.md)).
+
 Run the proxy on your router without `--host` (or with `--host 0.0.0.0`) so it
 accepts connections from all LAN devices:
 
@@ -160,6 +163,10 @@ TG_PORT=1443
 TG_SECRET=0123456789abcdef0123456789abcdef
 TG_LINK_IP=192.168.1.1
 TG_LISTEN_FAKETLS_DOMAIN=www.yandex.ru
+TG_SOCKS_ENABLED=false
+TG_SOCKS_HOST=127.0.0.1
+TG_SOCKS_PORT=1080
+TG_SOCKS_DC=-2:203.0.113.10
 TG_POOL_SIZE=4
 TG_BUF_KB=256
 TG_MAX_CONNECTIONS=64

@@ -29,9 +29,11 @@ assert "luci-app-tg-ws-proxy-rs" in entry["depends"]["acl"]
 assert "tg-ws-proxy-rs" in acl["read"]["uci"]
 assert "tg-ws-proxy-rs" in acl["write"]["uci"]
 assert "/sbin/logread -e tg-ws-proxy-rs" in acl["read"]["file"]
-# Read-only probes: which release the binary is, and whether a stopped
-# service's port is held by another program.
-for probe in ("/usr/bin/tg-ws-proxy-rs --version", "/bin/netstat -lnt"):
+# Read-only probes: which release the binary is, whether a stopped
+# service's port is held by another program, and the connection links
+# (`--print-links` exits without binding anything).
+for probe in ("/usr/bin/tg-ws-proxy-rs --version", "/bin/netstat -lnt",
+              "/usr/bin/tg-ws-proxy-rs --print-links *"):
     assert acl["read"]["file"].get(probe) == ["exec"], probe
 assert "list" in acl["read"]["ubus"]["service"]
 assert "rc" not in acl["write"].get("ubus", {})
