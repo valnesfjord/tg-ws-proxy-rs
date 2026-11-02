@@ -1109,8 +1109,13 @@ start() {
 	if [ -d "${LOGFILE%/*}" ]; then
 		stderr_file="$LOGFILE"
 	fi
+	# SIGHUP is ignored before the exec, and an ignored signal stays ignored
+	# across it. Started by hand from an SSH or telnet session, the proxy is in
+	# that session, and the hangup the kernel sends when it closes killed it --
+	# the binary leaves SIGHUP at its default (#164). Neither nohup nor setsid is
+	# a given in the firmware's BusyBox; `trap` is the shell's own.
 	# shellcheck disable=SC2086 # EXTRA_ARGS is a list of arguments, not one.
-	"$PROG" "$@" $EXTRA_ARGS >/dev/null 2>>"$stderr_file" &
+	( trap '' HUP; exec "$PROG" "$@" $EXTRA_ARGS >/dev/null 2>>"$stderr_file" ) &
 
 	tries=0
 	while [ "$tries" -lt 15 ]; do
