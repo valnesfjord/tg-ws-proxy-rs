@@ -43,6 +43,7 @@ The LuCI/integration package owns:
 ```text
 /etc/init.d/tg-ws-proxy-rs
 /etc/config/tg-ws-proxy-rs
+/etc/capabilities/tg-ws-proxy-rs.json
 /usr/share/luci/menu.d/luci-app-tg-ws-proxy-rs.json
 /usr/share/rpcd/acl.d/luci-app-tg-ws-proxy-rs.json
 /usr/share/ucitrack/luci-app-tg-ws-proxy-rs.json
@@ -53,6 +54,27 @@ The LuCI/integration package owns:
 generation and legacy logging migration run from versioned OpenWrt installation
 hooks or `install.sh`; the procd init script only reads UCI and starts the
 process.
+
+## Service privileges
+
+The package creates a dedicated `tg-ws-proxy-rs` user and group, and procd
+starts the proxy with that identity. The root-owned init script reads the UCI
+config and passes its settings to the process, so the secret can remain in a
+root-only `0600` file. If the account is missing or has root IDs, the service
+refuses to start rather than letting procd fall back to root.
+
+For the default ports the proxy has no effective Linux capabilities. If the
+MTProto port or an enabled SOCKS5 port is below 1024, procd uses `procd-ujail`
+to grant only `CAP_NET_BIND_SERVICE` and set `no_new_privs`. The helper remains
+a root-owned supervisor while the proxy itself runs as the dedicated user.
+This setup uses ujail as a capability launcher; it does not create a filesystem
+or network namespace. The package depends on `procd-ujail`, so the device needs
+that package available when installing or upgrading.
+
+The capability profile belongs to the LuCI package, not the raw binary. Neither
+the installer nor a manual binary replacement needs `setcap`; procd applies the
+profile on each start. Port 443 must still be free: OpenWrt's web interface may
+already be listening there.
 
 ## Release assets
 
@@ -123,12 +145,13 @@ Only the three newest installer backup directories are retained after a
 successful installation. Process command and environment snapshots are captured
 only when importing a pre-existing manual installation without a UCI config.
 
-If the new binary cannot start, the previous binary, UCI config and service state
-are restored. A newly introduced LuCI package is removed as well. When an
-already-installed LuCI package was upgraded, it remains upgraded because neither
-APK nor opkg guarantees that the previous package artifact is locally available;
-the installer reports this limitation instead of claiming a full package
-rollback.
+If the new service cannot start, the previous binary, LuCI files, capability
+profile, UCI config and service state are restored. A previous release that ran
+as root therefore runs as root again after a rollback. A newly introduced LuCI
+package is removed as well. An already-installed package's metadata may remain
+upgraded because neither APK nor opkg guarantees that the previous package
+artifact is locally available. The next installer run reinstalls the package
+even if its version did not change, so its files match the package again.
 
 ## Upgrading from 2.2.3
 

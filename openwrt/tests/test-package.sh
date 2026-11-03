@@ -9,6 +9,7 @@ for file in \
     openwrt/build-luci-package.sh \
     openwrt/luci-app/Makefile \
     openwrt/luci-app/root/etc/config/tg-ws-proxy-rs \
+    openwrt/luci-app/root/etc/capabilities/tg-ws-proxy-rs.json \
     openwrt/luci-app/root/etc/init.d/tg-ws-proxy-rs \
     .github/workflows/release.yml; do
     [[ -f "$ROOT/$file" ]] || fail "missing $file"
@@ -23,6 +24,15 @@ grep -Eq '^[[:space:]]*PKGARCH:=all$' "$makefile" || fail 'LuCI recipe must decl
 grep -Fq 'include $(INCLUDE_DIR)/package.mk' "$makefile" || fail 'LuCI package does not use the standard package recipe'
 if grep -Fq '+tg-ws-proxy' "$makefile"; then fail 'architecture-independent LuCI package must not depend on a core package'; fi
 grep -Fq 'PKG_NAME:=luci-app-tg-ws-proxy-rs' "$makefile" || fail 'LuCI package is not named luci-app-tg-ws-proxy-rs'
+grep -Fq 'USERID:=tg-ws-proxy-rs:tg-ws-proxy-rs' "$makefile" || fail 'dedicated service user/group is missing'
+grep -Fq '+procd-ujail' "$makefile" || fail 'privileged-port helper is not a package dependency'
+python3 - "$ROOT/openwrt/luci-app/root/etc/capabilities/tg-ws-proxy-rs.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    profile = json.load(source)
+assert set(profile) == {"bounding", "effective", "permitted", "inheritable", "ambient"}
+assert all(value == ["CAP_NET_BIND_SERVICE"] for value in profile.values())
+PY
 grep -Fq '/etc/config/tg-ws-proxy-rs' "$makefile" || fail 'UCI conffile is not declared'
 # shellcheck disable=SC2016 # Match the literal package staging path in the recipe.
 grep -Fq 'chmod 0600 $(1)/etc/config/tg-ws-proxy-rs' "$makefile" || \
