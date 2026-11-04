@@ -1,7 +1,7 @@
 //! Shared per-process runtime state.
 //!
-//! Holds what every connection needs but nothing owns: the outbound connector
-//! and the always-on domain-fronting SNI.  The DC lookups are stateless
+//! Holds what every connection needs: the outbound connector, shared HTTP/2
+//! media lanes, and the always-on domain-fronting SNI. The DC lookups are stateless
 //! pass-throughs to `config`, kept as methods so call sites can take
 //! everything they need from one place.
 
@@ -12,6 +12,7 @@ use crate::config::{default_dc_ip, websocket_dc};
 use crate::outbound::OutboundConnector;
 
 pub struct Runtime {
+    pub(crate) h2: crate::cf_h2::Pool,
     outbound: OutboundConnector,
     /// Preferred Cloudflare edges from `--cf-ip`. Empty means DNS picks the
     /// anycast edge as usual.
@@ -29,6 +30,7 @@ pub struct Runtime {
 impl Runtime {
     pub fn new(outbound: OutboundConnector) -> Self {
         Self {
+            h2: crate::cf_h2::Pool::default(),
             outbound,
             cf_ips: Vec::new(),
             cf_fail_cooldown: Duration::from_secs(60),

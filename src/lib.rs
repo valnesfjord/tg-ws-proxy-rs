@@ -1,3 +1,4 @@
+mod cf_h2;
 pub mod check;
 pub mod config;
 pub mod crypto;

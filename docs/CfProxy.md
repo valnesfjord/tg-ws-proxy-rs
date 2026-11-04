@@ -163,3 +163,36 @@ Common causes:
 
 The check exits with status code `0` if all probes pass, or `1` if any fail,
 making it suitable for use in scripts or watchdog setups.
+
+## HTTP/2 media multiplexing
+
+Media connections (a negative DC number in the MTProto handshake) prefer
+HTTP/2 when the routing ladder reaches `cfproxy`. Each MTProto envelope becomes
+a POST to `https://kws{N}.{cf_domain}/api`; clients using the same domain and DC
+share one TCP/TLS connection. Ordinary connections, direct Telegram WebSockets
+and Cloudflare Worker tunnels keep their existing transports and priority.
+
+HTTP/2 is enabled by default. Use `--no-h2` or `TG_NO_H2=true` to force media
+back onto WebSocket. `--cf-disable-tls` also selects WebSocket: this path does
+not attempt plaintext HTTP/2. The domain must allow HTTP/2 and POST requests to
+`/api`, in addition to the existing `/apiws` endpoint.
+
+The proxy checks ALPN and sends a HEAD request before using a lane. Failed or
+blocked setup falls back to WebSocket without consuming client packets; failed
+domains enter the existing configurable CF cooldown. If a POST fails after the
+session has started, the native connection closes so Telegram can reconnect;
+consumed packets are not silently moved into a different transport. Small
+recent encrypted requests may be reposted up to three times within 30 seconds
+to retrieve delayed replies; auth-key setup and large upload bodies are never
+replayed.
+
+`--cf-ip`, `--cf-balance`, outbound proxies and certificate verification apply
+to HTTP/2 as well. A pinned `cfproxy` tier includes both HTTP/2 and its WebSocket
+fallback; `--no-h2` disables only the former.
+
+Multiplexing saves sockets but requires complete envelopes for HTTP framing.
+Packets are limited to 4 MiB; each lane allows 16 requests and a shared 16 MiB
+payload budget, with at most four active requests per native client (one slot
+reserved for delayed replies). These limits apply to payloads; TLS/H2 buffers
+and the packet currently being read also consume memory. Backpressure and
+cancellation release stream capacity when clients disconnect.

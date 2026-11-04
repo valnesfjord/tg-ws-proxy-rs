@@ -400,3 +400,76 @@ pub async fn await_proxy_handler(handler: JoinHandle<()>) {
         .expect("proxy handler timed out")
         .expect("proxy handler panicked");
 }
+
+/// A TLS/H2 origin reached through a fake CONNECT proxy. Captures the dial
+/// target, TLS SNI and each HTTP request; echoes POST bodies. Keeping accept
+/// counts visible lets routing tests prove multiplexing across native clients.
+pub async fn h2_echo_proxy() -> (
+    SocketAddr,
+    tokio::sync::mpsc::UnboundedReceiver<String>,
+    JoinHandle<()>,
+) {
+    install_rustls_provider();
+    let cert = rcgen::generate_simple_self_signed(vec!["kws2.h2.example".into()]).unwrap();
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![rustls_pki_types::CertificateDer::from(
+                cert.serialize_der().unwrap(),
+            )],
+            rustls_pki_types::PrivatePkcs8KeyDer::from(cert.serialize_private_key_der()).into(),
+        )
+        .unwrap();
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let tx = tx.clone();
+            let acceptor = acceptor.clone();
+            connections.spawn(async move {
+                tx.send(read_http_connect_request(&mut socket).await)
+                    .unwrap();
+                socket.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
+                let tls = acceptor.accept(socket).await.unwrap();
+                tx.send(format!("SNI {}", tls.get_ref().1.server_name().unwrap()))
+                    .unwrap();
+                let mut h2 = h2::server::handshake(tls).await.unwrap();
+                let mut requests = tokio::task::JoinSet::new();
+                while let Some(Ok((request, mut respond))) = h2.accept().await {
+                    tx.send(format!("{} {}", request.method(), request.uri()))
+                        .unwrap();
+                    requests.spawn(async move {
+                        if request.method() == http::Method::HEAD {
+                            respond
+                                .send_response(
+                                    http::Response::builder().status(405).body(()).unwrap(),
+                                    true,
+                                )
+                                .unwrap();
+                            return;
+                        }
+                        let mut recv = request.into_body();
+                        let mut data = Vec::new();
+                        while let Some(chunk) = recv.data().await {
+                            let chunk = chunk.unwrap();
+                            data.extend_from_slice(&chunk);
+                            recv.flow_control().release_capacity(chunk.len()).unwrap();
+                        }
+                        let response = http::Response::builder()
+                            .header("content-length", data.len())
+                            .body(())
+                            .unwrap();
+                        let mut stream = respond.send_response(response, false).unwrap();
+                        stream.send_data(bytes::Bytes::from(data), true).unwrap();
+                    });
+                }
+            });
+        }
+    });
+    (addr, rx, task)
+}

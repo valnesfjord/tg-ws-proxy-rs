@@ -10,7 +10,7 @@
 //!       │                DC, framing, client obfuscation
 //!       ▼
 //!  [select_upstream]  ← the fallback ladder: pooled/direct WebSocket,
-//!       │                Cloudflare Worker, Cloudflare proxy, upstream
+//!       │                Cloudflare Worker, Cloudflare proxy (H2/WS), upstream
 //!       │                MTProto proxy, and finally raw TCP
 //!       ▼
 //!  [bridge_ws / bridge_relay / bridge_tcp]  ← bidirectional re-encryption
@@ -411,10 +411,14 @@ async fn select_bridge(
 // connect path for one move per connection.
 #[allow(clippy::large_enum_variant)]
 enum Upstream {
+    H2(Arc<crate::cf_h2::Lane>),
     /// A WebSocket to Telegram — direct, via the Cloudflare proxy, or through
     /// a Cloudflare Worker tunnel.  See [`WsFraming`] for why the two are not
     /// interchangeable once bridged.
-    Ws { ws: TgWsStream, framing: WsFraming },
+    Ws {
+        ws: TgWsStream,
+        framing: WsFraming,
+    },
     /// An upstream MTProto proxy, plain or FakeTLS-wrapped.
     Mtproto(UpstreamConnection),
     /// Last resort: a direct TCP connection to this Telegram DC IP.
@@ -456,6 +460,20 @@ fn bridge_selected(
     } = params;
 
     match upstream {
+        Upstream::H2(lane) => Box::pin(async move {
+            if let Err(error) = crate::cf_h2::bridge(
+                reader,
+                writer,
+                lane,
+                proto,
+                ciphers.clt_dec.0,
+                ciphers.clt_enc.0,
+            )
+            .await
+            {
+                debug!("[{}] DC{} media HTTP/2 bridge closed: {}", label, dc, error);
+            }
+        }),
         Upstream::Ws { ws, framing } => Box::pin(bridge_ws(
             reader,
             writer,
@@ -747,11 +765,8 @@ impl Route<'_> {
                     }
                 }
                 UpstreamTier::Cfproxy => {
-                    if let Some(ws) = self.cf_proxy("pinned").await {
-                        return Some(Upstream::Ws {
-                            ws,
-                            framing: WsFraming::Packets,
-                        });
+                    if let Some(upstream) = self.cf_proxy_tier("pinned").await {
+                        return Some(upstream);
                     }
                 }
                 UpstreamTier::Mtproto => {
@@ -845,10 +860,7 @@ impl Route<'_> {
             });
         }
 
-        self.cf_proxy(reason).await.map(|ws| Upstream::Ws {
-            ws,
-            framing: WsFraming::Packets,
-        })
+        self.cf_proxy_tier(reason).await
     }
 
     /// Describe the connection the pool should re-open, off the one that just
@@ -1014,6 +1026,55 @@ impl Route<'_> {
         }
 
         None
+    }
+
+    async fn cf_proxy_tier(&self, reason: &str) -> Option<Upstream> {
+        if self.is_media
+            && !self.config.no_h2
+            && !self.config.cf_disable_tls
+            && self.runtime.fallback_ip(self.dc).is_some()
+        {
+            let first = balance_offset(
+                &self.config.cf_domains,
+                self.config.cf_balance,
+                &CF_BALANCE_COUNTER,
+            );
+            let attempt = async {
+                for zone in domain_order(&self.config.cf_domains, first) {
+                    let host = cf_record(self.dc, zone);
+                    match self
+                        .runtime
+                        .h2
+                        .open(
+                            &host,
+                            self.runtime,
+                            self.config.skip_tls_verify,
+                            self.timeouts.cf_connect,
+                        )
+                        .await
+                    {
+                        Ok(lane) => {
+                            info!(
+                                "[{}] DC{} media → CF HTTP/2 ({})",
+                                self.label, self.dc, host
+                            );
+                            return Some(Upstream::H2(lane));
+                        }
+                        Err(error) => debug!("CF HTTP/2 {}: {}", host, error),
+                    }
+                }
+                None
+            };
+            if let Ok(Some(upstream)) =
+                tokio::time::timeout(self.timeouts.cf_connect, attempt).await
+            {
+                return Some(upstream);
+            }
+        }
+        self.cf_proxy(reason).await.map(|ws| Upstream::Ws {
+            ws,
+            framing: WsFraming::Packets,
+        })
     }
 
     /// Try the configured Cloudflare proxy domains in `--cf-balance` order.

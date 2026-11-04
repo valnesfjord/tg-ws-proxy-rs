@@ -101,6 +101,11 @@ tg-ws-proxy --dc-ip 2:149.154.167.220 --cf-domain yourdomain.com \
 TG_CF_DOMAIN=yourdomain.com tg-ws-proxy
 ```
 
+Media connections in the `cfproxy` tier prefer multiplexed HTTP/2 POST requests
+to `/api`, falling back to WebSocket when HTTP/2 setup fails. Disable this with
+`--no-h2` / `TG_NO_H2=true`; `--cf-disable-tls` also keeps WebSocket. This does
+not change tier order. See [HTTP/2 media multiplexing](CfProxy.md#http2-media-multiplexing).
+
 A `--dc-ip` address whose TCP connect *times out* is stepped over for
 `--ip-fail-cooldown` seconds (default one hour) whenever a fallback tier is
 configured, instead of costing every later connection another connect timeout.

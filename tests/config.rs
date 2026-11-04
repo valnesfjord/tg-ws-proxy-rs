@@ -807,3 +807,11 @@ fn socks_is_opt_in_and_validates_destination_mappings() {
         assert!(Config::try_parse_from(["test", &format!("--socks-dc={invalid}")]).is_err());
     }
 }
+
+#[test]
+fn media_h2_is_enabled_by_default_and_can_be_disabled() {
+    let config = Config::try_parse_from(["tg-ws-proxy"]).unwrap();
+    assert!(!config.no_h2);
+    let config = Config::try_parse_from(["tg-ws-proxy", "--no-h2"]).unwrap();
+    assert!(config.no_h2);
+}

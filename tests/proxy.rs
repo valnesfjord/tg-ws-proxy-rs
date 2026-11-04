@@ -882,3 +882,109 @@ async fn inbound_faketls_rejects_a_client_hello_for_another_hostname() {
         "an SNI mismatch must not trigger an outbound connection"
     );
 }
+
+#[tokio::test]
+async fn media_h2_shares_tls_across_clients_and_preserves_cf_ip_host() {
+    use cipher::StreamCipher;
+    use std::sync::Arc;
+    use tg_ws_proxy_rs::{pool::WsPool, runtime::Runtime};
+
+    let (addr, mut events, origin) = common::h2_echo_proxy().await;
+    let config = proxy_config(
+        &format!("http://{addr}"),
+        &[
+            "--cf-domain",
+            "h2.example",
+            "--cf-ip",
+            "192.0.2.170",
+            "--pinned-media-upstream",
+            "cfproxy",
+            "--danger-accept-invalid-certs",
+        ],
+    );
+    let runtime = Arc::new(
+        Runtime::new(config.outbound_connector().unwrap()).with_cf_ips(config.cf_ips.clone()),
+    );
+    let pool = Arc::new(WsPool::with_runtime(
+        0,
+        Duration::from_secs(55),
+        runtime.clone(),
+    ));
+    for byte in [7, 8] {
+        let runtime = runtime.clone();
+        let pool = pool.clone();
+        let (mut client, handler) =
+            common::proxy_connection(config.clone(), move |socket, peer, config, _, _| {
+                tg_ws_proxy_rs::proxy::handle_client_with_runtime(
+                    socket, peer, config, pool, runtime,
+                )
+            })
+            .await;
+        let handler = tokio::spawn(handler);
+        let (handshake, mut enc, mut dec) =
+            generate_client_handshake(&hex::decode(SECRET).unwrap(), -2, ProtoTag::Intermediate);
+        client.write_all(&handshake).await.unwrap();
+        let mut packet = vec![40, 0, 0, 0];
+        packet.extend_from_slice(&[byte; 40]);
+        enc.apply_keystream(&mut packet);
+        client.write_all(&packet).await.unwrap();
+        let mut reply = [0; 44];
+        tokio::time::timeout(common::TASK_TIMEOUT, client.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        dec.apply_keystream(&mut reply);
+        assert_eq!(&reply[..4], &[40, 0, 0, 0]);
+        assert_eq!(&reply[4..], &[byte; 40]);
+        drop(client);
+        await_proxy_handler(handler).await;
+    }
+    let mut captured = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        captured.push(event);
+    }
+    assert_eq!(
+        captured.len(),
+        5,
+        "one CONNECT, one TLS handshake, one HEAD, two POSTs: {captured:?}"
+    );
+    assert!(captured[0].starts_with("CONNECT 192.0.2.170:443 "));
+    assert_eq!(captured[1], "SNI kws2.h2.example");
+    assert_eq!(
+        &captured[2..],
+        &[
+            "HEAD https://kws2.h2.example/api",
+            "POST https://kws2.h2.example/api",
+            "POST https://kws2.h2.example/api",
+        ]
+    );
+    drop(pool);
+    drop(runtime);
+    origin.abort();
+}
+
+#[tokio::test]
+async fn h2_failure_falls_back_to_ws_and_opt_out_skips_h2() {
+    for (dc, extra, expected, port) in [
+        (-2, vec![], 3, 443),
+        (-2, vec!["--no-h2"], 2, 443),
+        (2, vec![], 2, 443),
+        (-2, vec!["--cf-disable-tls"], 2, 80),
+    ] {
+        let (addr, task) = rejecting_http_proxy_requests().await;
+        let mut args = vec![
+            "--cf-domain",
+            "h2-fallback.example",
+            "--pinned-upstream",
+            "cfproxy",
+        ];
+        args.extend(extra);
+        let config = proxy_config(&format!("http://{addr}"), &args);
+        run_proxy_once_for_dc(config, dc).await;
+        let requests = await_proxy_requests(task).await;
+        assert_eq!(
+            connect_targets(&requests),
+            vec![format!("kws2.h2-fallback.example:{port}"); expected]
+        );
+    }
+}
