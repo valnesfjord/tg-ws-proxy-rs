@@ -32,6 +32,7 @@ fi
 }
 case "$FORMAT" in apk|ipk) ;; *) printf 'error: --format must be apk or ipk\n' >&2; exit 1 ;; esac
 [[ -f "$SDK/include/package.mk" ]] || { printf 'error: not an OpenWrt SDK: %s\n' "$SDK" >&2; exit 1; }
+SDK="$(cd "$SDK" && pwd)"
 
 package_dir="$SDK/package/luci-app-tg-ws-proxy-rs"
 rm -rf "$package_dir" "$SDK/package/luci-app-tg-ws-proxy"
@@ -59,11 +60,23 @@ if [[ "$FORMAT" == apk ]]; then
     grep -Fq 'name: luci-app-tg-ws-proxy-rs' <<<"$metadata"
     grep -Fq "version: $VERSION-r1" <<<"$metadata"
     grep -Fq 'arch: noarch' <<<"$metadata"
+    grep -Fq 'procd-ujail' <<<"$metadata"
+    verify_dir="$(mktemp -d)"
+    trap 'rm -rf "$verify_dir"' EXIT
+    "$SDK"/staging_dir/host/bin/apk --allow-untrusted extract --no-chown \
+        --destination "$verify_dir" "$package" >/dev/null
+    grep -Fxq 'tg-ws-proxy-rs:tg-ws-proxy-rs' \
+        "$verify_dir/lib/apk/packages/luci-app-tg-ws-proxy-rs.rusers"
+    [[ -s "$verify_dir/etc/capabilities/tg-ws-proxy-rs.json" ]]
 else
     metadata="$(tar -xOzf "$package" ./control.tar.gz | tar -xzOf - ./control)"
     grep -Fq 'Package: luci-app-tg-ws-proxy-rs' <<<"$metadata"
     grep -Fq "Version: $VERSION-r1" <<<"$metadata"
     grep -Fq 'Architecture: all' <<<"$metadata"
+    grep -Fq 'procd-ujail' <<<"$metadata"
+    grep -Fxq 'Require-User: tg-ws-proxy-rs:tg-ws-proxy-rs' <<<"$metadata"
+    contents="$(tar -xOzf "$package" ./data.tar.gz | tar -tzf -)"
+    grep -Fxq './etc/capabilities/tg-ws-proxy-rs.json' <<<"$contents"
 fi
 
 mkdir -p "$OUTPUT"

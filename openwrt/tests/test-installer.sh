@@ -103,6 +103,110 @@ install_luci_package
     printf 'FAIL: IPK install uses unexpected options: %s\n' "$OPKG_ARGS" >&2; exit 1;
 }
 
+# ujail names its root-owned supervisor after the service. Verify the actual
+# executable instead of relying on the order pidof returns its processes.
+(
+    pidof() { printf '11 22\n'; }
+    readlink() {
+        case "$1" in
+            /proc/11/exe) printf '/sbin/ujail\n' ;;
+            /proc/22/exe) printf '/usr/bin/tg-ws-proxy-rs\n' ;;
+            *) return 1 ;;
+        esac
+    }
+    [[ "$(proxy_process_pid)" == 22 ]] || {
+        printf 'FAIL: installer selected the ujail supervisor instead of the proxy\n' >&2; exit 1
+    }
+)
+
+INIT_ROLLBACK_MARKER="$tmp/rollback-marker"
+: > "$INIT_ROLLBACK_MARKER"
+PM=opkg
+OPKG_ARGS=''
+install_luci_package
+[[ "$OPKG_ARGS" == "install --force-reinstall $LUCI_PACKAGE_FILE" ]] || {
+    printf 'FAIL: IPK retry after rollback does not reinstall the service files\n' >&2; exit 1
+}
+(
+    PM=apk
+    apk() {
+        if [[ "$*" == 'add --help' ]]; then printf '%s\n' --force-reinstall
+        else printf '%s\n' "$*" >> "$tmp/apk-reinstall.log"; fi
+    }
+    install_luci_package
+    grep -Fxq -- "--allow-untrusted --force-non-repository add --force-reinstall $LUCI_PACKAGE_FILE" \
+        "$tmp/apk-reinstall.log" || {
+        printf 'FAIL: APK retry after rollback does not force a reinstall\n' >&2; exit 1
+    }
+)
+(
+    PM=apk
+    OLD_CONFIG=1
+    apk() {
+        if [[ "$*" == 'add --help' ]]; then printf 'apk add help\n'
+        else printf '%s\n' "$*" >> "$tmp/apk-legacy.log"; fi
+    }
+    luci_is_installed() { return 0; }
+    restore_path() { printf 'restore %s\n' "$1" >> "$tmp/apk-legacy.log"; }
+    install_luci_package
+    expected="$(printf 'del luci-app-tg-ws-proxy-rs\nrestore /etc/config/tg-ws-proxy-rs\n--allow-untrusted --force-non-repository add %s' "$LUCI_PACKAGE_FILE")"
+    [[ "$(cat "$tmp/apk-legacy.log")" == "$expected" ]] || {
+        printf 'FAIL: older APK retry did not preserve the UCI config\n' >&2; exit 1
+    }
+)
+rm -f "$INIT_ROLLBACK_MARKER"
+
+# A failed upgrade must restore every service file, even when the package
+# manager still records the newer package or an older apk removed it on retry.
+(
+    fake_root="$tmp/openwrt-rollback"
+    BACKUP_DIR="$tmp/openwrt-backup"
+    INIT_ROLLBACK_MARKER="$tmp/openwrt-rollback-marker"
+    OLD_LUCI_PACKAGE=1
+    OLD_CONFIG=1
+    files=(
+        /usr/bin/tg-ws-proxy-rs
+        /etc/config/tg-ws-proxy-rs
+        /etc/init.d/tg-ws-proxy-rs
+        /etc/capabilities/tg-ws-proxy-rs.json
+        /usr/share/luci/menu.d/luci-app-tg-ws-proxy-rs.json
+        /usr/share/rpcd/acl.d/luci-app-tg-ws-proxy-rs.json
+        /usr/share/ucitrack/luci-app-tg-ws-proxy-rs.json
+        /www/luci-static/resources/view/tg-ws-proxy-rs/settings.js
+    )
+    for file in "${files[@]}"; do
+        mkdir -p "$fake_root$(dirname "$file")" "$BACKUP_DIR$(dirname "$file")"
+        printf 'old %s\n' "$file" > "$BACKUP_DIR$file"
+        printf 'new %s\n' "$file" > "$fake_root$file"
+    done
+    restore_path() {
+        local source="$BACKUP_DIR$1" dest="$fake_root$1"
+        rm -f "$dest"
+        if [[ -e "$source" ]]; then mkdir -p "$(dirname "$dest")"; cp -p "$source" "$dest"; fi
+    }
+    service_control() { :; }
+    restore_service_state() { :; }
+    uci() { :; }
+    rollback >/dev/null
+    [[ -f "$INIT_ROLLBACK_MARKER" ]] || { printf 'FAIL: rollback did not mark the package for reinstall\n' >&2; exit 1; }
+    for file in "${files[@]}"; do
+        cmp -s "$BACKUP_DIR$file" "$fake_root$file" || {
+            printf 'FAIL: rollback did not restore %s\n' "$file" >&2; exit 1
+        }
+    done
+    rm -f "$BACKUP_DIR/etc/capabilities/tg-ws-proxy-rs.json"
+    rollback >/dev/null
+    [[ ! -e "$fake_root/etc/capabilities/tg-ws-proxy-rs.json" ]] || {
+        printf 'FAIL: rollback retained a capability profile absent from the previous install\n' >&2; exit 1
+    }
+    OLD_LUCI_PACKAGE=0
+    remove_luci_package() { rm -f "$fake_root/etc/config/tg-ws-proxy-rs"; }
+    rollback >/dev/null
+    cmp -s "$BACKUP_DIR/etc/config/tg-ws-proxy-rs" "$fake_root/etc/config/tg-ws-proxy-rs" || {
+        printf 'FAIL: package removal lost the previous UCI config during rollback\n' >&2; exit 1
+    }
+)
+
 PM=apk
 APK_ARGS=''
 remove_luci_package

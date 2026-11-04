@@ -9,6 +9,31 @@ NAME="tg-ws-proxy-rs"
 PROG="/usr/bin/tg-ws-proxy-rs"
 CONFIG="tg-ws-proxy-rs"
 SECTION="main"
+CAPABILITIES="/etc/capabilities/tg-ws-proxy-rs.json"
+
+service_account_valid() {
+	local uid gid group_gid groups member_gid
+	uid="$(id -u "$NAME" 2>/dev/null)" || return 1
+	gid="$(id -g "$NAME" 2>/dev/null)" || return 1
+	group_gid="$(awk -F: -v name="$NAME" '$1 == name { print $3; exit }' /etc/group)"
+	case "$uid:$gid:$group_gid" in
+		*[!0-9:]*|:*|*::*|*:) return 1 ;;
+	esac
+	[ "$uid" -ne 0 ] && [ "$gid" -ne 0 ] && [ "$gid" = "$group_gid" ] || return 1
+	groups="$(id -G "$NAME" 2>/dev/null)" || return 1
+	for member_gid in $groups; do
+		[ "$member_gid" -ne 0 ] 2>/dev/null || return 1
+	done
+}
+
+needs_bind_capability() {
+	case "$1" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$1" -lt 1024 ] 2>/dev/null
+}
+
+bind_capability_available() {
+	[ -x /sbin/ujail ] && [ -r "$CAPABILITIES" ]
+}
 
 append_env() {
 	local option="$1"
@@ -99,7 +124,7 @@ rust_log_filter() {
 }
 
 start_service() {
-	local enabled secret log_level log_filter socks_enabled
+	local enabled secret log_level log_filter socks_enabled port socks_port bind_cap
 
 	config_load "$CONFIG"
 	config_get_bool enabled "$SECTION" enabled 0
@@ -110,19 +135,43 @@ start_service() {
 		logger -t "$NAME" "proxy secret is missing; rerun install.sh or set tg-ws-proxy-rs.main.secret"
 		return 1
 	fi
+	# procd silently ignores an unknown user, which would otherwise run as root.
+	if ! service_account_valid; then
+		logger -t "$NAME" "missing or invalid $NAME service user/group; reinstall luci-app-tg-ws-proxy-rs"
+		return 1
+	fi
+
+	config_get port "$SECTION" port 1443
+	config_get_bool socks_enabled "$SECTION" socks_enabled 0
+	config_get socks_port "$SECTION" socks_port 1080
+	bind_cap=0
+	if needs_bind_capability "$port" || { [ "$socks_enabled" -eq 1 ] && needs_bind_capability "$socks_port"; }; then
+		if ! bind_capability_available; then
+			logger -t "$NAME" "a privileged listen port requires procd-ujail and $CAPABILITIES"
+			return 1
+		fi
+		bind_cap=1
+	fi
 
 	log_level="$(resolve_log_level)"
 	log_filter="$(rust_log_filter "$log_level")"
 
 	procd_open_instance "$NAME.$SECTION"
 	procd_set_param command "$PROG"
+	procd_set_param user "$NAME"
+	procd_set_param group "$NAME"
+	if [ "$bind_cap" -eq 1 ]; then
+		# With no namespace options ujail only applies the capability profile.
+		procd_add_jail "$NAME" requirejail
+		procd_set_param capabilities "$CAPABILITIES"
+		procd_set_param no_new_privs 1
+	fi
 	config_list_foreach "$SECTION" dc_ip append_dc_ip
 
 	procd_set_param env "TG_SECRET=$secret"
 	procd_append_param env "RUST_LOG=$log_filter"
 	append_env host TG_HOST 0.0.0.0
 	append_env port TG_PORT 1443
-	config_get_bool socks_enabled "$SECTION" socks_enabled 0
 	if [ "$socks_enabled" -eq 1 ]; then
 		procd_append_param env TG_SOCKS_ENABLED=true
 		append_env socks_host TG_SOCKS_HOST 127.0.0.1

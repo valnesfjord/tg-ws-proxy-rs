@@ -18,8 +18,9 @@ define Package/luci-app-tg-ws-proxy-rs
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
   TITLE:=LuCI support for tg-ws-proxy-rs
-  DEPENDS:=+luci-base
+  DEPENDS:=+luci-base +procd-ujail
   PKGARCH:=all
+  USERID:=tg-ws-proxy-rs:tg-ws-proxy-rs
 endef
 
 define Package/luci-app-tg-ws-proxy-rs/description
