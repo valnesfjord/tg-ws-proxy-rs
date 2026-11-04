@@ -9,7 +9,28 @@ declare -A CFG=()
 declare -A LISTS=()
 declare -a EVENTS=()
 declare -a ENVS=()
+TEST_UID=32768
+TEST_GID=32768
+TEST_GROUP_GID=32768
+TEST_GROUPS=32768
+TEST_BIND_CAP_AVAILABLE=1
 
+id() {
+    [[ "${2-}" == tg-ws-proxy-rs ]] || return 1
+    case "$1" in
+        -u) [[ -n "$TEST_UID" ]] && printf '%s\n' "$TEST_UID" ;;
+        -g) [[ -n "$TEST_GID" ]] && printf '%s\n' "$TEST_GID" ;;
+        -G) [[ -n "$TEST_GROUPS" ]] && printf '%s\n' "$TEST_GROUPS" ;;
+        *) return 1 ;;
+    esac
+}
+awk() {
+    if [[ "${*: -1}" == /etc/group ]]; then
+        printf '%s\n' "$TEST_GROUP_GID"
+    else
+        command awk "$@"
+    fi
+}
 
 config_load() { EVENTS+=("config_load:$1"); }
 config_get() {
@@ -41,6 +62,7 @@ procd_append_param() {
     if [[ "$kind" == env ]]; then ENVS+=("$@"); fi
 }
 procd_close_instance() { EVENTS+=("close"); }
+procd_add_jail() { EVENTS+=("jail:$*"); }
 procd_add_reload_trigger() { EVENTS+=("trigger:$1"); }
 uci() {
     local key
@@ -55,6 +77,7 @@ logger() { EVENTS+=("logger:$*"); }
 
 # shellcheck source=/dev/null
 source "$INIT"
+bind_capability_available() { [[ "$TEST_BIND_CAP_AVAILABLE" == 1 ]]; }
 
 has_event() {
     local expected="$1" item
@@ -91,6 +114,11 @@ LISTS[main.cf_worker_domain]=$'worker-one.example\nworker-two.example'
 start_service
 has_event 'open:tg-ws-proxy-rs.main' || { printf 'FAIL: enabled service did not open procd\n' >&2; exit 1; }
 has_event 'set:command:/usr/bin/tg-ws-proxy-rs' || { printf 'FAIL: wrong procd command\n' >&2; exit 1; }
+has_event 'set:user:tg-ws-proxy-rs' || { printf 'FAIL: service user is not configured\n' >&2; exit 1; }
+has_event 'set:group:tg-ws-proxy-rs' || { printf 'FAIL: service group is not configured\n' >&2; exit 1; }
+if has_event 'jail:tg-ws-proxy-rs requirejail'; then
+    printf 'FAIL: an unprivileged port was given the bind capability\n' >&2; exit 1
+fi
 for expected in \
     'TG_HOST=0.0.0.0' \
     'TG_PORT=3443' \
@@ -161,6 +189,64 @@ has_event 'logger:-t tg-ws-proxy-rs proxy secret is missing; rerun install.sh or
 EVENTS=()
 service_triggers
 has_event 'trigger:tg-ws-proxy-rs' || { printf 'FAIL: reload trigger missing\n' >&2; exit 1; }
+
+# procd ignores unknown users, so never open an instance for a missing, root,
+# or mismatched account/group.
+for identity in '::' '0:32768:32768' '32768:0:0' '32768:32768:' '32768:32768:32769'; do
+    IFS=: read -r TEST_UID TEST_GID TEST_GROUP_GID <<< "$identity"
+    EVENTS=(); ENVS=(); CFG=(); LISTS=()
+    CFG[main.enabled]=1
+    CFG[main.secret]=0123456789abcdef0123456789abcdef
+    if start_service; then
+        printf 'FAIL: invalid service account %s was accepted\n' "$identity" >&2; exit 1
+    fi
+    if has_event 'open:tg-ws-proxy-rs.main'; then
+        printf 'FAIL: invalid service account %s opened procd\n' "$identity" >&2; exit 1
+    fi
+done
+TEST_UID=32768; TEST_GID=32768; TEST_GROUP_GID=32768
+TEST_GROUPS='32768 0'
+EVENTS=(); ENVS=(); CFG=(); LISTS=()
+CFG[main.enabled]=1
+CFG[main.secret]=0123456789abcdef0123456789abcdef
+if start_service; then
+    printf 'FAIL: service account in the root group was accepted\n' >&2; exit 1
+fi
+TEST_GROUPS=32768
+
+EVENTS=(); ENVS=(); CFG=(); LISTS=()
+CFG[main.enabled]=1
+CFG[main.secret]=0123456789abcdef0123456789abcdef
+CFG[main.port]=443
+start_service
+for expected in 'jail:tg-ws-proxy-rs requirejail' \
+    'set:capabilities:/etc/capabilities/tg-ws-proxy-rs.json' 'set:no_new_privs:1'; do
+    has_event "$expected" || { printf 'FAIL: port 443 is missing %s\n' "$expected" >&2; exit 1; }
+done
+
+# SOCKS can also need the capability, but a disabled listener must not.
+EVENTS=(); ENVS=(); CFG=(); LISTS=()
+CFG[main.enabled]=1
+CFG[main.secret]=0123456789abcdef0123456789abcdef
+CFG[main.socks_port]=443
+start_service
+if has_event 'jail:tg-ws-proxy-rs requirejail'; then
+    printf 'FAIL: disabled SOCKS port added the bind capability\n' >&2; exit 1
+fi
+EVENTS=(); ENVS=()
+CFG[main.socks_enabled]=1
+start_service
+has_event 'jail:tg-ws-proxy-rs requirejail' || { printf 'FAIL: SOCKS port 443 lacks bind capability\n' >&2; exit 1; }
+
+TEST_BIND_CAP_AVAILABLE=0
+EVENTS=(); ENVS=()
+if start_service; then
+    printf 'FAIL: privileged port started without the capability helper\n' >&2; exit 1
+fi
+if has_event 'open:tg-ws-proxy-rs.main'; then
+    printf 'FAIL: unavailable capability helper opened procd\n' >&2; exit 1
+fi
+TEST_BIND_CAP_AVAILABLE=1
 
 # Disabled SOCKS must not pick up stale addresses/mappings from UCI.
 EVENTS=(); ENVS=(); CFG=(); LISTS=()

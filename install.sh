@@ -34,6 +34,7 @@ DRY_RUN=0
 TMP_DIR=''
 STAGED_BINARY=''
 BACKUP_DIR=''
+INIT_ROLLBACK_MARKER=/root/tg-ws-proxy-backups/.restore-luci-package
 OLD_CONFIG=0
 OLD_LUCI_PACKAGE=0
 OLD_RUNNING=0
@@ -685,6 +686,16 @@ manual_process_pid() {
 	return 1
 }
 
+proxy_process_pid() {
+	for candidate in $(pidof tg-ws-proxy-rs 2>/dev/null); do
+		if [ "$(readlink "/proc/$candidate/exe" 2>/dev/null || true)" = /usr/bin/tg-ws-proxy-rs ]; then
+			printf '%s' "$candidate"
+			return 0
+		fi
+	done
+	return 1
+}
+
 luci_is_installed() {
 	if [ "$PM" = apk ]; then apk info -e luci-app-tg-ws-proxy-rs >/dev/null 2>&1
 	else opkg status luci-app-tg-ws-proxy-rs 2>/dev/null | grep -q 'Status:.*installed'; fi
@@ -696,6 +707,22 @@ legacy_luci_is_installed() {
 }
 
 install_luci_package() {
+	if [ -f "$INIT_ROLLBACK_MARKER" ]; then
+		if [ "$PM" = opkg ]; then
+			opkg install --force-reinstall "$LUCI_PACKAGE_FILE"
+			return $?
+		fi
+		if apk add --help 2>&1 | grep -q -- '--force-reinstall'; then
+			apk --allow-untrusted --force-non-repository add --force-reinstall "$LUCI_PACKAGE_FILE"
+			return $?
+		fi
+		# OpenWrt 25.12.0's apk lacks --force-reinstall. The backed-up UCI
+		# config must survive removing the package before installing it again.
+		if luci_is_installed; then
+			apk del luci-app-tg-ws-proxy-rs || return 1
+			if [ "$OLD_CONFIG" -eq 1 ]; then restore_path /etc/config/tg-ws-proxy-rs || return 1; fi
+		fi
+	fi
 	if [ "$PM" = apk ]; then
 		apk --allow-untrusted --force-non-repository add "$LUCI_PACKAGE_FILE"
 	else
@@ -759,20 +786,22 @@ rollback() {
 	warn "Installation failed; restoring the previous binary, UCI config and service state."
 	service_control stop >/dev/null 2>&1 || true
 	restore_path /usr/bin/tg-ws-proxy-rs
-	if [ "$OLD_CONFIG" -eq 1 ]; then restore_path /etc/config/tg-ws-proxy-rs; fi
 	if [ "$OLD_LUCI_PACKAGE" -eq 0 ]; then
 		remove_luci_package
-		for path in /etc/init.d/tg-ws-proxy-rs \
-			/usr/share/luci/menu.d/luci-app-tg-ws-proxy-rs.json \
-			/usr/share/rpcd/acl.d/luci-app-tg-ws-proxy-rs.json \
-			/usr/share/ucitrack/luci-app-tg-ws-proxy-rs.json \
-			/www/luci-static/resources/view/tg-ws-proxy-rs/settings.js; do
-			restore_path "$path"
-		done
 		[ "$OLD_CONFIG" -eq 1 ] || rm -f /etc/config/tg-ws-proxy-rs
 	else
-		warn "The LuCI integration package remains at its upgraded version."
+		: > "$INIT_ROLLBACK_MARKER" || warn "Cannot mark the LuCI package for reinstallation."
+		warn "The LuCI package is marked for reinstallation on the next attempt."
 	fi
+	for path in /etc/init.d/tg-ws-proxy-rs \
+		/etc/capabilities/tg-ws-proxy-rs.json \
+		/usr/share/luci/menu.d/luci-app-tg-ws-proxy-rs.json \
+		/usr/share/rpcd/acl.d/luci-app-tg-ws-proxy-rs.json \
+		/usr/share/ucitrack/luci-app-tg-ws-proxy-rs.json \
+		/www/luci-static/resources/view/tg-ws-proxy-rs/settings.js; do
+		restore_path "$path"
+	done
+	if [ "$OLD_CONFIG" -eq 1 ]; then restore_path /etc/config/tg-ws-proxy-rs; fi
 	uci -q revert tg-ws-proxy-rs
 	restore_service_state
 	warn "Recovery files are retained in $BACKUP_DIR"
@@ -1394,6 +1423,7 @@ main() {
 	legacy_service_control enabled >/dev/null 2>&1 && LEGACY_ENABLED=1
 
 	for path in /usr/bin/tg-ws-proxy-rs /etc/init.d/tg-ws-proxy-rs \
+		/etc/capabilities/tg-ws-proxy-rs.json \
 		/etc/config/tg-ws-proxy-rs \
 		/usr/share/luci/menu.d/luci-app-tg-ws-proxy-rs.json \
 		/usr/share/rpcd/acl.d/luci-app-tg-ws-proxy-rs.json \
@@ -1451,17 +1481,14 @@ main() {
 	service_control restart >/dev/null 2>&1 || { rollback; die "cannot restart service"; }
 	wait_ready || { rollback; die "service did not become ready"; }
 
-	new_pid="$(pidof tg-ws-proxy-rs 2>/dev/null || true)"
-	[ -n "$new_pid" ] || { rollback; die "new process is missing"; }
-	new_pid="${new_pid%% *}"
-	new_exe="$(readlink "/proc/$new_pid/exe" 2>/dev/null || true)"
-	[ "$new_exe" = /usr/bin/tg-ws-proxy-rs ] || { rollback; die "unexpected running executable: $new_exe"; }
+	new_pid="$(proxy_process_pid)" || { rollback; die "new proxy process is missing"; }
 	[ -s /usr/share/luci/menu.d/luci-app-tg-ws-proxy-rs.json ] || { rollback; die "LuCI menu is missing"; }
 	[ -s /www/luci-static/resources/view/tg-ws-proxy-rs/settings.js ] || { rollback; die "LuCI view is missing"; }
 	remove_legacy_installation
 	rm -f /tmp/luci-indexcache
 	rm -rf /tmp/luci-modulecache
 	/etc/init.d/rpcd reload >/dev/null 2>&1 || warn "rpcd reload failed; LuCI may need a manual reload"
+	rm -f "$INIT_ROLLBACK_MARKER"
 
 	variant=regular; [ "$USE_UPX" -eq 0 ] || variant=upx
 	prune_backups /root/tg-ws-proxy-backups 3
