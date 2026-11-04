@@ -353,6 +353,11 @@ pub struct Config {
     #[arg(long = "cf-balance", env = "TG_CF_BALANCE")]
     pub cf_balance: bool,
 
+    /// Disable HTTP/2 media multiplexing through Cloudflare /api.
+    /// The Cloudflare proxy tier uses WebSocket for media instead.
+    #[arg(long = "no-h2", env = "TG_NO_H2")]
+    pub no_h2: bool,
+
     /// Upgrade Cloudflare proxy and Worker connections over plaintext
     /// `ws://` (port 80) instead of `wss://` (port 443).
     ///

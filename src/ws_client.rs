@@ -125,7 +125,7 @@ impl CfDialOpts<'_> {
 /// Starting index for one logical Cloudflare connection. Every configured IP
 /// is still tried before failure; rotating only spreads which one gets first
 /// chance.
-fn cf_ip_start(ips: &[IpAddr]) -> usize {
+pub(crate) fn cf_ip_start(ips: &[IpAddr]) -> usize {
     if ips.len() <= 1 {
         return 0;
     }
@@ -1246,7 +1246,7 @@ fn build_tls_connector(skip_verify: bool) -> Connector {
 
 /// The shared certificate-verifying client config, using the bundled WebPKI
 /// root store.
-fn verifying_rustls_config() -> Arc<rustls::ClientConfig> {
+pub(crate) fn verifying_rustls_config() -> Arc<rustls::ClientConfig> {
     VERIFYING_CONFIG
         .get_or_init(|| {
             let mut root_store = rustls::RootCertStore::empty();
@@ -1268,7 +1268,7 @@ fn verifying_rustls_config() -> Arc<rustls::ClientConfig> {
 /// the domain-fronting path, which *always* needs it: the real certificate
 /// presented by Telegram can never match a fronted (spoofed) SNI hostname, so
 /// hostname verification would fail even for an otherwise-legitimate server.
-fn no_verify_rustls_config() -> Arc<rustls::ClientConfig> {
+pub(crate) fn no_verify_rustls_config() -> Arc<rustls::ClientConfig> {
     NO_VERIFY_CONFIG
         .get_or_init(|| {
             let mut config = rustls::ClientConfig::builder()
