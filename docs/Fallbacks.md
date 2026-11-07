@@ -130,6 +130,10 @@ domain can never block the others, or the whole DC, from being tried.
 
 ### `--cf-disable-tls` — plaintext Cloudflare transport
 
+This also disables HTTP/2 media multiplexing: Cloudflare's client-facing
+HTTP/2 endpoint requires TLS, so plaintext connections use WebSocket over
+HTTP/1.1. See [why h2c is not used](CfProxy.md#http2-media-multiplexing).
+
 If a TLS-intercepting middlebox breaks the WebSocket upgrade to Cloudflare,
 `--cf-disable-tls` makes both Cloudflare tiers use `ws://` on port 80 instead of
 `wss://` on port 443:
