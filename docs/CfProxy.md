@@ -173,9 +173,18 @@ share one TCP/TLS connection. Ordinary connections, direct Telegram WebSockets
 and Cloudflare Worker tunnels keep their existing transports and priority.
 
 HTTP/2 is enabled by default. Use `--no-h2` or `TG_NO_H2=true` to force media
-back onto WebSocket. `--cf-disable-tls` also selects WebSocket: this path does
-not attempt plaintext HTTP/2. The domain must allow HTTP/2 and POST requests to
-`/api`, in addition to the existing `/apiws` endpoint.
+back onto WebSocket. The domain must allow HTTP/2 and POST requests to `/api`,
+in addition to the existing `/apiws` endpoint.
+
+`--cf-disable-tls` selects WebSocket over HTTP/1.1 on port 80. HTTP/2 itself
+supports cleartext connections (often called h2c), but Cloudflare supports
+client-facing HTTP/2 only over TLS; see its
+[HTTP/2 explanation](https://blog.cloudflare.com/introducing-http2/) and
+[current documentation](https://developers.cloudflare.com/speed/optimization/protocol/http2/).
+The HTTP/2 connection here terminates at Cloudflare, so h2c support at the
+Telegram origin would not enable h2c between this proxy and Cloudflare.
+Cloudflare's Flexible SSL mode controls the separate Cloudflare-to-origin
+connection and does not remove this client-side TLS requirement.
 
 The proxy checks ALPN and sends a HEAD request before using a lane. Failed or
 blocked setup falls back to WebSocket without consuming client packets; failed
