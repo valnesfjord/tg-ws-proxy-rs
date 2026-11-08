@@ -511,6 +511,102 @@ async fn socks5_proxy_uses_local_dns() {
     await_task(proxy_task).await;
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn outbound_mark_covers_direct_proxy_and_no_proxy_connections() {
+    let probe = tokio::net::TcpSocket::new_v4().unwrap();
+    let can_mark = match socket2::SockRef::from(&probe).set_mark(0x1234) {
+        Ok(()) => true,
+        Err(error) => {
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            false
+        }
+    };
+    for mode in ["direct", "http", "socks5", "socks5h", "no_proxy"] {
+        let (target, target_task) = echo_server().await;
+        let (proxy_url, proxy_task) = match mode {
+            "http" => {
+                let (proxy, task) = http_proxy(target, b"HTTP/1.1 200 OK\r\n\r\n").await;
+                (Some(format!("http://{proxy}")), Some(task))
+            }
+            "socks5" | "socks5h" => {
+                let auth = if mode == "socks5h" {
+                    SocksMode::RemoteDnsWithAuth
+                } else {
+                    SocksMode::LocalDnsNoAuth
+                };
+                let (proxy, task) = socks5_proxy(target, auth).await;
+                let credentials = if mode == "socks5h" { "user:pass@" } else { "" };
+                (Some(format!("{mode}://{credentials}{proxy}")), Some(task))
+            }
+            "no_proxy" => (Some("http://127.0.0.1:1".into()), None),
+            _ => (None, None),
+        };
+        let no_proxy = (mode == "no_proxy").then_some("localhost");
+        let mut cfg =
+            Config::try_parse_from(["test", "--outbound-mark", "0x1234", "--no-outbound-proxy"])
+                .unwrap();
+        cfg.outbound_proxy = proxy_url;
+        cfg.no_proxy = no_proxy.map(str::to_owned);
+        let connector = cfg.outbound_connector().unwrap();
+        let host = match mode {
+            "socks5h" => "example.local".to_string(),
+            "no_proxy" => "localhost".to_string(),
+            _ => target.ip().to_string(),
+        };
+        let result = connector
+            .connect(&host, target.port(), Duration::from_secs(2))
+            .await;
+        if !can_mark {
+            let error = result.unwrap_err();
+            assert!(error.reason.contains("SO_MARK"), "{mode}: {error}");
+            assert!(!error.timed_out);
+            target_task.abort();
+            if let Some(task) = proxy_task {
+                task.abort();
+            }
+            continue;
+        }
+        let mut stream = result.unwrap();
+        assert_eq!(
+            socket2::SockRef::from(&stream).mark().unwrap(),
+            0x1234,
+            "{mode}"
+        );
+        stream.write_all(b"ping").await.unwrap();
+        let mut reply = [0; 4];
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"pong");
+        drop(stream);
+        await_task(target_task).await;
+        if let Some(task) = proxy_task {
+            await_task(task).await;
+        }
+    }
+    if can_mark {
+        let (target, task) = ipv6_one_shot_server(b"ipv6").await.unwrap();
+        let connector = OutboundConnector::direct()
+            .with_mark(Some(u32::MAX))
+            .unwrap();
+        let mut stream = connector
+            .connect("::1", target.port(), Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(socket2::SockRef::from(&stream).mark().unwrap(), u32::MAX);
+        let mut reply = [0; 4];
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"ipv6");
+        await_task(task).await;
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn outbound_mark_is_rejected_on_unsupported_platforms() {
+    assert!(OutboundConnector::direct().with_mark(Some(1)).is_err());
+    assert!(OutboundConnector::direct().with_mark(None).is_ok());
+}
+
 async fn echo_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

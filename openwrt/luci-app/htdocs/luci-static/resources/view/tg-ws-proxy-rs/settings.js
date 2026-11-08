@@ -490,6 +490,8 @@ return view.extend({
 			_('Ignore configured and environment proxy settings.'), '0');
 		o = addValue(s, 'routing', 'no_proxy', _('NO_PROXY'),
 			_('Comma-separated hosts, suffixes or CIDR ranges that bypass the outbound proxy.'));
+		o = addValue(s, 'routing', 'outbound_mark', _('Outbound firewall mark'),
+			_('Outbound TCP firewall mark in decimal or hex. Leave empty to disable.'), null, '0x100');
 		o = addFlag(s, 'routing', 'default_domains', _('Use default Cloudflare domains'), null, '0');
 		o = addFlag(s, 'routing', 'cf_priority', _('Prefer Cloudflare routes'),
 			_('Try Cloudflare Worker/proxy before direct Telegram WebSocket routes.'), '0');

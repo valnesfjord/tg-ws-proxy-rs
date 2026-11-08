@@ -48,6 +48,7 @@ impl std::error::Error for OutboundError {}
 
 pub struct OutboundConnector {
     config: OutboundConfig,
+    mark: Option<u32>,
 }
 
 impl OutboundConnector {
@@ -57,6 +58,7 @@ impl OutboundConnector {
                 proxy: None,
                 no_proxy: None,
             },
+            mark: None,
         }
     }
 
@@ -67,7 +69,17 @@ impl OutboundConnector {
     ) -> Result<Self, String> {
         Ok(Self {
             config: OutboundConfig::from_sources(outbound_proxy, no_proxy, use_env)?,
+            mark: None,
         })
+    }
+
+    /// Apply a Linux SO_MARK before connecting, including connections to proxies.
+    pub fn with_mark(mut self, mark: Option<u32>) -> Result<Self, String> {
+        if mark.is_some() && !cfg!(target_os = "linux") {
+            return Err("outbound marks are only supported on Linux".into());
+        }
+        self.mark = mark;
+        Ok(self)
     }
 
     pub fn summary(&self) -> Option<String> {
@@ -85,15 +97,18 @@ impl OutboundConnector {
         timeout: Duration,
     ) -> Result<TcpStream, OutboundError> {
         let Some(proxy) = &self.config.proxy else {
-            return connect_direct(target_host, target_port, timeout).await;
+            return connect_direct(target_host, target_port, timeout, self.mark).await;
         };
 
         if self.should_bypass(target_host, target_port) {
-            return connect_direct(target_host, target_port, timeout).await;
+            return connect_direct(target_host, target_port, timeout, self.mark).await;
         }
 
-        match tokio::time::timeout(timeout, connect_via_proxy(proxy, target_host, target_port))
-            .await
+        match tokio::time::timeout(
+            timeout,
+            connect_via_proxy(proxy, target_host, target_port, self.mark),
+        )
+        .await
         {
             Ok(result) => result.map_err(OutboundError::failed),
             Err(_) => Err(OutboundError::timed_out(format!(
@@ -115,8 +130,9 @@ async fn connect_direct(
     host: &str,
     port: u16,
     timeout: Duration,
+    mark: Option<u32>,
 ) -> Result<TcpStream, OutboundError> {
-    match tokio::time::timeout(timeout, connect_tcp(host, port)).await {
+    match tokio::time::timeout(timeout, connect_tcp(host, port, mark)).await {
         Ok(result) => result.map_err(OutboundError::failed),
         Err(_) => Err(OutboundError::timed_out("TCP connect timed out")),
     }
@@ -126,13 +142,14 @@ async fn connect_via_proxy(
     proxy: &ProxyConfig,
     target_host: &str,
     target_port: u16,
+    mark: Option<u32>,
 ) -> Result<TcpStream, String> {
     match proxy.kind {
-        ProxyKind::Http => connect_http_proxy(proxy, target_host, target_port)
+        ProxyKind::Http => connect_http_proxy(proxy, target_host, target_port, mark)
             .await
             .map_err(|e| format!("HTTP proxy {}: {e}", proxy.summary())),
         ProxyKind::Socks5 { remote_dns } => {
-            connect_socks5_proxy(proxy, target_host, target_port, remote_dns)
+            connect_socks5_proxy(proxy, target_host, target_port, remote_dns, mark)
                 .await
                 .map_err(|e| format!("SOCKS5 proxy {}: {e}", proxy.summary()))
         }
@@ -143,8 +160,9 @@ async fn connect_http_proxy(
     proxy: &ProxyConfig,
     target_host: &str,
     target_port: u16,
+    mark: Option<u32>,
 ) -> Result<TcpStream, String> {
-    let mut stream = connect_tcp(&proxy.host, proxy.port).await?;
+    let mut stream = connect_tcp(&proxy.host, proxy.port, mark).await?;
     let target_host = if target_host.contains(':') && !target_host.starts_with('[') {
         Cow::Owned(format!("[{target_host}]"))
     } else {
@@ -173,27 +191,64 @@ async fn connect_socks5_proxy(
     target_host: &str,
     target_port: u16,
     remote_dns: bool,
+    mark: Option<u32>,
 ) -> Result<TcpStream, String> {
     let target = socks5_target(target_host, target_port, remote_dns).await?;
-    let proxy_addr = (proxy.host.as_str(), proxy.port);
+    let socket = connect_tcp(&proxy.host, proxy.port, mark).await?;
 
     let stream = if let Some(username) = proxy.username.as_deref() {
-        Socks5Stream::connect_with_password(
-            proxy_addr,
+        Socks5Stream::connect_with_password_and_socket(
+            socket,
             target,
             username,
             proxy.password.as_deref().unwrap_or(""),
         )
         .await
     } else {
-        Socks5Stream::connect(proxy_addr, target).await
+        Socks5Stream::connect_with_socket(socket, target).await
     }
     .map_err(|e| e.to_string())?;
 
     Ok(stream.into_inner())
 }
 
-async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, String> {
+async fn connect_tcp(host: &str, port: u16, mark: Option<u32>) -> Result<TcpStream, String> {
+    #[cfg(target_os = "linux")]
+    if let Some(mark) = mark {
+        let mut last_error = "TCP lookup returned no addresses".to_string();
+        for addr in lookup_host((host, port))
+            .await
+            .map_err(|e| format!("TCP lookup: {e}"))?
+        {
+            let socket = match if addr.is_ipv4() {
+                tokio::net::TcpSocket::new_v4()
+            } else {
+                tokio::net::TcpSocket::new_v6()
+            } {
+                Ok(socket) => socket,
+                Err(error) => {
+                    last_error = format!("TCP socket: {error}");
+                    continue;
+                }
+            };
+            // The first SYN must already carry the mark to avoid routing loops.
+            socket2::SockRef::from(&socket)
+                .set_mark(mark)
+                .map_err(|e| {
+                    format!(
+                        "SO_MARK {mark}: {e} (requires CAP_NET_ADMIN or CAP_NET_RAW on Linux 5.17+)"
+                    )
+                })?;
+            match socket.connect(addr).await {
+                Ok(stream) => return Ok(stream),
+                Err(error) => last_error = format!("TCP connect: {error}"),
+            }
+        }
+        return Err(last_error);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = mark;
+
     TcpStream::connect((host, port))
         .await
         .map_err(|e| format!("TCP connect: {e}"))

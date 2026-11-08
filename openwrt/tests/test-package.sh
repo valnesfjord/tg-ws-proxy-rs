@@ -32,6 +32,12 @@ with open(sys.argv[1], encoding="utf-8") as source:
     profile = json.load(source)
 assert set(profile) == {"bounding", "effective", "permitted", "inheritable", "ambient"}
 assert all(value == ["CAP_NET_BIND_SERVICE"] for value in profile.values())
+from pathlib import Path
+for name, caps in [("mark", ["CAP_NET_RAW"]),
+                   ("mark-bind", ["CAP_NET_RAW", "CAP_NET_BIND_SERVICE"])]:
+    marked = json.loads(Path(sys.argv[1]).with_name(f"tg-ws-proxy-rs-{name}.json").read_text())
+    assert marked.keys() == profile.keys()
+    assert all(value == caps for value in marked.values())
 PY
 grep -Fq '/etc/config/tg-ws-proxy-rs' "$makefile" || fail 'UCI conffile is not declared'
 # shellcheck disable=SC2016 # Match the literal package staging path in the recipe.
