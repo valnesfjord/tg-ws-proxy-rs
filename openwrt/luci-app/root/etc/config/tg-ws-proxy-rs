@@ -15,6 +15,7 @@ config tg-ws-proxy-rs 'main'
 	option outbound_proxy ''
 	option no_outbound_proxy '0'
 	option no_proxy ''
+	option outbound_mark ''
 
 	option default_domains '0'
 	option cf_priority '0'

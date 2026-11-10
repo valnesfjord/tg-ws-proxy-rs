@@ -815,3 +815,41 @@ fn media_h2_is_enabled_by_default_and_can_be_disabled() {
     let config = Config::try_parse_from(["tg-ws-proxy", "--no-h2"]).unwrap();
     assert!(config.no_h2);
 }
+
+#[test]
+fn outbound_mark_accepts_decimal_and_hex_u32() {
+    for (value, expected) in [
+        ("0", 0),
+        ("256", 256),
+        ("0x100", 256),
+        ("0XFFFFFFFF", u32::MAX),
+    ] {
+        let cfg = Config::try_parse_from(["test", "--outbound-mark", value]).unwrap();
+        assert_eq!(cfg.outbound_mark, Some(expected));
+    }
+    assert_eq!(
+        Config::try_parse_from(["test"]).unwrap().outbound_mark,
+        None
+    );
+    for value in ["", "-1", "4294967296", "0x100000000", "0x", "1/255", "abc"] {
+        assert!(
+            Config::try_parse_from(["test", "--outbound-mark", value]).is_err(),
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn outbound_mark_uses_env_with_cli_precedence() {
+    let run = |value: &str, args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_tg-ws-proxy"))
+            .args(["--print-links"])
+            .args(args)
+            .env("TG_OUTBOUND_MARK", value)
+            .output()
+            .unwrap()
+    };
+    assert!(run("0x100", &[]).status.success());
+    assert!(!run("invalid", &[]).status.success());
+    assert!(run("invalid", &["--outbound-mark", "256"]).status.success());
+}

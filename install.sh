@@ -611,6 +611,7 @@ migrate_manual_config() {
 	set_from_env TG_POOL_MAX_AGE pool_max_age
 	set_from_env TG_OUTBOUND_PROXY outbound_proxy
 	set_from_env TG_NO_PROXY no_proxy
+	set_from_env TG_OUTBOUND_MARK outbound_mark
 	set_from_env TG_SKIP_TLS_VERIFY danger_accept_invalid_certs
 	set_from_env TG_CF_PRIORITY cf_priority
 	set_from_env TG_CF_BALANCE cf_balance
@@ -795,6 +796,8 @@ rollback() {
 	fi
 	for path in /etc/init.d/tg-ws-proxy-rs \
 		/etc/capabilities/tg-ws-proxy-rs.json \
+		/etc/capabilities/tg-ws-proxy-rs-mark.json \
+		/etc/capabilities/tg-ws-proxy-rs-mark-bind.json \
 		/usr/share/luci/menu.d/luci-app-tg-ws-proxy-rs.json \
 		/usr/share/rpcd/acl.d/luci-app-tg-ws-proxy-rs.json \
 		/usr/share/ucitrack/luci-app-tg-ws-proxy-rs.json \
@@ -1424,6 +1427,8 @@ main() {
 
 	for path in /usr/bin/tg-ws-proxy-rs /etc/init.d/tg-ws-proxy-rs \
 		/etc/capabilities/tg-ws-proxy-rs.json \
+		/etc/capabilities/tg-ws-proxy-rs-mark.json \
+		/etc/capabilities/tg-ws-proxy-rs-mark-bind.json \
 		/etc/config/tg-ws-proxy-rs \
 		/usr/share/luci/menu.d/luci-app-tg-ws-proxy-rs.json \
 		/usr/share/rpcd/acl.d/luci-app-tg-ws-proxy-rs.json \

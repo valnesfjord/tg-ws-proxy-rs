@@ -678,6 +678,12 @@ pub struct Config {
     #[arg(long = "no-proxy", value_name = "LIST", env = "TG_NO_PROXY")]
     pub no_proxy: Option<String>,
 
+    /// Firewall mark for outbound TCP sockets (Linux; decimal or 0x-prefixed hex).
+    /// Requires CAP_NET_ADMIN, or CAP_NET_RAW on Linux 5.17+.
+    #[arg(long = "outbound-mark", value_name = "MARK", env = "TG_OUTBOUND_MARK",
+        value_parser = parse_outbound_mark)]
+    pub outbound_mark: Option<u32>,
+
     #[arg(skip)]
     normalized_secrets: OnceLock<Vec<Vec<u8>>>,
 
@@ -737,6 +743,17 @@ pub fn split_cli_args(line: &str) -> Result<Vec<String>, String> {
         args.push(cur);
     }
     Ok(args)
+}
+
+fn parse_outbound_mark(value: &str) -> Result<u32, String> {
+    let mark = match value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        Some(hex) => u32::from_str_radix(hex, 16),
+        None => value.parse(),
+    };
+    mark.map_err(|_| "expected a 32-bit unsigned mark (decimal or 0x-prefixed hex)".into())
 }
 
 impl Config {
@@ -1035,7 +1052,8 @@ impl Config {
             self.outbound_proxy.as_deref(),
             self.no_proxy.as_deref(),
             !self.no_outbound_proxy,
-        )
+        )?
+        .with_mark(self.outbound_mark)
     }
 
     /// The address the TCP listener actually binds to.

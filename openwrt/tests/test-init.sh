@@ -77,7 +77,7 @@ logger() { EVENTS+=("logger:$*"); }
 
 # shellcheck source=/dev/null
 source "$INIT"
-bind_capability_available() { [[ "$TEST_BIND_CAP_AVAILABLE" == 1 ]]; }
+capabilities_available() { [[ "$TEST_BIND_CAP_AVAILABLE" == 1 ]]; }
 
 has_event() {
     local expected="$1" item
@@ -270,5 +270,42 @@ for expected in 'TG_SOCKS_ENABLED=true' 'TG_SOCKS_HOST=127.0.0.1' 'TG_SOCKS_PORT
     'TG_SOCKS_DC=-2:149.154.167.222,4:149.154.167.91'; do
     has_env "$expected" || { printf 'FAIL: missing SOCKS env %s\n' "$expected" >&2; exit 1; }
 done
+
+# Marking adds CAP_NET_RAW only when configured, alongside bind if needed.
+for mark in 0 256 0000000256 4294967295 0004294967295 0x0 0x100 0XFFFFFFFF 0x000ffffffff; do
+    for port in 1443 443; do
+        EVENTS=(); ENVS=(); CFG=(); LISTS=()
+        CFG[main.enabled]=1
+        CFG[main.secret]=0123456789abcdef0123456789abcdef
+        CFG[main.port]="$port"
+        CFG[main.outbound_mark]="$mark"
+        start_service
+        profile=mark
+        [[ "$port" == 443 ]] && profile='mark-bind'
+        has_env "TG_OUTBOUND_MARK=$mark" || { printf 'FAIL: missing mark env\n' >&2; exit 1; }
+        has_event "set:capabilities:/etc/capabilities/tg-ws-proxy-rs-$profile.json" || {
+            printf 'FAIL: incorrect mark capabilities\n' >&2; exit 1;
+        }
+        has_event 'jail:tg-ws-proxy-rs requirejail' || { printf 'FAIL: mark lacks jail\n' >&2; exit 1; }
+    done
+done
+
+for mark in invalid -1 +1 4294967296 999999999999999999999999999999 0x100000000 0x 0X 0xgg 1/255 ' 1' '1 ' '1.0' '1e2' '1;id' '\x31' $'1\n2'; do
+    EVENTS=(); ENVS=()
+    CFG[main.outbound_mark]="$mark"
+    if start_service || has_event 'open:tg-ws-proxy-rs.main' || has_event 'jail:tg-ws-proxy-rs requirejail'; then
+        printf 'FAIL: invalid mark %s started the service\n' "$mark" >&2; exit 1
+    fi
+    has_event 'logger:-t tg-ws-proxy-rs invalid outbound_mark; expected an unsigned 32-bit decimal or 0x-prefixed hexadecimal value' || {
+        printf 'FAIL: invalid mark %s was not diagnosed\n' "$mark" >&2; exit 1;
+    }
+done
+TEST_BIND_CAP_AVAILABLE=0
+EVENTS=(); ENVS=()
+CFG[main.port]=1443
+CFG[main.outbound_mark]=0x100
+if start_service || has_event 'open:tg-ws-proxy-rs.main'; then
+    printf 'FAIL: marking started without the capability helper\n' >&2; exit 1
+fi
 
 printf 'PASS: init/UCI mapping\n'

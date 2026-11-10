@@ -283,6 +283,7 @@ tg-ws-proxy [OPTIONS]
 | `--outbound-proxy <URL>` | — | Proxy for all outgoing connections: `http://`, `socks5://`, or `socks5h://`; `https://` proxy URLs are not supported |
 | `--no-outbound-proxy` | off | Ignore standard outbound proxy environment variables |
 | `--no-proxy <LIST>` | — | Comma-separated host bypass list for `--outbound-proxy` |
+| `--outbound-mark <MARK>` | — | Linux firewall mark for outbound TCP sockets, including proxy connections; decimal or `0x` hex (`TG_OUTBOUND_MARK`) |
 | `--check` | off | Test every configured CF domain and MTProto proxy, print OK/FAIL with latency, then exit `0` if all pass and `1` otherwise |
 | `--check-listener` | off | Implies `--check`: binds and serves, probes its own listener end-to-end (obfuscation handshake, a real `req_pq_multi`, the DC's `resPQ` back), then exits with the check's code |
 | `--print-links` | off | Print every enabled listener's connection links (`inbound<TAB>label<TAB>url` per line) and exit without binding; LuCI uses it for its copy buttons |

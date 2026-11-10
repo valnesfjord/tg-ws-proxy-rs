@@ -210,3 +210,36 @@ tg-ws-proxy --log-file proxy.log
 # or
 set TG_LOG_FILE=proxy.log && tg-ws-proxy
 ```
+
+## Outbound firewall mark (Linux)
+
+Use `--outbound-mark 0x100` or `TG_OUTBOUND_MARK=0x100` to set `SO_MARK` on
+outbound TCP sockets before connecting, including connections to an outbound
+HTTP/SOCKS proxy. Decimal and hexadecimal unsigned 32-bit values are accepted;
+omitting the option leaves sockets unmarked. Explicit `0` sets a zero mark.
+System resolver DNS queries are not marked by this setting.
+
+The mark can match an existing `ip rule fwmark` or firewall rule that excludes
+these connections from transparent redirection, preventing a routing loop.
+Routing/firewall rules must be configured separately.
+
+Linux requires `CAP_NET_ADMIN`, or `CAP_NET_RAW` on kernels 5.17 and newer
+([socket(7)](https://man7.org/linux/man-pages/man7/socket.7.html)). An unavailable
+capability causes connection failure; the proxy never retries without the mark.
+Android and other operating systems reject a configured mark.
+
+On OpenWrt, configure the mark through LuCI or the `outbound_mark` UCI option:
+
+```sh
+uci set tg-ws-proxy-rs.main.outbound_mark='0x100'
+uci commit tg-ws-proxy-rs
+/etc/init.d/tg-ws-proxy-rs restart
+```
+
+The packaged OpenWrt service grants `CAP_NET_RAW` only when a mark is configured
+(requires Linux 5.17+), and adds `CAP_NET_BIND_SERVICE` only if a listener uses a
+privileged port. `CAP_NET_RAW` also permits raw sockets; grant it only to trusted
+processes. Invalid UCI marks are logged and rejected before starting the service.
+On older kernels, marking requires a custom profile with `CAP_NET_ADMIN`.
+For other service managers or containers, grant the needed capability explicitly
+(for example, Docker `--cap-add NET_RAW` on Linux 5.17+).

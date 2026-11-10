@@ -169,6 +169,8 @@ rm -f "$INIT_ROLLBACK_MARKER"
         /etc/config/tg-ws-proxy-rs
         /etc/init.d/tg-ws-proxy-rs
         /etc/capabilities/tg-ws-proxy-rs.json
+        /etc/capabilities/tg-ws-proxy-rs-mark.json
+        /etc/capabilities/tg-ws-proxy-rs-mark-bind.json
         /usr/share/luci/menu.d/luci-app-tg-ws-proxy-rs.json
         /usr/share/rpcd/acl.d/luci-app-tg-ws-proxy-rs.json
         /usr/share/ucitrack/luci-app-tg-ws-proxy-rs.json

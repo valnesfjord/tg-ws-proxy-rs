@@ -1102,7 +1102,7 @@ dependencies = [
 
 [[package]]
 name = "tg-ws-proxy-rs"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "aes",
  "async-http-proxy",
@@ -1123,6 +1123,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "sha2",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "tokio-socks",

@@ -25,7 +25,7 @@ use crate::runtime::Runtime;
 /// Why [`run`] / [`run_with_listen`] stopped before serving, or failed to start.
 #[derive(Debug)]
 pub enum RunError {
-    /// `--outbound-proxy` / `NO_PROXY` could not be parsed.
+    /// Outbound settings could not be parsed or are unsupported on this platform.
     InvalidOutbound(String),
     /// A pinned upstream tier (`--pinned-upstream` / `--pinned-media-upstream`)
     /// names a tier nothing configures.
