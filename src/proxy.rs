@@ -46,12 +46,13 @@ use crate::crypto::{
 use crate::faketls::{
     TLS_MAX_RECORD_PAYLOAD, TLS_READ_HEADROOM, build_faketls_client_hello,
     drain_faketls_server_hello, read_tls_appdata, sign_faketls_client_hello, write_tls_appdata,
+    write_tls_client_init,
 };
 use crate::inbound::mtproto::MtProto;
 use crate::inbound::{self, CLIENT_READ_BUF_SIZE, ClientReader, ClientWriter, Session};
 use crate::outbound::OutboundConnector;
 use crate::pool::{CfTarget, CfTier, WsPool};
-use crate::runtime::Runtime;
+use crate::runtime::{AbortOnDrop, Runtime};
 use crate::splitter::MsgSplitter;
 use crate::ws_client::{
     CfDialOpts, CooldownMap, TgWsStream, WsAttempt, cf_record,
@@ -322,7 +323,7 @@ pub async fn handle_client_with_runtime(
 /// Route and bridge a client whose inbound handshake is done.
 pub(crate) fn serve_session(
     label: SocketAddr,
-    session: Session,
+    mut session: Session,
     config: Arc<Config>,
     pool: Arc<WsPool>,
     runtime: Arc<Runtime>,
@@ -333,10 +334,22 @@ pub(crate) fn serve_session(
     // machine reserves space for their combined widest variants forever. Not
     // an `async fn`: its arguments, the session's ciphers among them, would
     // stay in the session's state machine after moving into the ladder.
+    let idle_timeout = Duration::from_secs(config.client_idle_timeout);
+    let activity = (!idle_timeout.is_zero()).then(|| session.track_activity());
     let ladder = Box::pin(select_bridge(label, session, config, pool, runtime));
     async move {
-        let bridge = ladder.await;
-        if let Some(bridge) = bridge {
+        let Some(bridge) = ladder.await else {
+            return;
+        };
+        if let Some(activity) = activity {
+            activity.record();
+            tokio::select! {
+                _ = bridge => {}
+                _ = activity.wait_for_idle(idle_timeout) => {
+                    info!("[{}] session closed after {}s of inactivity", label, idle_timeout.as_secs());
+                }
+            }
+        } else {
             bridge.await;
         }
     }
@@ -461,7 +474,7 @@ fn bridge_selected(
 
     match upstream {
         Upstream::H2(lane) => Box::pin(async move {
-            if let Err(error) = crate::cf_h2::bridge(
+            let result = crate::cf_h2::bridge(
                 reader,
                 writer,
                 lane,
@@ -469,10 +482,13 @@ fn bridge_selected(
                 ciphers.clt_dec.0,
                 ciphers.clt_enc.0,
             )
-            .await
-            {
-                debug!("[{}] DC{} media HTTP/2 bridge closed: {}", label, dc, error);
-            }
+            .await;
+            info!(
+                "[{}] DC{} media HTTP/2 session closed: {}",
+                label,
+                dc,
+                result.err().as_deref().unwrap_or("finished")
+            );
         }),
         Upstream::Ws { ws, framing } => Box::pin(bridge_ws(
             reader,
@@ -1157,51 +1173,66 @@ impl Route<'_> {
 
     /// Try each configured upstream MTProto proxy in order.
     ///
-    /// `force` dials through the failure cooldown — see [`Self::cf_worker`].
+    /// A pinned last resort retries cooling proxies once every ready proxy has failed.
     async fn upstream_proxies(&self, reason: &str, force: bool) -> Option<UpstreamConnection> {
+        let mut cooling = Vec::new();
         for upstream in &self.config.mtproto_proxies {
             let key = upstream_key(&upstream.host, upstream.port);
-            if !force && UPSTREAM_FAIL.active(key.as_str()) {
-                debug!("[{}] upstream {} in cooldown, skipping", self.label, key);
+            if UPSTREAM_FAIL.active(key.as_str()) {
+                if force {
+                    cooling.push((upstream, key));
+                } else {
+                    debug!("[{}] upstream {} in cooldown, skipping", self.label, key);
+                }
                 continue;
             }
-
-            let conn = connect_mtproto_upstream(
-                upstream,
-                self.dc_idx,
-                self.proto,
-                self.timeouts.upstream_connect,
-                self.runtime.outbound(),
-            )
-            .await;
-
-            match conn {
-                Some(conn) => {
-                    UPSTREAM_FAIL.clear(key.as_str());
-                    info!(
-                        "[{}] DC{}{} {} → upstream {} MTProto {}",
-                        self.label,
-                        self.dc,
-                        self.media,
-                        reason,
-                        if conn.faketls { "FakeTLS" } else { "plain" },
-                        key
-                    );
-                    return Some(conn);
-                }
-                None => {
-                    UPSTREAM_FAIL.set(key.clone(), self.timeouts.upstream_fail_cooldown);
-                    warn!(
-                        "[{}] upstream {} failed, cooldown {}s",
-                        self.label,
-                        key,
-                        self.timeouts.upstream_fail_cooldown.as_secs()
-                    );
-                }
+            if let Some(conn) = self.dial_upstream_proxy(upstream, key, reason).await {
+                return Some(conn);
             }
         }
-
+        for (upstream, key) in cooling {
+            if let Some(conn) = self.dial_upstream_proxy(upstream, key, reason).await {
+                return Some(conn);
+            }
+        }
         None
+    }
+
+    async fn dial_upstream_proxy(
+        &self,
+        upstream: &MtProtoProxy,
+        key: String,
+        reason: &str,
+    ) -> Option<UpstreamConnection> {
+        let conn = connect_mtproto_upstream(
+            upstream,
+            self.dc_idx,
+            self.proto,
+            self.timeouts.upstream_connect,
+            self.runtime.outbound(),
+        )
+        .await;
+        if let Some(conn) = &conn {
+            UPSTREAM_FAIL.clear(key.as_str());
+            info!(
+                "[{}] DC{}{} {} → upstream {} MTProto {}",
+                self.label,
+                self.dc,
+                self.media,
+                reason,
+                if conn.faketls { "FakeTLS" } else { "plain" },
+                key
+            );
+        } else {
+            warn!(
+                "[{}] upstream {} failed, cooldown {}s",
+                self.label,
+                key,
+                self.timeouts.upstream_fail_cooldown.as_secs()
+            );
+            UPSTREAM_FAIL.set(key, self.timeouts.upstream_fail_cooldown);
+        }
+        conn
     }
 
     /// Open a fresh direct WebSocket to `target_ip`, always fronted when
@@ -1579,7 +1610,10 @@ async fn connect_mtproto_upstream(
     }
 
     // Drain the server's fake TLS handshake response.
-    if !drain_faketls_server_hello(&mut reader).await {
+    if !matches!(
+        tokio::time::timeout(timeout, drain_faketls_server_hello(&mut reader)).await,
+        Ok(true)
+    ) {
         warn!(
             "[upstream] {}:{} FakeTLS server handshake failed",
             host, port
@@ -1587,8 +1621,7 @@ async fn connect_mtproto_upstream(
         return None;
     }
 
-    // Send the 64-byte MTProto init as the first Application Data record.
-    if let Err(e) = write_tls_appdata(&mut writer, &handshake).await {
+    if let Err(e) = write_tls_client_init(&mut writer, &handshake).await {
         warn!(
             "[upstream] {}:{} FakeTLS send MTProto init error: {}",
             host, port, e
@@ -1859,20 +1892,21 @@ async fn bridge_tcp(
 /// Joining both directions instead left zombie connections behind that
 /// exhausted the file-descriptor limit.
 ///
-async fn join_bridge<D>(mut upload: JoinHandle<()>, download: D) -> ClosedBy
+async fn join_bridge<D>(upload: JoinHandle<()>, download: D) -> ClosedBy
 where
     D: Future<Output = ()>,
 {
+    let mut upload = AbortOnDrop(upload);
     tokio::pin!(download);
 
     tokio::select! {
-        _ = &mut upload => {
+        _ = &mut upload.0 => {
             // The upload direction only ends when the client stops sending.
             ClosedBy::Client
         }
         _ = &mut download => {
-            upload.abort();
-            let _ = upload.await;
+            upload.0.abort();
+            let _ = (&mut upload.0).await;
             ClosedBy::Upstream
         }
     }

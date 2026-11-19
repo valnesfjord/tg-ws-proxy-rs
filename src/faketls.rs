@@ -10,7 +10,8 @@
 //! 2. **Server response** — the proxy replies with ServerHello + ChangeCipherSpec
 //!    + an Application Data record (fake certificate).  All records are drained.
 //!
-//! 3. **Data phase** — all data is wrapped in TLS Application Data records
+//! 3. **Data phase** — the client sends a compatibility ChangeCipherSpec,
+//!    then wraps all data in TLS Application Data records
 //!    (`\x17\x03\x03` + 2-byte big-endian length + payload).  Inside these
 //!    records, the standard MTProto obfuscation (AES-CTR) is used.
 
@@ -56,6 +57,8 @@ const TLS_HANDSHAKE_SERVER_HELLO: u8 = 0x02;
 const TLS_CLIENT_RANDOM_OFFSET_IN_HANDSHAKE: usize = 6;
 const TLS_SERVER_RANDOM_OFFSET_IN_PACKET: usize = 11;
 const TLS_CHANGE_CIPHER_SPEC_VALUE: u8 = 0x01;
+// MTProxy FakeTLS peers can expect a 517-byte ClientHello record.
+const FAKETLS_CLIENT_HELLO_LEN: usize = 517;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -69,7 +72,7 @@ pub struct FakeTlsClientHello {
 
 // ─── ClientHello construction ───────────────────────────────────────────────
 
-/// Build a TLS 1.2-style ClientHello with the `random` field zeroed.
+/// Build a TLS 1.3-style ClientHello with the `random` field zeroed.
 ///
 /// The returned record must be signed with [`sign_faketls_client_hello`]
 /// before sending — that function fills the `random` field with the
@@ -98,7 +101,18 @@ pub fn build_faketls_client_hello(hostname: &str) -> Vec<u8> {
         0x04, 0x03, 0x08, 0x04, 0x04, 0x01,
         0x05, 0x03, 0x08, 0x05, 0x05, 0x01,
         0x08, 0x06, 0x06, 0x01, 0x02, 0x01,
+        // ALPN: h2 and http/1.1
+        0x00, 0x10, 0x00, 0x0e, 0x00, 0x0c,
+        0x02, b'h', b'2', 0x08, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1',
+        // status_request: OCSP with empty responder IDs and request extensions
+        0x00, 0x05, 0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00,
+        // signed_certificate_timestamp, psk_key_exchange_modes (psk_dhe_ke)
+        0x00, 0x12, 0x00, 0x00,
+        0x00, 0x2d, 0x00, 0x02, 0x01, 0x01,
+        // supported_versions: TLS 1.3 and TLS 1.2
+        0x00, 0x2b, 0x00, 0x05, 0x04, 0x03, 0x04, 0x03, 0x03,
     ];
+    const KEY_SHARE_HEADER: &[u8] = &[0x00, 0x33, 0x00, 0x26, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20];
     #[rustfmt::skip]
     const CIPHER_SUITES: &[u8] = &[
         0x13, 0x01, 0x13, 0x02, 0x13, 0x03,
@@ -112,12 +126,25 @@ pub fn build_faketls_client_hello(hostname: &str) -> Vec<u8> {
     let host_len = host_b.len() as u16;
     let sni_list_len = 3u16 + host_len;
     let sni_data_len = 2u16 + sni_list_len;
-    let extensions_len = 4 + sni_data_len as usize + FIXED_EXTENSIONS.len();
-    let hello_len = 2 + 32 + 1 + 32 + 2 + CIPHER_SUITES.len() + 2 + 2 + extensions_len;
-    let handshake_len = 4 + hello_len;
-
     let mut session_id = [0u8; 32];
-    rand::rng().fill_bytes(&mut session_id);
+    let mut key_share = [0u8; 32];
+    let mut rng = rand::rng();
+    rng.fill_bytes(&mut session_id);
+    rng.fill_bytes(&mut key_share);
+    // FakeTLS authenticates with HMAC and never uses the X25519 share for key exchange.
+    key_share[31] &= 0x7f;
+
+    let hello_prefix_len = 2 + 32 + 1 + session_id.len() + 2 + CIPHER_SUITES.len() + 2 + 2;
+    let unpadded_extensions_len = 4
+        + sni_data_len as usize
+        + FIXED_EXTENSIONS.len()
+        + KEY_SHARE_HEADER.len()
+        + key_share.len();
+    let padding_len = FAKETLS_CLIENT_HELLO_LEN
+        .checked_sub(5 + 4 + hello_prefix_len + unpadded_extensions_len + 4);
+    let extensions_len = unpadded_extensions_len + padding_len.map_or(0, |len| 4 + len);
+    let hello_len = hello_prefix_len + extensions_len;
+    let handshake_len = 4 + hello_len;
 
     let mut record = Vec::with_capacity(5 + handshake_len);
     record.push(TLS_RECORD_HANDSHAKE);
@@ -144,6 +171,13 @@ pub fn build_faketls_client_hello(hostname: &str) -> Vec<u8> {
     record.extend_from_slice(&host_len.to_be_bytes());
     record.extend_from_slice(host_b);
     record.extend_from_slice(FIXED_EXTENSIONS);
+    record.extend_from_slice(KEY_SHARE_HEADER);
+    record.extend_from_slice(&key_share);
+    if let Some(padding_len) = padding_len {
+        record.extend_from_slice(&0x0015u16.to_be_bytes());
+        record.extend_from_slice(&(padding_len as u16).to_be_bytes());
+        record.resize(record.len() + padding_len, 0);
+    }
 
     debug_assert_eq!(record.len(), 5 + handshake_len);
 
@@ -453,6 +487,29 @@ pub async fn drain_faketls_server_hello<R: AsyncRead + Unpin>(reader: &mut R) ->
 }
 
 // ─── TLS Application Data record framing ─────────────────────────────────────
+
+/// Send the client compatibility record and the first MTProto init together.
+pub(crate) async fn write_tls_client_init(
+    writer: &mut (impl AsyncWrite + Unpin),
+    init: &[u8; 64],
+) -> std::io::Result<()> {
+    let mut records = [0u8; 6 + 5 + 64];
+    records[..11].copy_from_slice(&[
+        TLS_RECORD_CHANGE_CIPHER_SPEC,
+        TLS_VERSION_12[0],
+        TLS_VERSION_12[1],
+        0,
+        1,
+        TLS_CHANGE_CIPHER_SPEC_VALUE,
+        TLS_RECORD_APPLICATION_DATA,
+        TLS_VERSION_12[0],
+        TLS_VERSION_12[1],
+        0,
+        init.len() as u8,
+    ]);
+    records[11..].copy_from_slice(init);
+    writer.write_all(&records).await
+}
 
 /// Wrap `data` in one or more TLS Application Data records.
 ///

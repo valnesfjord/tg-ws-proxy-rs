@@ -3,6 +3,7 @@
 mod common;
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
@@ -10,6 +11,7 @@ use futures_util::{SinkExt, StreamExt};
 use tg_ws_proxy_rs::config::Config;
 use tg_ws_proxy_rs::crypto::{ProtoTag, apply_keystream, generate_relay_init, make_cipher};
 use tg_ws_proxy_rs::inbound::socks;
+use tg_ws_proxy_rs::{pool::WsPool, runtime::Runtime};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -30,12 +32,16 @@ async fn start(cfg: Config) -> (TcpStream, tokio::task::JoinHandle<()>) {
     (client, tokio::spawn(handler))
 }
 
-#[tokio::test]
-async fn client_handler_future_stays_compact() {
-    // Every SOCKS client holds this state for its whole session, so it gets
-    // the same budget as the MTProto listener's handler.
-    let (_client, handler) = handler(config()).await;
-    let future_size = std::mem::size_of_val(&handler);
+#[test]
+fn client_handler_future_stays_compact() {
+    fn handler_size<F>(
+        _: impl Fn(TcpStream, SocketAddr, Arc<Config>, Arc<WsPool>, Arc<Runtime>) -> F,
+    ) -> usize {
+        std::mem::size_of::<F>()
+    }
+
+    // Every SOCKS client holds this state for its whole session.
+    let future_size = handler_size(socks::handle_client);
     assert!(
         future_size <= 4 * 1024,
         "the SOCKS client future grew to {future_size} bytes"

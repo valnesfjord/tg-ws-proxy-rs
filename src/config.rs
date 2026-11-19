@@ -498,6 +498,14 @@ pub struct Config {
     )]
     pub handshake_timeout: u64,
 
+    /// Seconds without traffic in either direction before closing a client session (0 disables).
+    #[arg(
+        long = "client-idle-timeout",
+        default_value = "900",
+        env = "TG_CLIENT_IDLE_TIMEOUT"
+    )]
+    pub client_idle_timeout: u64,
+
     /// TCP fallback connect timeout in seconds.
     #[arg(
         long = "tcp-fallback-timeout",

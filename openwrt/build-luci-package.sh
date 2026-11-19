@@ -44,7 +44,7 @@ old_packages=("$SDK"/bin/packages/*/*/luci-app-tg-ws-proxy-rs*."$FORMAT")
 ((${#old_packages[@]} == 0)) || rm -f "${old_packages[@]}"
 
 export TG_PACKAGE_VERSION="$VERSION"
-make -C "$SDK" defconfig >/dev/null
+make -C "$SDK" defconfig
 make -C "$SDK" package/luci-app-tg-ws-proxy-rs/clean >/dev/null
 make -C "$SDK" package/luci-app-tg-ws-proxy-rs/compile
 

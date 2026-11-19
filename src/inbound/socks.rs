@@ -400,8 +400,8 @@ impl Inbound for Socks5 {
         };
         let (reader, writer) = stream.into_split();
         Ok(Session {
-            reader: ClientReader::Plain(reader),
-            writer: ClientWriter::Plain(writer),
+            reader: ClientReader::new(reader, None),
+            writer: ClientWriter::new(writer, false),
             dc_idx,
             proto: transport.proto,
             obfuscation: transport.obfuscation,

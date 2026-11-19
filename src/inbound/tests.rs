@@ -17,3 +17,16 @@ fn faketls_pending_uses_an_offset_and_releases_its_record() {
     assert_eq!(pending.data.capacity(), 0);
     assert_eq!(pending.read(&mut last), None);
 }
+
+#[tokio::test]
+async fn client_activity_restarts_the_idle_clock() {
+    let timeout = Duration::from_secs(30);
+    let activity = ClientActivity(Arc::new(Mutex::new(Instant::now() - timeout)));
+    let mut idle = std::pin::pin!(activity.wait_for_idle(timeout));
+    assert!(futures_util::poll!(idle.as_mut()).is_ready());
+
+    activity.record();
+
+    let mut idle = std::pin::pin!(activity.wait_for_idle(timeout));
+    assert!(futures_util::poll!(idle.as_mut()).is_pending());
+}

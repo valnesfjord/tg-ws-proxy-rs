@@ -615,7 +615,8 @@ jobs:
           path: ${{ runner.temp }}/device-logs/**
 
   openwrt:
-    runs-on: ubuntu-latest
+    # Keep the OpenWrt 24.10 IPK SDK on the Ubuntu 24.04 host toolchain.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
 

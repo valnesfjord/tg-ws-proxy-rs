@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{Semaphore, watch};
-use tokio::task::JoinHandle;
+use tokio::time::{Instant, sleep_until};
 use tracing::{error, info, warn};
 
 use crate::check;
@@ -20,7 +20,7 @@ use crate::inbound::socks::Socks5;
 use crate::inbound::{self, Inbound, Listeners};
 use crate::limits::{auto_max_connections, soft_nofile_limit};
 use crate::pool::WsPool;
-use crate::runtime::Runtime;
+use crate::runtime::{AbortOnDrop, Runtime};
 
 /// Why [`run`] / [`run_with_listen`] stopped before serving, or failed to start.
 #[derive(Debug)]
@@ -495,6 +495,7 @@ pub async fn run_with_listen(
     const EMFILE: i32 = 24; // too many open files (per-process fd limit)
     const ENFILE: i32 = 23; // file table overflow (system-wide fd limit)
     let semaphore = Arc::new(Semaphore::new(max_connections));
+    let mut warn_limit_at = Instant::now();
     loop {
         // Block here when we are already at the connection limit.  Pending
         // TCP connections queue in the kernel backlog until capacity frees up.
@@ -506,6 +507,11 @@ pub async fn run_with_listen(
             }
             permit = Arc::clone(&semaphore).acquire_owned() => {
                 permit.expect("semaphore closed unexpectedly")
+            }
+            _ = sleep_until(warn_limit_at), if semaphore.available_permits() == 0 => {
+                warn!(max_connections, "Client connection limit reached; waiting for a free slot");
+                warn_limit_at = Instant::now() + Duration::from_secs(30);
+                continue;
             }
         };
 
@@ -555,17 +561,6 @@ pub async fn run_with_listen(
 
     info!("proxy stopped");
     Ok(())
-}
-
-/// Aborts the task when dropped, so a background task started by
-/// [`run_with_listen`] ends with it rather than outliving a stopped proxy in
-/// an embedder that keeps its runtime.
-struct AbortOnDrop(JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
 }
 
 /// Re-fetch the `--default-domains` list after the startup fetch failed, and

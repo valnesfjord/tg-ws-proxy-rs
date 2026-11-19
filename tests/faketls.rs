@@ -8,6 +8,28 @@ use tg_ws_proxy_rs::faketls::{
 const TLS_SERVER_RANDOM_OFFSET_IN_PACKET: usize = 11;
 
 #[test]
+fn tls_parser_accepts_the_padded_outbound_client_hello() {
+    let hostname = "example.net";
+    let mut hello = build_faketls_client_hello(hostname);
+    sign_faketls_client_hello(&mut hello, &[0x42; 16]);
+    assert_eq!(hello.len(), 517);
+
+    let mut acceptor = rustls::server::Acceptor::default();
+    acceptor.read_tls(&mut hello.as_slice()).unwrap();
+    let accepted = acceptor
+        .accept()
+        .map_err(|(error, _)| error)
+        .unwrap()
+        .unwrap();
+    let parsed = accepted.client_hello();
+    assert_eq!(parsed.server_name(), Some(hostname));
+    assert_eq!(
+        parsed.alpn().unwrap().collect::<Vec<_>>(),
+        [b"h2".as_slice(), b"http/1.1".as_slice()]
+    );
+}
+
+#[test]
 fn signed_client_hello_parses_hostname_and_auth() {
     // The inbound listener accepts only a ClientHello signed with the shared
     // secret and keeps the SNI hostname for domain validation.

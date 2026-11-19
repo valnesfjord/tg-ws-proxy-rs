@@ -148,9 +148,9 @@ Operate it with the script itself:
 `status` prints the `tg://` link read back out of `/opt/var/log/tg-ws-proxy-rs.log`
 (the previous run is kept beside it as `.log.1`, capped at its last 64 KiB when
 a run went over 1 MiB). Backups land in
-`/opt/var/tg-ws-proxy-backups/install-<stamp>`, three kept. Every flag in the
-[next section](#configuration-via-environment) has its `TG_*` equivalent, and
-those are the names `config.conf` sets.
+`/opt/var/tg-ws-proxy-backups/install-<stamp>`, three kept. Add extra flags in
+`EXTRA_ARGS` in `/opt/etc/tg-ws-proxy-rs/config.conf`. For example, add
+`--client-idle-timeout 600` for a ten-minute timeout.
 
 ## Configuration via environment
 
@@ -170,6 +170,7 @@ TG_SOCKS_DC=-2:203.0.113.10
 TG_POOL_SIZE=4
 TG_BUF_KB=256
 TG_MAX_CONNECTIONS=64
+TG_CLIENT_IDLE_TIMEOUT=900
 TG_QUIET=true
 TG_VERBOSE=false
 TG_SKIP_TLS_VERIFY=false

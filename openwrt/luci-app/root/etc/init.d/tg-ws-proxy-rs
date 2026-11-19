@@ -195,6 +195,7 @@ start_service() {
 	append_env ws_redirect_cooldown TG_WS_REDIRECT_COOLDOWN 300
 	append_env ip_fail_cooldown TG_IP_FAIL_COOLDOWN 3600
 	append_env handshake_timeout TG_HANDSHAKE_TIMEOUT 10
+	append_env client_idle_timeout TG_CLIENT_IDLE_TIMEOUT 900
 	append_env tcp_fallback_timeout TG_TCP_FALLBACK_TIMEOUT 10
 	append_env upstream_connect_timeout TG_UPSTREAM_CONNECT_TIMEOUT 5
 	append_env upstream_fail_cooldown TG_UPSTREAM_FAIL_COOLDOWN 60

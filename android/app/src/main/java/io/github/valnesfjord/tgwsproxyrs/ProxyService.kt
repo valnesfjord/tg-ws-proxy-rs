@@ -187,6 +187,7 @@ class ProxyService : Service() {
             "--default-domains --cf-balance --quiet --host 127.0.0.1 --link-ip 127.0.0.1"
         const val PREFS = "tg_ws_proxy"
         const val PREF_ARGS = "args"
+        const val PREF_START_ON_BOOT = "start_on_boot"
 
         private const val CHANNEL_ID = "proxy"
         private const val NOTIFICATION_ID = 1

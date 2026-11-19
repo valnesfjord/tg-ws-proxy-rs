@@ -17,7 +17,7 @@ pub mod socks;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -26,6 +26,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::OwnedSemaphorePermit;
+use tokio::time::Instant;
 use tracing::debug;
 
 use crate::config::Config;
@@ -50,6 +51,36 @@ pub(crate) struct Session {
     /// The client's transport obfuscation as `(decrypt, encrypt)`, or `None`
     /// for a plain transport.
     pub(crate) obfuscation: Option<(AesCtr256, AesCtr256)>,
+}
+
+impl Session {
+    pub(crate) fn track_activity(&mut self) -> ClientActivity {
+        let activity = ClientActivity(Arc::new(Mutex::new(Instant::now())));
+        self.reader.activity = Some(activity.clone());
+        self.writer.activity = Some(activity.clone());
+        activity
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ClientActivity(Arc<Mutex<Instant>>);
+
+impl ClientActivity {
+    pub(crate) fn record(&self) {
+        *self.0.lock().unwrap() = Instant::now();
+    }
+
+    pub(crate) async fn wait_for_idle(&self, timeout: Duration) {
+        loop {
+            let elapsed = self.0.lock().unwrap().elapsed();
+            if elapsed >= timeout {
+                return;
+            }
+            // Leave the timer armed until the previous deadline; active sessions
+            // only have to recheck once per idle interval.
+            tokio::time::sleep(timeout - elapsed).await;
+        }
+    }
 }
 
 /// A way for a client to reach a listener, as offered to the user to copy.
@@ -103,6 +134,19 @@ pub(crate) async fn serve<I: Inbound>(
     runtime: Arc<Runtime>,
 ) {
     let _ = stream.set_nodelay(true);
+    let keepalive = socket2::TcpKeepalive::new().with_time(Duration::from_secs(120));
+    #[cfg(any(
+        target_os = "android",
+        target_os = "linux",
+        target_os = "macos",
+        windows
+    ))]
+    let keepalive = keepalive
+        .with_interval(Duration::from_secs(30))
+        .with_retries(3);
+    if let Err(error) = socket2::SockRef::from(&stream).set_tcp_keepalive(&keepalive) {
+        debug!("[{}] TCP keepalive configuration failed: {}", peer, error);
+    }
     let timeout = Duration::from_secs(config.handshake_timeout);
     // No arm awaits: the handshake's result, ciphers included, stays a
     // temporary of this statement instead of part of the session's state.
@@ -293,12 +337,10 @@ impl Listeners {
 pub(crate) const CLIENT_READ_BUF_SIZE: usize = TLS_MAX_RECORD_PAYLOAD + TLS_READ_HEADROOM;
 
 /// The client's side of a session, with any listener camouflage removed.
-pub(crate) enum ClientReader {
-    Plain(OwnedReadHalf),
-    FakeTls {
-        reader: OwnedReadHalf,
-        pending: PendingData,
-    },
+pub(crate) struct ClientReader {
+    tcp: OwnedReadHalf,
+    faketls_pending: Option<PendingData>,
+    activity: Option<ClientActivity>,
 }
 
 /// Handshake bytes that arrived in the same FakeTLS record as the MTProto
@@ -332,39 +374,62 @@ impl PendingData {
 }
 
 impl ClientReader {
-    pub(crate) async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Self::Plain(reader) => reader.read(buf).await,
-            Self::FakeTls { reader, pending } => {
-                if let Some(n) = pending.read(buf) {
-                    return Ok(n);
-                }
-
-                read_tls_appdata(reader, buf).await
-            }
+    pub(crate) fn new(tcp: OwnedReadHalf, faketls_pending: Option<PendingData>) -> Self {
+        Self {
+            tcp,
+            faketls_pending,
+            activity: None,
         }
     }
 
-    async fn drain(self) {
-        match self {
-            Self::Plain(mut reader) | Self::FakeTls { mut reader, .. } => {
-                let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
-            }
+    pub(crate) async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = match &mut self.faketls_pending {
+            Some(pending) => match pending.read(buf) {
+                Some(n) => n,
+                None => read_tls_appdata(&mut self.tcp, buf).await?,
+            },
+            None => self.tcp.read(buf).await?,
+        };
+        if n != 0
+            && let Some(activity) = &self.activity
+        {
+            activity.record();
         }
+        Ok(n)
+    }
+
+    async fn drain(mut self) {
+        let _ = tokio::io::copy(&mut self.tcp, &mut tokio::io::sink()).await;
     }
 }
 
-pub(crate) enum ClientWriter {
-    Plain(OwnedWriteHalf),
-    FakeTls(OwnedWriteHalf),
+pub(crate) struct ClientWriter {
+    tcp: OwnedWriteHalf,
+    faketls: bool,
+    activity: Option<ClientActivity>,
 }
 
 impl ClientWriter {
-    pub(crate) async fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
-        match self {
-            Self::Plain(writer) => writer.write_all(data).await,
-            Self::FakeTls(writer) => write_tls_appdata(writer, data).await,
+    pub(crate) fn new(tcp: OwnedWriteHalf, faketls: bool) -> Self {
+        Self {
+            tcp,
+            faketls,
+            activity: None,
         }
+    }
+
+    pub(crate) async fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        if self.faketls {
+            write_tls_appdata(&mut self.tcp, data).await?;
+        } else {
+            self.tcp.write_all(data).await?;
+        }
+        if !data.is_empty()
+            && let Some(activity) = &self.activity
+        {
+            activity.record();
+        }
+        Ok(())
     }
 }
 

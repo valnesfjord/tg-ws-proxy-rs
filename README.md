@@ -279,6 +279,7 @@ tg-ws-proxy [OPTIONS]
 | `--ip-fail-cooldown <SECS>` | `3600` | How long to skip the direct WS path for a `--dc-ip` address whose TCP connect timed out, when a Cloudflare/upstream fallback is configured |
 | `--fronting-domain <DOMAIN>` | off | Always present this domain as the TLS SNI for direct WS connections (fronting), e.g. `sprinthost.ru`; needs `--dc-ip` |
 | `--max-connections <N>` | auto | Max concurrent client connections (auto-computed from `ulimit -n`) |
+| `--client-idle-timeout <SECS>` | `900` | Close a client session after this long without traffic in either direction. `0` disables the timeout. |
 | `--mtproto-proxy <HOST:PORT:SECRET>` | — | Upstream MTProto proxy fallback (repeatable) |
 | `--outbound-proxy <URL>` | — | Proxy for all outgoing connections: `http://`, `socks5://`, or `socks5h://`; `https://` proxy URLs are not supported |
 | `--no-outbound-proxy` | off | Ignore standard outbound proxy environment variables |

@@ -23,6 +23,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.Icon
@@ -39,6 +40,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -59,6 +62,7 @@ fun TgWsTheme(content: @Composable () -> Unit) {
 fun ProxyScreen(viewModel: ProxyViewModel) {
     val args by viewModel.args.collectAsStateWithLifecycle()
     val running by viewModel.running.collectAsStateWithLifecycle()
+    val startOnBoot by viewModel.startOnBoot.collectAsStateWithLifecycle()
     val tgLink by viewModel.tgLink.collectAsStateWithLifecycle()
     val error by viewModel.error.collectAsStateWithLifecycle()
     val logs = viewModel.logs
@@ -134,13 +138,34 @@ fun ProxyScreen(viewModel: ProxyViewModel) {
                 )
             }
 
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                val label = stringResource(R.string.start_on_boot)
+                Text(label, modifier = Modifier.weight(1f))
+                Switch(
+                    checked = startOnBoot,
+                    onCheckedChange = viewModel::updateStartOnBoot,
+                    modifier = Modifier.semantics { contentDescription = label },
+                )
+            }
+
             if (tgLink != null) {
                 Spacer(Modifier.height(8.dp))
-                OutlinedButton(
-                    onClick = viewModel::openLink,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text(stringResource(R.string.open_telegram_link))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(
+                        onClick = viewModel::openLink,
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Text(stringResource(R.string.open_telegram_link))
+                    }
+                    OutlinedButton(
+                        onClick = viewModel::copyLink,
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Text(stringResource(R.string.copy_proxy_link))
+                    }
                 }
             }
 

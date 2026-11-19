@@ -4,42 +4,19 @@ use clap::Parser;
 
 use crate::crypto::{HANDSHAKE_LEN, build_connection_ciphers};
 
-#[tokio::test]
-async fn client_handler_future_stays_compact() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let client = TcpStream::connect(listener.local_addr().unwrap())
-        .await
-        .unwrap();
-    let (server, peer) = listener.accept().await.unwrap();
+#[test]
+fn client_handler_future_stays_compact() {
+    fn handler_size<F>(
+        _: impl Fn(TcpStream, SocketAddr, Arc<Config>, Arc<WsPool>, Arc<Runtime>) -> F,
+    ) -> usize {
+        std::mem::size_of::<F>()
+    }
 
-    let config = Arc::new(
-        Config::try_parse_from([
-            "tg-ws-proxy",
-            "--secret",
-            "00112233445566778899aabbccddeeff",
-            "--pool-size",
-            "0",
-            "--no-outbound-proxy",
-        ])
-        .unwrap(),
-    );
-    let runtime = Arc::new(Runtime::new(OutboundConnector::direct()));
-    let pool = Arc::new(WsPool::with_runtime(
-        0,
-        Duration::from_secs(55),
-        Arc::clone(&runtime),
-    ));
-    let handler = handle_client_with_runtime(server, peer, config, pool, runtime);
-    let future_size = std::mem::size_of_val(&handler);
-    eprintln!("per-client future size: {future_size} bytes");
-
+    let future_size = handler_size(handle_client_with_runtime);
     assert!(
         future_size <= 4 * 1024,
         "the per-client future grew to {future_size} bytes"
     );
-
-    drop(handler);
-    drop(client);
 }
 
 #[test]
@@ -177,6 +154,25 @@ async fn an_aborted_direction_still_reports_the_bytes_it_moved() {
 }
 
 #[tokio::test]
+async fn cancelling_a_bridge_cancels_its_upload() {
+    let (sender, dropped) = tokio::sync::oneshot::channel::<()>();
+    let upload = tokio::spawn(async move {
+        let _sender = sender;
+        std::future::pending::<()>().await;
+    });
+    let mut bridge = Box::pin(join_bridge(upload, std::future::pending()));
+    assert!(futures_util::poll!(bridge.as_mut()).is_pending());
+    drop(bridge);
+
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), dropped)
+            .await
+            .expect("the cancelled bridge left the upload running")
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn the_side_that_stops_first_is_the_one_reported() {
     // A session that transfers nothing looks identical whichever side hung
     // up; this is what tells a client-side timeout apart from an upstream
@@ -249,8 +245,8 @@ async fn upstream_frame_sizes(framing: WsFraming, payload: &[u8]) -> Vec<usize> 
 
     let bridge = tokio::spawn(async move {
         bridge_ws(
-            ClientReader::Plain(reader),
-            ClientWriter::Plain(writer),
+            ClientReader::new(reader, None),
+            ClientWriter::new(writer, false),
             WsBridgeParams {
                 label: "127.0.0.1:1".parse().unwrap(),
                 ws,
@@ -466,6 +462,110 @@ async fn a_pinned_ladder_re_probes_a_cooled_dc_ip_when_every_rung_fails() {
         re_probed_the_cooled_ip,
         "the cooled address was never asked again, so nothing can clear it"
     );
+}
+
+#[tokio::test]
+async fn pinned_mtproto_proxies_try_ready_endpoints_before_cooling_ones() {
+    let cooling = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ready = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cooling_addr = cooling.local_addr().unwrap();
+    let ready_addr = ready.local_addr().unwrap();
+    let secret = "00112233445566778899aabbccddeeff";
+    let config = ladder_config(&[
+        "--mtproto-proxy",
+        &format!("{cooling_addr}:{secret}"),
+        "--mtproto-proxy",
+        &format!("{ready_addr}:{secret}"),
+    ]);
+    let runtime = Arc::new(Runtime::new(OutboundConnector::direct()));
+    let pool = Arc::new(WsPool::new(0, Duration::from_secs(55)));
+    let route = ladder_route(&config, &runtime, &pool, 2);
+    UPSTREAM_FAIL.set(cooling_addr.to_string(), Duration::from_secs(60));
+
+    let tiers = [UpstreamTier::Mtproto];
+    let Some(Upstream::Mtproto(conn)) = route.pinned_ladder(&tiers, None).await else {
+        panic!("the ready MTProto upstream should connect");
+    };
+    assert_eq!(conn.reader.peer_addr().unwrap(), ready_addr);
+    assert!(UPSTREAM_FAIL.active(cooling_addr.to_string().as_str()));
+    drop(conn);
+
+    UPSTREAM_FAIL.set(ready_addr.to_string(), Duration::from_secs(60));
+    let conn = route.upstream_proxies("default", false).await;
+    assert!(
+        conn.is_none(),
+        "only the last pinned tier can retry a cooling proxy"
+    );
+    let Some(Upstream::Mtproto(conn)) = route.pinned_ladder(&tiers, None).await else {
+        panic!("the pinned tier should retry its cooling upstreams");
+    };
+    assert_eq!(conn.reader.peer_addr().unwrap(), cooling_addr);
+    assert!(!UPSTREAM_FAIL.active(cooling_addr.to_string().as_str()));
+    UPSTREAM_FAIL.clear(ready_addr.to_string().as_str());
+}
+
+#[tokio::test]
+async fn faketls_client_init_record_layout() {
+    let init = [0x42; 64];
+    let mut wire = Vec::new();
+    write_tls_client_init(&mut wire, &init).await.unwrap();
+
+    assert_eq!(
+        &wire[..11],
+        &[0x14, 0x03, 0x03, 0, 1, 1, 0x17, 0x03, 0x03, 0, 64]
+    );
+    assert_eq!(&wire[11..], &init);
+}
+
+#[tokio::test]
+async fn outbound_faketls_sends_client_ccs_before_the_mtproto_init() {
+    use crate::faketls::{
+        TLS_MAX_RECORD_PAYLOAD, build_faketls_server_hello, parse_faketls_client_hello,
+        read_tls_record_bytes,
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let key = "00112233445566778899aabbccddeeff";
+    let config = ladder_config(&[
+        "--mtproto-proxy",
+        &format!("{addr}:ee{key}{}", hex::encode("example.net")),
+    ]);
+    let proxy = &config.mtproto_proxies[0];
+    let outbound = OutboundConnector::direct();
+    let dial = connect_mtproto_upstream(
+        proxy,
+        2,
+        ProtoTag::PaddedIntermediate,
+        Duration::from_secs(2),
+        &outbound,
+    );
+    let peer = async {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let record = read_tls_record_bytes(&mut socket, TLS_MAX_RECORD_PAYLOAD)
+            .await
+            .unwrap()
+            .unwrap();
+        let hello = parse_faketls_client_hello(&record, proxy.secret_key()).unwrap();
+        socket
+            .write_all(&build_faketls_server_hello(proxy.secret_key(), &hello))
+            .await
+            .unwrap();
+        let mut ccs = [0; 6];
+        socket.read_exact(&mut ccs).await.unwrap();
+        assert_eq!(ccs, [0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
+
+        let mut init = [0; 64];
+        assert_eq!(read_tls_appdata(&mut socket, &mut init).await.unwrap(), 64);
+        let handshake = crate::crypto::parse_handshake(&init, proxy.secret_key()).unwrap();
+        assert_eq!(handshake.dc_id, 2);
+    };
+
+    let (connection, ()) =
+        tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(dial, peer) })
+            .await
+            .unwrap();
+    assert!(connection.is_some());
 }
 
 // ─── The background probe of a cooled `--dc-ip` ──────────────────────────────

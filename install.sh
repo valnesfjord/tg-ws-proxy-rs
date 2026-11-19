@@ -600,6 +600,7 @@ migrate_manual_config() {
 	set_from_env TG_WS_REDIRECT_COOLDOWN ws_redirect_cooldown
 	set_from_env TG_IP_FAIL_COOLDOWN ip_fail_cooldown
 	set_from_env TG_HANDSHAKE_TIMEOUT handshake_timeout
+	set_from_env TG_CLIENT_IDLE_TIMEOUT client_idle_timeout
 	set_from_env TG_TCP_FALLBACK_TIMEOUT tcp_fallback_timeout
 	set_from_env TG_UPSTREAM_CONNECT_TIMEOUT upstream_connect_timeout
 	set_from_env TG_UPSTREAM_FAIL_COOLDOWN upstream_fail_cooldown
