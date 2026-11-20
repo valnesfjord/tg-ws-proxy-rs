@@ -67,16 +67,17 @@ fn split_mtproto_init_rejects_short_input() {
 }
 
 #[tokio::test]
-async fn a_wrong_secret_is_drained_without_closing_the_connection() {
+async fn a_rejected_handshake_drains_until_the_client_is_idle() {
     // A scanner must not learn anything from when the connection ends: after
-    // a bad handshake the listener reads and discards, sending no FIN even
-    // past the handshake timeout, until the client gives up.
+    // a bad handshake the listener uses the same idle interval as a session.
     let config = Config::try_parse_from([
         "tg-ws-proxy",
         "--secret",
         SECRET,
         "--handshake-timeout",
         "1",
+        "--client-idle-timeout",
+        "2",
         "--no-outbound-proxy",
     ])
     .unwrap();
@@ -88,7 +89,14 @@ async fn a_wrong_secret_is_drained_without_closing_the_connection() {
     assert!(read.is_err(), "the listener answered or closed: {read:?}");
     assert!(!handler.is_finished());
 
-    drop(client);
+    client.write_all(b"still connected").await.unwrap();
+    let read = tokio::time::timeout(Duration::from_secs(1), client.read(&mut byte)).await;
+    assert!(read.is_err(), "activity should extend the idle deadline");
+    let n = tokio::time::timeout(Duration::from_secs(3), client.read(&mut byte))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 0);
     await_proxy_handler(handler).await;
 }
 

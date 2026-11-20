@@ -7,9 +7,9 @@ link appears tap it (or let the app open it) to add the proxy in Telegram.
 The listen address should be `127.0.0.1` so Telegram on the same phone can
 connect.
 
-Add `--secret <32 hex chars>` if you want the link to stay the same across
-restarts. `--log-file` is ignored; logs go to the on-screen view and logcat
-(`tg-ws-proxy`).
+The app saves a random secret in its private settings on first launch and reuses
+it after restarts. Set `--secret <32 hex chars>` to supply your own. Logs go to
+the on-screen view and logcat (`tg-ws-proxy`). The app ignores `--log-file`.
 
 The default arguments carry `--quiet`, so the on-screen **Log** panel stays
 empty until you remove it. That is the default and not a failed start: drop
@@ -28,8 +28,8 @@ the running proxy's listener options and a fixed `--secret`.
 ## Start after reboot
 
 Turn on **Start after reboot** to start the foreground proxy service with the
-saved arguments after you unlock the device. Add a fixed `--secret` to keep your
-Telegram proxy link usable across restarts. When Android restricts an app's
+saved arguments after you unlock the device. Telegram can keep using the same
+proxy link with the default port and saved secret. When Android restricts an app's
 background battery usage, it can defer its boot notification until the app is
 opened.
 

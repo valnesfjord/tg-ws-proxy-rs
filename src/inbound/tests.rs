@@ -30,3 +30,28 @@ async fn client_activity_restarts_the_idle_clock() {
     let mut idle = std::pin::pin!(activity.wait_for_idle(timeout));
     assert!(futures_util::poll!(idle.as_mut()).is_pending());
 }
+
+#[tokio::test]
+async fn incomplete_faketls_records_update_activity_on_socket_progress() {
+    use futures_util::poll;
+
+    let old = Instant::now() - Duration::from_secs(30);
+    let activity = ClientActivity(Arc::new(Mutex::new(old)));
+    let (stream, mut peer) = tokio::io::duplex(8);
+    let mut stream = TrackedIo {
+        inner: stream,
+        activity: Some(activity.clone()),
+    };
+    let mut buf = [0; 32];
+    peer.write_all(&[0x17, 3, 3, 0, 32, 42]).await.unwrap();
+    {
+        let mut read = std::pin::pin!(read_tls_appdata(&mut stream, &mut buf));
+        assert!(poll!(read.as_mut()).is_pending());
+        assert!(*activity.0.lock().unwrap() > old);
+    }
+
+    *activity.0.lock().unwrap() = old;
+    let mut write = std::pin::pin!(write_tls_appdata(&mut stream, &buf));
+    assert!(poll!(write.as_mut()).is_pending());
+    assert!(*activity.0.lock().unwrap() > old);
+}

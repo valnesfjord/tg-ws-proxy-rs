@@ -17,12 +17,13 @@ pub mod socks;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::Poll;
+use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use futures_util::future::Either;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::OwnedSemaphorePermit;
@@ -56,8 +57,8 @@ pub(crate) struct Session {
 impl Session {
     pub(crate) fn track_activity(&mut self) -> ClientActivity {
         let activity = ClientActivity(Arc::new(Mutex::new(Instant::now())));
-        self.reader.activity = Some(activity.clone());
-        self.writer.activity = Some(activity.clone());
+        self.reader.tcp.activity = Some(activity.clone());
+        self.writer.tcp.activity = Some(activity.clone());
         activity
     }
 }
@@ -97,8 +98,8 @@ pub(crate) struct Link {
 pub(crate) enum Reject {
     /// Close it now.
     Close,
-    /// Read and discard until the client gives up, so a prober learns nothing
-    /// from when the connection ends. Not bounded by the handshake timeout.
+    /// Drain until EOF or the ordinary client idle deadline so a rejected
+    /// handshake does not cause an immediate FIN.
     /// The writer is held too: dropping a write half sends FIN, the very
     /// signal draining withholds.
     Drain(ClientReader, ClientWriter),
@@ -148,13 +149,14 @@ pub(crate) async fn serve<I: Inbound>(
         debug!("[{}] TCP keepalive configuration failed: {}", peer, error);
     }
     let timeout = Duration::from_secs(config.handshake_timeout);
+    let idle_timeout = Duration::from_secs(config.client_idle_timeout);
     // No arm awaits: the handshake's result, ciphers included, stays a
     // temporary of this statement instead of part of the session's state.
     let rest = match tokio::time::timeout(timeout, inbound.handshake(stream, peer, &config)).await {
         Ok(Ok(session)) => Either::Left(proxy::serve_session(peer, session, config, pool, runtime)),
         Ok(Err(Reject::Drain(reader, writer))) => Either::Right(async move {
             let _writer = writer;
-            reader.drain().await;
+            reader.drain(idle_timeout).await;
         }),
         Ok(Err(Reject::Close)) => return,
         Err(_) => {
@@ -338,9 +340,8 @@ pub(crate) const CLIENT_READ_BUF_SIZE: usize = TLS_MAX_RECORD_PAYLOAD + TLS_READ
 
 /// The client's side of a session, with any listener camouflage removed.
 pub(crate) struct ClientReader {
-    tcp: OwnedReadHalf,
+    tcp: TrackedIo<OwnedReadHalf>,
     faketls_pending: Option<PendingData>,
-    activity: Option<ClientActivity>,
 }
 
 /// Handshake bytes that arrived in the same FakeTLS record as the MTProto
@@ -376,60 +377,116 @@ impl PendingData {
 impl ClientReader {
     pub(crate) fn new(tcp: OwnedReadHalf, faketls_pending: Option<PendingData>) -> Self {
         Self {
-            tcp,
+            tcp: TrackedIo::new(tcp),
             faketls_pending,
-            activity: None,
         }
     }
 
     pub(crate) async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = match &mut self.faketls_pending {
+        match &mut self.faketls_pending {
             Some(pending) => match pending.read(buf) {
-                Some(n) => n,
-                None => read_tls_appdata(&mut self.tcp, buf).await?,
+                Some(n) => Ok(n),
+                None => read_tls_appdata(&mut self.tcp, buf).await,
             },
-            None => self.tcp.read(buf).await?,
-        };
-        if n != 0
-            && let Some(activity) = &self.activity
-        {
-            activity.record();
+            None => self.tcp.read(buf).await,
         }
-        Ok(n)
     }
 
-    async fn drain(mut self) {
-        let _ = tokio::io::copy(&mut self.tcp, &mut tokio::io::sink()).await;
+    async fn drain(mut self, idle_timeout: Duration) {
+        let mut buf = [0; 512];
+        loop {
+            let read = self.tcp.read(&mut buf);
+            let result = if idle_timeout.is_zero() {
+                read.await
+            } else {
+                let Ok(result) = tokio::time::timeout(idle_timeout, read).await else {
+                    return;
+                };
+                result
+            };
+            if !matches!(result, Ok(1..)) {
+                return;
+            }
+        }
     }
 }
 
 pub(crate) struct ClientWriter {
-    tcp: OwnedWriteHalf,
+    tcp: TrackedIo<OwnedWriteHalf>,
     faketls: bool,
-    activity: Option<ClientActivity>,
 }
 
 impl ClientWriter {
     pub(crate) fn new(tcp: OwnedWriteHalf, faketls: bool) -> Self {
         Self {
-            tcp,
+            tcp: TrackedIo::new(tcp),
             faketls,
-            activity: None,
         }
     }
 
     pub(crate) async fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
         if self.faketls {
-            write_tls_appdata(&mut self.tcp, data).await?;
+            write_tls_appdata(&mut self.tcp, data).await
         } else {
-            self.tcp.write_all(data).await?;
+            self.tcp.write_all(data).await
         }
-        if !data.is_empty()
+    }
+}
+
+// A single FakeTLS record or WebSocket message can take multiple socket reads
+// or writes. Each successful partial transfer extends the idle deadline.
+struct TrackedIo<T> {
+    inner: T,
+    activity: Option<ClientActivity>,
+}
+
+impl<T> TrackedIo<T> {
+    fn new(inner: T) -> Self {
+        Self {
+            inner,
+            activity: None,
+        }
+    }
+
+    fn record(&self, n: usize) {
+        if n != 0
             && let Some(activity) = &self.activity
         {
             activity.record();
         }
-        Ok(())
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for TrackedIo<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        ready!(Pin::new(&mut self.inner).poll_read(cx, buf))?;
+        self.record(buf.filled().len() - before);
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for TrackedIo<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let n = ready!(Pin::new(&mut self.inner).poll_write(cx, buf))?;
+        self.record(n);
+        Poll::Ready(Ok(n))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
