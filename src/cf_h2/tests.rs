@@ -224,19 +224,8 @@ async fn bridge_preserves_ciphers_and_faketls_across_fragmented_packets() {
             let (mut client_enc, mut client_dec) = build_raw_ciphers(&init);
             let (proxy_dec, proxy_enc) = build_raw_ciphers(&init);
             let (reader, writer) = remote.into_split();
-            let reader = if faketls {
-                ClientReader::FakeTls {
-                    reader,
-                    pending: PendingData::default(),
-                }
-            } else {
-                ClientReader::Plain(reader)
-            };
-            let writer = if faketls {
-                ClientWriter::FakeTls(writer)
-            } else {
-                ClientWriter::Plain(writer)
-            };
+            let reader = ClientReader::new(reader, faketls.then(PendingData::default));
+            let writer = ClientWriter::new(writer, faketls);
             let task = tokio::spawn(bridge(
                 reader,
                 writer,
@@ -316,8 +305,8 @@ async fn idle_http_channel_reposts_encrypted_packet_for_delayed_reply() {
     let (mut client, remote) = socket_pair().await;
     let (reader, writer) = remote.into_split();
     let bridge = tokio::spawn(bridge(
-        ClientReader::Plain(reader),
-        ClientWriter::Plain(writer),
+        ClientReader::new(reader, None),
+        ClientWriter::new(writer, false),
         lane,
         ProtoTag::Intermediate,
         None,
@@ -420,7 +409,7 @@ async fn invalid_native_lengths_are_rejected_before_reading_a_body() {
         client.write_all(&header).await.unwrap();
         let (reader, _) = server.into_split();
         let mut reader = PacketReader {
-            reader: ClientReader::Plain(reader),
+            reader: ClientReader::new(reader, None),
             cipher: None,
             buffer: vec![0; CLIENT_READ_BUF_SIZE],
             offset: 0,

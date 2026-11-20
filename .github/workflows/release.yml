@@ -370,7 +370,8 @@ jobs:
     # beside them again.
     openwrt-luci:
         needs: create-release
-        runs-on: ubuntu-latest
+        # Same host environment as the OpenWrt CI job for both SDKs.
+        runs-on: ubuntu-24.04
         env:
             APK_VERSION: 25.12.5
             APK_SDK_FILE: openwrt-sdk-25.12.5-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64.tar.zst
@@ -479,7 +480,8 @@ jobs:
         # and each would die on a raw `gh release download` error -- five red
         # jobs whose logs point at `gh` rather than at the job that broke.
         if: ${{ !cancelled() && needs.create-release.result == 'success' }}
-        runs-on: ubuntu-latest
+        # Ubuntu 26.04 has no installable qemu-user-static package.
+        runs-on: ubuntu-24.04
         strategy:
             fail-fast: false
             matrix:

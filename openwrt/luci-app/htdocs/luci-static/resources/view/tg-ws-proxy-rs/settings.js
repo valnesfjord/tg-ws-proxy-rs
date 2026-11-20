@@ -515,6 +515,8 @@ return view.extend({
 		o = addSeconds(s, 'ws_redirect_cooldown', _('WebSocket redirect cooldown'), null, '300');
 		o = addSeconds(s, 'ip_fail_cooldown', _('IP failure cooldown'), null, '3600');
 		o = addSeconds(s, 'handshake_timeout', _('Client handshake timeout'), null, '10');
+		o = addSeconds(s, 'client_idle_timeout', _('Client idle timeout'),
+			_('Seconds without traffic in either direction. Zero disables the timeout.'), '900');
 		o = addSeconds(s, 'tcp_fallback_timeout', _('TCP fallback timeout'), null, '10');
 		o = addSeconds(s, 'upstream_connect_timeout', _('Upstream proxy connect timeout'), null, '5');
 		o = addSeconds(s, 'upstream_fail_cooldown', _('Upstream proxy failure cooldown'), null, '60');

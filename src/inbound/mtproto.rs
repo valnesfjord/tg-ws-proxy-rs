@@ -41,14 +41,9 @@ impl Inbound for MtProto {
             read_inbound_handshake(label, &mut reader, &mut writer, secrets, faketls_domain)
                 .await
                 .ok_or(Reject::Close)?;
-        let (reader, writer) = if faketls_domain.is_some() {
-            (
-                ClientReader::FakeTls { reader, pending },
-                ClientWriter::FakeTls(writer),
-            )
-        } else {
-            (ClientReader::Plain(reader), ClientWriter::Plain(writer))
-        };
+        let faketls = faketls_domain.is_some();
+        let reader = ClientReader::new(reader, faketls.then_some(pending));
+        let writer = ClientWriter::new(writer, faketls);
 
         let Some((info, secret)) = secrets
             .iter()

@@ -58,7 +58,8 @@ jobs:
 
     pack:
         name: pack ${{ matrix.target }}
-        runs-on: ubuntu-latest
+        # Match the QEMU package used by release.yml's compress-assets job.
+        runs-on: ubuntu-24.04
         strategy:
             fail-fast: false
             matrix:

@@ -1,10 +1,18 @@
 package io.github.valnesfjord.tgwsproxyrs
 
+import android.content.ComponentName
+import android.content.Context
+import android.content.ContextWrapper
+import android.content.Intent
+import android.net.Uri
+import androidx.core.content.edit
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -99,6 +107,52 @@ class NativeProxyContractTest {
         Socket().use { it.connect(InetSocketAddress("127.0.0.1", port), 5_000) }
 
         assertTrue("nativeIsRunning should be true once listening", NativeProxy.nativeIsRunning())
+    }
+
+    @Test
+    fun bootUsesTheSameGeneratedSecretAsAManualStart() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val prefs = context.getSharedPreferences(ProxyService.PREFS, Context.MODE_PRIVATE)
+        val saved = prefs.getString(TgWsProxyApp.PREF_DEFAULT_SECRET, null)
+        assertTrue(saved?.matches(Regex("dd[0-9a-f]{32}")) == true)
+        val args = OFFLINE_ARGS.removeSuffix(" --secret $TEST_SECRET")
+        startProxy(args)
+        assertEquals(saved, Uri.parse(awaitLink()).getQueryParameter("secret"))
+        stopAndWait()
+        resetBridge()
+
+        // Capture the service intent so background-start restrictions on the
+        // instrumentation process do not stand in for Android's boot exemption.
+        val bootPrefs = context.getSharedPreferences("test_boot", Context.MODE_PRIVATE)
+        var request: Intent? = null
+        val bootContext = object : ContextWrapper(context) {
+            override fun getSharedPreferences(name: String, mode: Int) = bootPrefs
+            override fun startForegroundService(service: Intent): ComponentName? {
+                request = service
+                return service.component
+            }
+        }
+        val boot = Intent(Intent.ACTION_BOOT_COMPLETED)
+        val receiver = ProxyBootReceiver()
+        try {
+            bootPrefs.edit {
+                clear()
+                putString(ProxyService.PREF_ARGS, args)
+            }
+            receiver.onReceive(bootContext, boot)
+            assertNull(request)
+            bootPrefs.edit { putBoolean(ProxyService.PREF_START_ON_BOOT, true) }
+            receiver.onReceive(bootContext, boot)
+            val intent = requireNotNull(request)
+            assertEquals(ProxyService::class.java.name, intent.component?.className)
+            assertEquals(ProxyService.ACTION_START, intent.action)
+            val bootArgs = requireNotNull(intent.getStringExtra(ProxyService.EXTRA_ARGS))
+            assertEquals(args, bootArgs)
+            startProxy(bootArgs)
+            assertEquals(saved, Uri.parse(awaitLink()).getQueryParameter("secret"))
+        } finally {
+            bootPrefs.edit { clear() }
+        }
     }
 
     /**

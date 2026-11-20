@@ -2,7 +2,13 @@ package io.github.valnesfjord.tgwsproxyrs
 
 import android.app.Application
 import android.content.ActivityNotFoundException
+import android.content.ClipData
+import android.content.ClipDescription
+import android.content.ClipboardManager
 import android.content.Intent
+import android.os.Build
+import android.os.PersistableBundle
+import android.widget.Toast
 import androidx.compose.runtime.mutableStateListOf
 import androidx.core.content.edit
 import androidx.core.net.toUri
@@ -20,6 +26,11 @@ class ProxyViewModel(application: Application) : AndroidViewModel(application) {
         prefs.getString(ProxyService.PREF_ARGS, null) ?: ProxyService.DEFAULT_ARGS,
     )
     val args: StateFlow<String> = _args.asStateFlow()
+
+    private val _startOnBoot = MutableStateFlow(
+        prefs.getBoolean(ProxyService.PREF_START_ON_BOOT, false),
+    )
+    val startOnBoot: StateFlow<Boolean> = _startOnBoot.asStateFlow()
 
     val running = ProxyBridge.running
     val tgLink = ProxyBridge.tgLink
@@ -65,6 +76,11 @@ class ProxyViewModel(application: Application) : AndroidViewModel(application) {
         prefs.edit { putString(ProxyService.PREF_ARGS, value) }
     }
 
+    fun updateStartOnBoot(enabled: Boolean) {
+        prefs.edit { putBoolean(ProxyService.PREF_START_ON_BOOT, enabled) }
+        _startOnBoot.value = enabled
+    }
+
     fun start() {
         ProxyBridge.clearError()
         autoOpenPending = true
@@ -84,6 +100,22 @@ class ProxyViewModel(application: Application) : AndroidViewModel(application) {
             getApplication<Application>().startActivity(intent)
         } catch (_: ActivityNotFoundException) {
             ProxyBridge.reportMessage(getApplication<Application>().getString(R.string.telegram_missing))
+        }
+    }
+
+    fun copyLink() {
+        val link = tgLink.value ?: return
+        val app = getApplication<Application>()
+        val clip = ClipData.newPlainText(app.getString(R.string.proxy_link), link)
+        val systemShowsPreview = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+        if (systemShowsPreview) {
+            clip.description.extras = PersistableBundle().apply {
+                putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true)
+            }
+        }
+        app.getSystemService(ClipboardManager::class.java).setPrimaryClip(clip)
+        if (!systemShowsPreview) {
+            Toast.makeText(app, R.string.proxy_link_copied, Toast.LENGTH_SHORT).show()
         }
     }
 

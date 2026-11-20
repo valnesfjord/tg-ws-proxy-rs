@@ -7,15 +7,31 @@ link appears tap it (or let the app open it) to add the proxy in Telegram.
 The listen address should be `127.0.0.1` so Telegram on the same phone can
 connect.
 
-Add `--secret <32 hex chars>` if you want the link to stay the same across
-restarts. `--log-file` is ignored; logs go to the on-screen view and logcat
-(`tg-ws-proxy`).
+The app saves a random secret in its private settings on first launch and reuses
+it after restarts. Set `--secret <32 hex chars>` to supply your own. Logs go to
+the on-screen view and logcat (`tg-ws-proxy`). The app ignores `--log-file`.
 
 The default arguments carry `--quiet`, so the on-screen **Log** panel stays
 empty until you remove it. That is the default and not a failed start: drop
 `--quiet` (or swap it for `--verbose`) before tapping **Start** to see log
 lines. The `tg://` link appears either way — it reaches the UI from the listen
 callback rather than by scraping the log, so `--quiet` never hides it.
+
+## Telegram X
+
+Tap **Copy proxy link** in the app. To add the proxy manually in Telegram X
+during sign-in, select MTProto and enter the link's `server`, `port` and
+`secret`. Keep the `dd` or `ee` prefix as part of the secret. With a console
+installation, use the link in the startup log or run `--print-links` with
+the running proxy's listener options and a fixed `--secret`.
+
+## Start after reboot
+
+Turn on **Start after reboot** to start the foreground proxy service with the
+saved arguments after you unlock the device. Telegram can keep using the same
+proxy link with the default port and saved secret. When Android restricts an app's
+background battery usage, it can defer its boot notification until the app is
+opened.
 
 ## Quick Settings tile
 
@@ -250,6 +266,28 @@ of this repository. To ship signed APKs, create four repository secrets:
 `TG_ANDROID_STORE_FILE` is deliberately not a secret: it is a path, and the
 workflow computes it when it decodes the keystore into the runner's temporary
 directory (mode 600, deleted when the job ends).
+
+## Command-line binary on Android
+
+The Linux musl release archives use the Linux resolver. Android uses Bionic
+and its system resolver, which the APK already uses. If a Linux executable
+runs on the phone but fails with `failed to lookup address information`,
+build the console binary for Android with the NDK.
+
+Install [cargo-ndk](https://github.com/bbqsrc/cargo-ndk) and the NDK listed
+above. From the repository root, for an ARM64 phone:
+
+```bash
+rustup target add aarch64-linux-android
+cargo ndk -t arm64-v8a --platform 26 build --locked --release --bin tg-ws-proxy
+adb push target/aarch64-linux-android/release/tg-ws-proxy /data/local/tmp/tg-ws-proxy
+adb shell chmod 700 /data/local/tmp/tg-ws-proxy
+adb shell /data/local/tmp/tg-ws-proxy --default-domains --check
+```
+
+For 32-bit ARM, use `armeabi-v7a` with the Rust target
+`armv7-linux-androideabi`. On Termux you can also run the Android executable
+from its home directory.
 
 ## What the core change is
 

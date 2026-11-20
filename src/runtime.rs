@@ -8,8 +8,19 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
+use tokio::task::JoinHandle;
+
 use crate::config::{default_dc_ip, websocket_dc};
 use crate::outbound::OutboundConnector;
+
+/// A task that must end when its owner is cancelled, even when the runtime stays alive.
+pub(crate) struct AbortOnDrop(pub(crate) JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 pub struct Runtime {
     pub(crate) h2: crate::cf_h2::Pool,

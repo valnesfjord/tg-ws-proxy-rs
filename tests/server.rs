@@ -276,3 +276,87 @@ fn connection_links_describe_every_enabled_listener_without_binding() {
     assert_eq!(links.len(), 2, "{links:?}");
     assert_eq!(links[1], "SOCKS5\tRouter service\tsocks5://127.0.0.1:1080");
 }
+
+#[tokio::test]
+async fn an_idle_client_releases_its_slot_and_upstream_socket() {
+    use tg_ws_proxy_rs::crypto::{ProtoTag, generate_client_handshake};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::timeout;
+
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = upstream.local_addr().unwrap();
+    let secret = "00112233445566778899aabbccddeeff";
+    let config = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--host",
+        "127.0.0.1",
+        "--link-ip",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--secret",
+        secret,
+        "--pool-size",
+        "0",
+        "--max-connections",
+        "1",
+        "--client-idle-timeout",
+        "1",
+        "--pinned-upstream",
+        "mtproto",
+        "--mtproto-proxy",
+        &format!("{addr}:{secret}"),
+        "--no-outbound-proxy",
+    ])
+    .unwrap()
+    .with_defaults();
+    let (listen_tx, listen_rx) = tokio::sync::oneshot::channel();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(server::run_with_listen(
+        config,
+        async {
+            let _ = stop_rx.await;
+        },
+        move |info| {
+            let _ = listen_tx.send(info);
+        },
+    ));
+
+    let limit = Duration::from_secs(5);
+    let info = timeout(limit, listen_rx).await.unwrap().unwrap();
+    let (init, _, _) =
+        generate_client_handshake(&hex::decode(secret).unwrap(), 2, ProtoTag::Intermediate);
+    let mut client = TcpStream::connect(info.addr).await.unwrap();
+    client.write_all(&init).await.unwrap();
+    let (mut remote, _) = timeout(limit, upstream.accept()).await.unwrap().unwrap();
+    timeout(limit, remote.read_exact(&mut [0; 64]))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut queued = TcpStream::connect(info.addr).await.unwrap();
+    queued.write_all(&init).await.unwrap();
+    assert_eq!(
+        timeout(limit, client.read(&mut [0]))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        timeout(limit, remote.read(&mut [0]))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    let (mut next, _) = timeout(limit, upstream.accept()).await.unwrap().unwrap();
+    timeout(limit, next.read_exact(&mut [0; 64]))
+        .await
+        .unwrap()
+        .unwrap();
+
+    stop_tx.send(()).unwrap();
+    server.await.unwrap().unwrap();
+}
