@@ -178,6 +178,16 @@ fn padded_envelopes_and_reply_framing() {
         strip_padding(&mut plain, ProtoTag::PaddedIntermediate).unwrap();
         assert_eq!(plain.len(), 28);
     }
+    // A plain (unobfuscated) padded-intermediate frame carries up to
+    // MAX_PLAIN_PADDING bytes of padding: the client pads to that limit when
+    // the transport is already encrypted (media over HTTPS), and the reference
+    // accepts the whole range. The encrypted branch stays at 15.
+    for padding in 0..=MAX_PLAIN_PADDING {
+        let mut plain = vec![0; 28 + padding];
+        plain[16..20].copy_from_slice(&8u32.to_le_bytes());
+        strip_padding(&mut plain, ProtoTag::PaddedIntermediate).unwrap();
+        assert_eq!(plain.len(), 28);
+    }
     let mut bad = vec![0; 32];
     bad[16..20].copy_from_slice(&100u32.to_le_bytes());
     assert!(strip_padding(&mut bad, ProtoTag::PaddedIntermediate).is_err());
@@ -399,7 +409,9 @@ async fn invalid_native_lengths_are_rejected_before_reading_a_body() {
         ),
         (
             ProtoTag::PaddedIntermediate,
-            (MAX_PACKET as u32 + 16).to_le_bytes().to_vec(),
+            (MAX_PACKET as u32 + MAX_PLAIN_PADDING as u32 + 1)
+                .to_le_bytes()
+                .to_vec(),
         ),
         (ProtoTag::Abridged, vec![0xff, 0xff, 0xff, 0xff]),
         (ProtoTag::Abridged, vec![0]),

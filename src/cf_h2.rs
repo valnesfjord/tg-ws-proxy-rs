@@ -28,6 +28,10 @@ use crate::runtime::Runtime;
 use crate::ws_client::{cf_ip_start, no_verify_rustls_config, verifying_rustls_config};
 
 const MAX_PACKET: usize = 4 * 1024 * 1024;
+/// Padding the reference allows on a plain padded-intermediate frame
+/// (`proxy/cf_h2.py`'s `MAX_PLAIN_PADDING`): the client randomises up to this
+/// many bytes when the transport underneath is already encrypted.
+const MAX_PLAIN_PADDING: usize = 256;
 const LANE_BYTES: usize = 16 * 1024 * 1024;
 const LANE_REQUESTS: usize = 16;
 const CHANNEL_REQUESTS: usize = 4;
@@ -431,7 +435,7 @@ impl PacketReader {
             (u32::from_le_bytes(header) & 0x7fff_ffff) as usize
         };
         let padding = if proto == ProtoTag::PaddedIntermediate {
-            15
+            MAX_PLAIN_PADDING
         } else {
             0
         };
@@ -449,14 +453,17 @@ impl PacketReader {
 
 fn strip_padding(body: &mut Vec<u8>, proto: ProtoTag) -> Result<()> {
     if proto == ProtoTag::PaddedIntermediate {
-        let length = if body[..8] == [0; 8] {
-            20usize
-                .checked_add(u32::from_le_bytes(body[16..20].try_into().unwrap()) as usize)
-                .ok_or("invalid unencrypted MTProto length")?
+        let (length, max_padding) = if body[..8] == [0; 8] {
+            (
+                20usize
+                    .checked_add(u32::from_le_bytes(body[16..20].try_into().unwrap()) as usize)
+                    .ok_or("invalid unencrypted MTProto length")?,
+                MAX_PLAIN_PADDING,
+            )
         } else {
-            24 + (body.len() - 24) / 16 * 16
+            (24 + (body.len() - 24) / 16 * 16, 15)
         };
-        if length < 24 || length > body.len() || body.len() - length > 15 {
+        if length < 24 || length > body.len() || body.len() - length > max_padding {
             return Err("invalid padded MTProto packet".into());
         }
         body.truncate(length);
